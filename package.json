@@ -1,0 +1,127 @@
+{
+  "name": "tf-companion",
+  "displayName": "Terraform Companion",
+  "description": "Terraform version CodeLens, resolved-value hover on var and local, count→for_each refactor, plus unused-local and version-constraint lints.",
+  "version": "1.0.0",
+  "publisher": "ItzFede",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Federico-Baldan/TF_EXSTENSION.git"
+  },
+  "icon": "assets/logo/icon-256.png",
+  "engines": {
+    "vscode": "^1.129.0"
+  },
+  "categories": [
+    "Linters",
+    "Programming Languages"
+  ],
+  "keywords": [
+    "terraform",
+    "hcl",
+    "tfvars",
+    "iac",
+    "devops"
+  ],
+  "main": "./dist/extension.js",
+  "activationEvents": [
+    "onLanguage:terraform",
+    "onLanguage:terraform-vars",
+    "workspaceContains:**/*.tf"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "tfCompanion.pickTfvars",
+        "title": "Terraform Companion: Pick the active tfvars file"
+      }
+    ],
+    "configuration": {
+      "title": "Terraform Companion",
+      "properties": {
+        "tfCompanion.versionLens.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "CodeLens with the latest available version of providers and modules from the Terraform Registry"
+        },
+        "tfCompanion.versionLens.cacheTtlHours": {
+          "type": "number",
+          "default": 6,
+          "minimum": 0.084,
+          "description": "How many hours the registry version cache stays valid (minimum 5 minutes)"
+        },
+        "tfCompanion.unusedLocals.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Flag locals never referenced in their module"
+        },
+        "tfCompanion.versionHygiene.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Flag registry modules without a version and version constraints with no upper bound"
+        },
+        "tfCompanion.versionHygiene.variableDocs": {
+          "type": "boolean",
+          "default": false,
+          "description": "Also flag variables without a description or type"
+        },
+        "tfCompanion.countForEach.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Flag the count = length(list) pattern and offer the for_each refactor"
+        },
+        "tfCompanion.dependsOn.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Flag depends_on entries already covered by an implicit dependency in the arguments"
+        },
+        "tfCompanion.cacheCleaner.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "On startup, offer to delete .terraform folders (cache only) of modules with no recent activity"
+        },
+        "tfCompanion.cacheCleaner.staleDays": {
+          "type": "number",
+          "default": 30,
+          "minimum": 1,
+          "description": "Days without activity after which a .terraform folder is considered stale (minimum 1 day: a lower value would treat every cache in the workspace as stale)"
+        },
+        "tfCompanion.cacheCleaner.autoDelete": {
+          "type": "boolean",
+          "default": false,
+          "description": "Delete stale .terraform folders automatically, without asking for confirmation (default: ask first)"
+        },
+        "tfCompanion.resolvedHover.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Hover on var.* and local.* with the final value resolved through the var→local chain"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "build": "node esbuild.mjs",
+    "watch": "node esbuild.mjs --watch",
+    "test": "vitest run --passWithNoTests",
+    "typecheck": "tsc --noEmit",
+    "lint": "biome check .",
+    "lint:fix": "biome check --write .",
+    "package": "npm run build && npx @vscode/vsce package --no-dependencies"
+  },
+  "dependencies": {
+    "@tree-sitter-grammars/tree-sitter-hcl": "1.2.0",
+    "semver": "^7.8.5",
+    "web-tree-sitter": "0.26.11"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.5.4",
+    "@types/node": "24.13.3",
+    "@types/semver": "7.7.1",
+    "@types/vscode": "1.125.0",
+    "@vscode/vsce": "3.9.2",
+    "esbuild": "0.28.1",
+    "typescript": "7.0.2",
+    "vitest": "4.1.10"
+  }
+}

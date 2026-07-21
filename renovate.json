@@ -1,0 +1,88 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:best-practices",
+    ":semanticCommits",
+    ":separateMultipleMajorReleases"
+  ],
+  "timezone": "Europe/Rome",
+  "labels": ["dependencies"],
+  "rangeStrategy": "bump",
+  "dependencyDashboard": true,
+  "rebaseWhen": "conflicted",
+  "postUpdateOptions": ["npmDedupe"],
+  "platformAutomerge": true,
+  "automergeStrategy": "squash",
+  "minimumReleaseAge": "14 days",
+  "osvVulnerabilityAlerts": true,
+  "vulnerabilityAlerts": {
+    "labels": ["dependencies", "security"],
+    "minimumReleaseAge": null,
+    "schedule": ["at any time"]
+  },
+  "lockFileMaintenance": {
+    "enabled": true,
+    "automerge": true,
+    "schedule": ["before 6am on monday"]
+  },
+  "packageRules": [
+    {
+      "description": "One dependency per PR. Renovate groups by default via config:recommended (all @types together, all non-major devDependencies together), which makes a single PR carry several unrelated upgrades: a red CI then names the group rather than the package that broke it, and reverting takes the innocent ones with it. `null` cancels an inherited groupName, so this rule has to sit first and every deliberate grouping below has to re-declare its own.",
+      "matchPackageNames": ["*"],
+      "groupName": null
+    },
+    {
+      "description": "Majors wait for an explicit tick on the Dependency Dashboard instead of opening a PR on their own. A major is the one update that can need a code change to land, so it should arrive when someone is ready to look at it, not sit open going stale. The Renovate workflow reads this same Pending Approval section and notifies Telegram, which is what stops the list being one nobody reads.",
+      "matchUpdateTypes": ["major"],
+      "dependencyDashboardApproval": true
+    },
+    {
+      "description": "Automerge non-major devDependency updates once CI is green — one PR each.",
+      "matchDepTypes": ["devDependencies"],
+      "matchUpdateTypes": ["minor", "patch", "pin", "digest"],
+      "automerge": true
+    },
+    {
+      "description": "@types/vscode must stay in sync with engines.vscode (the minimum supported VS Code version). Never bump it automatically — raise engines.vscode by hand first.",
+      "matchPackageNames": ["@types/vscode"],
+      "enabled": false
+    },
+    {
+      "description": "engines.vscode is a floor: it declares the oldest VS Code that may install the extension. Renovate resolves it from github-tags on microsoft/vscode, so every hotfix tag is a candidate and #38 landed ^1.129.1 — which excludes anyone still on 1.129.0 for a patch that, by VS Code's release model, carries no new API at all. API only ever arrives on a minor, so the floor only ever needs to move to a minor. allowedVersions keeps just the x.y.0 tags in play; every minor from 1.98 up has one, so this narrows the target rather than blocking the update.",
+      "matchManagers": ["npm"],
+      "matchDepTypes": ["engines"],
+      "matchPackageNames": ["vscode"],
+      "allowedVersions": "/^\\d+\\.\\d+\\.0$/"
+    },
+    {
+      "description": "@types/node describes the Node runtime VS Code embeds, not the one we develop on. A major bump can start type-checking against APIs the host does not ship, so it is reviewed by hand.",
+      "matchPackageNames": ["@types/node"],
+      "matchUpdateTypes": ["major"],
+      "automerge": false,
+      "addLabels": ["needs-review"]
+    },
+    {
+      "description": "The one grouping that survives, and not for convenience: the runtime and the grammar are ABI-coupled, and dist/*.wasm is copied from both packages by esbuild.mjs. A PR that moves one without the other ships a runtime that cannot load the grammar it was built against, so splitting them would produce a broken PR by construction. Reviewed by hand, never automerged.",
+      "matchPackageNames": [
+        "web-tree-sitter",
+        "@tree-sitter-grammars/tree-sitter-hcl"
+      ],
+      "groupName": "tree-sitter",
+      "rangeStrategy": "pin",
+      "automerge": false,
+      "addLabels": ["needs-review"]
+    },
+    {
+      "description": "The extension host loads dist/*.wasm copied from these packages by esbuild.mjs, so a bundler bump is a packaging change. CI packages a VSIX, which is the check that matters. `minor` is listed because esbuild is still 0.x: semver calls 0.25→0.28 a minor, so a major-only rule would never fire for it and every breaking bundler release would automerge as a devDependency.",
+      "matchPackageNames": ["esbuild", "@vscode/vsce"],
+      "matchUpdateTypes": ["major", "minor"],
+      "automerge": false,
+      "addLabels": ["needs-review"]
+    },
+    {
+      "description": "Keep GitHub Actions current and automerge them, one Action per PR. Digests are pinned by config:best-practices, so a bump is a reviewed SHA move.",
+      "matchManagers": ["github-actions"],
+      "automerge": true
+    }
+  ]
+}

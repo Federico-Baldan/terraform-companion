@@ -1,0 +1,118 @@
+name: Renovate
+
+on:
+  schedule:
+    # Monday and Thursday, 03:00 UTC.
+    - cron: "0 3 * * 1,4"
+  workflow_dispatch:
+    inputs:
+      logLevel:
+        description: Renovate log level
+        type: choice
+        default: info
+        options:
+          - debug
+          - info
+          - warn
+      dryRun:
+        description: Dry run (inspect only, create no branches or PRs)
+        type: boolean
+        default: false
+  push:
+    branches: [main]
+    # Re-run when the Renovate config or this workflow changes, to validate quickly.
+    paths:
+      - renovate.json
+      - .github/workflows/renovate.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: renovate
+  cancel-in-progress: false
+
+jobs:
+  renovate:
+    name: Renovate
+    runs-on: ubuntu-latest
+    # issues: read is for the notify step alone, re-reading the Dependency
+    # Dashboard with GITHUB_TOKEN — Renovate itself keeps using its own PAT
+    permissions:
+      contents: read
+      issues: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Run Renovate
+        uses: renovatebot/github-action@3064367f740a1a91cca218698a63902689cce200 # v46.1.20
+        with:
+          # PAT needs repo + workflow (or fine-grained: Contents RW, PRs RW,
+          # Workflows RW). Default GITHUB_TOKEN also works, but its PRs won't
+          # trigger ci.yml, so automerge-on-green won't fire
+          token: ${{ secrets.RENOVATE_TOKEN }}
+        env:
+          RENOVATE_REPOSITORIES: ${{ github.repository }}
+          # Config is already committed (renovate.json) — skip the onboarding PR.
+          RENOVATE_ONBOARDING: "false"
+          RENOVATE_AUTODISCOVER: 'false'
+          RENOVATE_PLATFORM: github
+          LOG_LEVEL: ${{ inputs.logLevel || 'info' }}
+          RENOVATE_DRY_RUN: ${{ inputs.dryRun && 'full' || 'null' }}
+
+      # majors have dependencyDashboardApproval — Renovate opens no PR until
+      # the checkbox is ticked, and without a notification that list is one
+      # nobody reads. Runs even if Renovate failed (!cancelled()): a bad run
+      # must not silence the notification
+      - name: Notify pending approvals
+        if: ${{ !cancelled() }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          REPO: ${{ github.repository }}
+        run: |
+          if [ -z "$TELEGRAM_BOT_TOKEN" ] || [ -z "$TELEGRAM_CHAT_ID" ]; then
+            echo "::warning::TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID not configured — no notification sent"
+            exit 0
+          fi
+
+          # /issues returns PRs too — dropped by checking .pull_request, which
+          # real issues don't have
+          dashboard=$(gh api "repos/${REPO}/issues?state=open&per_page=100" \
+            --jq 'map(select(.pull_request == null and .title == "Dependency Dashboard")) | first')
+
+          if [ -z "$dashboard" ] || [ "$dashboard" = null ]; then
+            echo "No open Dependency Dashboard — nothing to notify"
+            exit 0
+          fi
+
+          # every pending entry is a checkbox with the approve-branch= marker;
+          # "Create all pending approval PRs at once" has no marker so it's
+          # excluded, avoiding an empty notification. tr strips CRs — a CRLF
+          # body would otherwise trail \r onto every title
+          items=$(printf '%s' "$dashboard" | jq -r '.body // ""' | tr -d '\r' | awk '
+            /^## Pending Approval/ { inside = 1; next }
+            inside && /^## / { exit }
+            inside && /approve-branch=/ { sub(/.*-->/, ""); print "• " $0 }
+          ')
+
+          if [ -z "$items" ]; then
+            echo "\"Pending Approval\" section empty — no notification"
+            exit 0
+          fi
+
+          text=$(printf '%s\n' \
+            "🟡 Terraform Companion — Renovate has updates waiting for approval" \
+            "" \
+            "$items" \
+            "" \
+            "Tick the checkbox to let the PRs open:" \
+            "$(printf '%s' "$dashboard" | jq -r '.html_url')")
+
+          # no parse_mode — a title with < or * would otherwise 400 the Bot API
+          curl -sS --fail-with-body --retry 3 --retry-delay 5 -o /dev/null \
+            -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=${text}" \
+            -d disable_web_page_preview=true

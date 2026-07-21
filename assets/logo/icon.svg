@@ -1,0 +1,69 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" width="1024" height="1024">
+  <defs>
+    <clipPath id="tile"><rect x="0" y="0" width="100" height="100" rx="23" ry="23"/></clipPath>
+    <radialGradient id="bg" cx="32%" cy="6%" r="125%">
+      <stop offset="0" stop-color="#1a1330"/>
+      <stop offset="1" stop-color="#080510"/>
+    </radialGradient>
+    <radialGradient id="sheen" cx="30%" cy="4%" r="80%">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.13"/>
+      <stop offset="0.58" stop-color="#ffffff" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="gTFmark" gradientUnits="userSpaceOnUse" x1="50" y1="26" x2="50" y2="72">
+      <stop offset="0" stop-color="#A96FE6"/>
+      <stop offset="0.5" stop-color="#7B42BC"/>
+      <stop offset="1" stop-color="#59298F"/>
+    </linearGradient>
+    <radialGradient id="gAmbient" cx="50%" cy="50%" r="50%">
+      <stop offset="0" stop-color="#8A4FD0" stop-opacity="0.30"/>
+      <stop offset="1" stop-color="#8A4FD0" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="gGlow" cx="50%" cy="50%" r="50%">
+      <stop offset="0" stop-color="#D7DFEC" stop-opacity="0.7"/>
+      <stop offset="1" stop-color="#D7DFEC" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+
+  <g clip-path="url(#tile)">
+    <rect x="0" y="0" width="100" height="100" fill="url(#bg)"/>
+    <rect x="0" y="0" width="100" height="100" fill="url(#sheen)"/>
+
+    <ellipse cx="50" cy="49" rx="34" ry="34" fill="url(#gAmbient)"/>
+
+    <!-- orbit: far side (behind mark) -->
+    <g transform="rotate(-14 50 53)">
+      <path d="M93,53 A43,12 0 0 0 7,53" fill="none" stroke="#D7DFEC" stroke-width="1.9" stroke-linecap="round" opacity="0.4"/>
+    </g>
+
+    <!-- Terraform mark: shadow -->
+    <g transform="translate(1.5,2.4)" fill="#37195C">
+      <path d="M30.46,27 L30.46,41.01 L42.60,48.03 L42.60,34.01 Z"/>
+      <path d="M69.54,34.82 L57.40,41.83 L57.40,55.85 L69.54,48.84 Z"/>
+      <path d="M43.93,34.83 L43.93,48.84 L56.07,55.85 L56.07,41.84 Z"/>
+      <path d="M43.93,49.98 L43.93,64 L56.07,71.01 L56.07,56.99 Z"/>
+    </g>
+    <!-- Terraform mark: faces -->
+    <g fill="url(#gTFmark)">
+      <path d="M30.46,27 L30.46,41.01 L42.60,48.03 L42.60,34.01 Z"/>
+      <path d="M69.54,34.82 L57.40,41.83 L57.40,55.85 L69.54,48.84 Z"/>
+      <path d="M43.93,34.83 L43.93,48.84 L56.07,55.85 L56.07,41.84 Z"/>
+      <path d="M43.93,49.98 L43.93,64 L56.07,71.01 L56.07,56.99 Z"/>
+    </g>
+    <!-- Terraform mark: edge light -->
+    <g stroke="#CBA6FF" stroke-width="1.2" stroke-linecap="round" opacity="0.5" fill="none">
+      <path d="M30.7,27.2 L42.4,34"/>
+      <path d="M57.6,41.7 L69.3,35"/>
+      <path d="M44.1,34.9 L55.9,41.7"/>
+      <path d="M44.1,50.1 L55.9,56.9"/>
+    </g>
+
+    <!-- orbit: near side + scintilla (in front of mark) -->
+    <g transform="rotate(-14 50 53)">
+      <path d="M93,53 A43,12 0 0 1 7,53" fill="none" stroke="#D7DFEC" stroke-width="3" stroke-linecap="round" opacity="0.92"/>
+      <path d="M93,53 A43,12 0 0 1 7,53" fill="none" stroke="#ffffff" stroke-width="0.9" stroke-linecap="round" opacity="0.4"/>
+      <circle cx="86.46" cy="46.64" r="11" fill="url(#gGlow)"/>
+      <path d="M86.46,39.5 C87.1,44.7 88.1,45.7 93,46.64 C88.1,47.6 87.1,48.6 86.46,53.8 C85.8,48.6 84.8,47.6 79.9,46.64 C84.8,45.7 85.8,44.7 86.46,39.5 Z" fill="#ffffff"/>
+      <circle cx="86.46" cy="46.64" r="1.7" fill="#D7DFEC"/>
+    </g>
+  </g>
+</svg>
