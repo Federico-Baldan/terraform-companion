@@ -13,7 +13,7 @@ You almost certainly already run the [HashiCorp Terraform](https://marketplace.v
 
 This fills the gaps terraform-ls leaves: it won't tell you a provider constraint is a major release behind, and it won't tell you what `var.environment` resolves to until you run a plan. Install both and they stay out of each other's way.
 
-Requires VS Code 1.129 or newer. Activates on `.tf` / `.tfvars` files.
+Requires VS Code 1.125 or newer. Activates on `.tf` / `.tfvars` files.
 
 ## Version CodeLens
 
