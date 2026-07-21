@@ -3,11 +3,11 @@
   "displayName": "Terraform Companion",
   "description": "Terraform version CodeLens, resolved-value hover on var and local, count→for_each refactor, plus unused-local and version-constraint lints.",
   "version": "1.0.0",
-  "publisher": "ItzFede",
+  "publisher": "Federico-Baldan",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/Federico-Baldan/TF_EXSTENSION.git"
+    "url": "https://github.com/Federico-Baldan/terraform-companion.git"
   },
   "icon": "assets/logo/icon-256.png",
   "engines": {

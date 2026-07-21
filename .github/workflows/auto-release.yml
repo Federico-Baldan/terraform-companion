@@ -1,0 +1,236 @@
+name: Auto-release
+
+on:
+  schedule:
+    # Daily at 06:00 Rome. After the 03:00 UTC Renovate window so its automerges
+    # have already landed and re-run CI: reading the check state before that
+    # would see a green PR that is about to be rebuilt. timezone is honoured
+    # natively, so this stays 06:00 across the DST switch.
+    - cron: "0 6 * * *"
+      timezone: "Europe/Rome"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Report the decision without merging"
+        type: boolean
+        default: true
+      min_age_days:
+        description: "Merge only if the release PR is at least this old (0 to ignore age)"
+        type: number
+        default: 7
+
+# The merge runs on a PAT, not on this token — see the token comment on the step.
+# Nothing here needs write access, so GITHUB_TOKEN stays read-only and a bug in
+# the script below cannot write anything on its own.
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: auto-release
+  cancel-in-progress: false
+
+jobs:
+  auto-release:
+    name: Merge an aged patch release PR
+    runs-on: ubuntu-latest
+    steps:
+      # Every check below can only stop or continue — never merge on doubt. An
+      # unexpected shape (missing manifest, unparsable version, no checks at all)
+      # exits without merging, because the failure mode of publishing a bad
+      # version to the Marketplace is not reversible while waiting a day is.
+      - name: Merge the release PR if it is an aged, green patch
+        env:
+          # A merge performed with GITHUB_TOKEN would not re-trigger ci.yml
+          # (GitHub does not create workflow runs for GITHUB_TOKEN events), so
+          # release-please would never see the merge, never tag, and the release
+          # would silently not happen while the PR looked done. The PAT needs
+          # Contents RW + PRs RW, which RENOVATE_TOKEN already carries.
+          GH_TOKEN: ${{ secrets.RENOVATE_TOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          REPO: ${{ github.repository }}
+          # Defaulted in shell rather than with `||`: GitHub renders an unset
+          # input as an empty string and the number 0 as falsy, so a deliberate
+          # 0 from the dispatch form would otherwise become 7 and the manual
+          # test would silently do nothing.
+          MIN_AGE_DAYS: ${{ inputs.min_age_days }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+
+          MIN_AGE_DAYS="${MIN_AGE_DAYS:-7}"
+          # Empty on a schedule run (no inputs exist), which is the real
+          # release path — only the dispatch form defaults to a dry run.
+          DRY_RUN="${DRY_RUN:-false}"
+          BRANCH="release-please--branches--main"
+          MANIFEST=".github/.release-please-manifest.json"
+
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::warning::RENOVATE_TOKEN not configured — auto-release cannot merge"
+            exit 0
+          fi
+
+          # Matched on the head branch rather than the "autorelease: pending"
+          # label, for the reason release-reminder.yml already records: the
+          # branch name is fixed by the tool, the labels are not always applied.
+          prs=$(gh api "repos/${REPO}/pulls?state=open&per_page=100")
+          pr=$(printf '%s' "$prs" | jq -c --arg b "$BRANCH" \
+            'map(select(.head.ref == $b)) | first')
+
+          if [ "$pr" = null ]; then
+            # An exact-match miss is indistinguishable from "nothing to release"
+            # unless we look: if release-please ever changes its branch naming,
+            # this workflow would quietly never fire again. A near-miss branch
+            # is the tell, so it is reported instead of exiting silent.
+            stray=$(printf '%s' "$prs" | jq -r \
+              '[.[] | select(.head.ref | startswith("release-please")) | .head.ref] | join(", ")')
+            if [ -n "$stray" ]; then
+              echo "::warning::No PR on ${BRANCH}, but these exist: ${stray} — the branch naming may have changed"
+            else
+              echo "No open release PR — nothing to do"
+            fi
+            exit 0
+          fi
+
+          num=$(printf '%s' "$pr" | jq -r '.number')
+          title=$(printf '%s' "$pr" | jq -r '.title')
+          url=$(printf '%s' "$pr" | jq -r '.html_url')
+
+          if printf '%s' "$pr" | jq -e '.labels[]? | select(.name == "hold")' >/dev/null; then
+            echo "PR #${num} carries the hold label — left alone"
+            exit 0
+          fi
+
+          # renovate.json already says a vulnerability does not wait
+          # (minimumReleaseAge: null, schedule: at any time). A fix written for
+          # that vulnerability sitting a week in the release PR would undo it at
+          # the last step, so a fix(security): commit drops the threshold to 0 —
+          # meaning the next daily run, at most 24h away, not this instant.
+          #
+          # The PR body is the generated changelog, where a scoped commit
+          # renders as "* **security:** ...". Matched on that exact bold scope
+          # and not on the word anywhere: "fix: harden security headers" renders
+          # unscoped, and must not shortcut the wait for containing the word.
+          if printf '%s' "$pr" | jq -r '.body // ""' | tr -d '\r' \
+             | grep -Eq '^\* \*\*security:\*\*'; then
+            urgent=true
+            threshold=0
+          else
+            urgent=false
+            threshold="$MIN_AGE_DAYS"
+          fi
+
+          created=$(printf '%s' "$pr" | jq -r '.created_at')
+          age=$(( ( $(date -u +%s) - $(date -u -d "$created" +%s) ) / 86400 ))
+          if [ "$age" -lt "$threshold" ]; then
+            echo "PR #${num} is ${age}d old, below the ${threshold}d threshold"
+            exit 0
+          fi
+
+          if [ "$urgent" = true ]; then
+            echo "PR #${num} carries a fix(security): commit — skipping the ${MIN_AGE_DAYS}d wait"
+          fi
+
+          # Read from the manifest on both branches rather than parsing the PR
+          # title: the title follows a configurable pattern, so a config change
+          # would turn a minor into an unrecognised string — and the safe
+          # reading of an unrecognised string is a guess. Two numbers are not.
+          head_ref=$(printf '%s' "$pr" | jq -r '.head.ref')
+          raw() {
+            gh api "repos/${REPO}/contents/${MANIFEST}?ref=$1" \
+              -H "Accept: application/vnd.github.raw" 2>/dev/null || true
+          }
+          old=$(raw main | jq -r '."." // empty')
+          new=$(raw "$head_ref" | jq -r '."." // empty')
+
+          for v in "$old" "$new"; do
+            if ! printf '%s' "$v" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+              echo "::warning::Version '${v}' is not X.Y.Z — refusing to classify PR #${num}, left for a human"
+              exit 0
+            fi
+          done
+
+          # X.Y.Z with the same X.Y is a patch by construction, so stripping the
+          # last segment and comparing needs no arithmetic and no assumption
+          # about how many digits each segment has.
+          if [ "${old%.*}" != "${new%.*}" ]; then
+            echo "PR #${num} releases ${old} -> ${new}, which is not a patch — left for a human"
+            exit 0
+          fi
+
+          checks=$(gh pr view "$num" --repo "$REPO" --json statusCheckRollup,mergeable)
+
+          rollup=$(printf '%s' "$checks" | jq -c '.statusCheckRollup // []')
+          # A PR with zero checks would pass an "all checks succeeded" test
+          # vacuously, which is exactly the state where nothing verified the
+          # build being published.
+          if [ "$(printf '%s' "$rollup" | jq 'length')" -eq 0 ]; then
+            echo "::warning::PR #${num} reports no checks — refusing to merge a release nothing verified"
+            exit 0
+          fi
+
+          # A CheckRun still running has a null conclusion and no state, so the
+          # "PENDING" fallback counts it as not-yet-ok rather than skipping it.
+          not_ok=$(printf '%s' "$rollup" | jq '[
+            .[] | ((.conclusion // .state // "PENDING") | ascii_upcase)
+                | select(. != "SUCCESS" and . != "NEUTRAL" and . != "SKIPPED")
+          ] | length')
+          if [ "$not_ok" -ne 0 ]; then
+            echo "PR #${num} has ${not_ok} check(s) not green — waiting for the next run"
+            exit 0
+          fi
+
+          mergeable=$(printf '%s' "$checks" | jq -r '.mergeable')
+          if [ "$mergeable" != "MERGEABLE" ]; then
+            echo "::warning::PR #${num} is ${mergeable}, not MERGEABLE — needs a human"
+            exit 0
+          fi
+
+          if [ "$DRY_RUN" = true ]; then
+            echo "DRY RUN — would merge #${num} (${old} -> ${new}, ${age}d old, urgent=${urgent}, all checks green)"
+            exit 0
+          fi
+
+          # Squash, matching automergeStrategy in renovate.json and what
+          # release-please recommends: it leaves one commit whose message is the
+          # PR title, which is what the release-please job in ci.yml reads.
+          gh pr merge "$num" --repo "$REPO" --squash
+
+          echo "Merged #${num}: ${old} -> ${new}"
+
+          # Sent after the merge, not before: this is a record of something
+          # irreversible having happened, and the publish that follows is
+          # visible in ci.yml. A pre-merge notification would arrive even on
+          # the runs that then failed to merge.
+          if [ -z "${TELEGRAM_BOT_TOKEN:-}" ] || [ -z "${TELEGRAM_CHAT_ID:-}" ]; then
+            echo "::warning::TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID not configured — merged without notifying"
+            exit 0
+          fi
+
+          # A security release reads differently from a routine one: it says the
+          # wait was deliberately skipped, so an unexpected one is recognisable
+          # as unexpected instead of blending into the weekly noise.
+          if [ "$urgent" = true ]; then
+            headline="🔒 Terraform Companion — security patch ${new} released without waiting"
+            detail="fix(security): in the changelog, so the ${MIN_AGE_DAYS}-day wait was skipped"
+          else
+            headline="🚀 Terraform Companion — patch ${new} released automatically"
+            detail="waited ${age} day(s), all checks green"
+          fi
+
+          text=$(printf '%s\n' \
+            "$headline" \
+            "" \
+            "$title" \
+            "$detail" \
+            "" \
+            "Publishing to the Marketplace is running now:" \
+            "$url")
+
+          # no parse_mode — a title with < or * would otherwise 400 the Bot API
+          curl -sS --fail-with-body --retry 3 --retry-delay 5 -o /dev/null \
+            -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=${text}" \
+            -d disable_web_page_preview=true

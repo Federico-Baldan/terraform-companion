@@ -1,0 +1,95 @@
+name: Release reminder
+
+on:
+  schedule:
+    # Monday lunch. Scheduled at 12:50 rather than 13:20 because GitHub runs
+    # cron on a best-effort queue and 10-30 minutes of delay is normal, so the
+    # message lands inside lunch instead of after it. timezone is honoured
+    # natively (GitHub handles the DST switch), so this stays 12:50 in Rome all
+    # year instead of drifting an hour every October.
+    - cron: "50 12 * * 1"
+      timezone: "Europe/Rome"
+  workflow_dispatch:
+    inputs:
+      min_age_days:
+        description: "Only warn if the release PR is at least this old (0 to always warn)"
+        type: number
+        default: 0
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: release-reminder
+  cancel-in-progress: false
+
+jobs:
+  remind:
+    name: Warn about an unmerged release PR
+    runs-on: ubuntu-latest
+    steps:
+      - name: Notify open release PR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          REPO: ${{ github.repository }}
+          # Defaulted in shell, not with `|| 3`: GitHub treats the number 0 as
+          # falsy, so a deliberate 0 from the dispatch form would silently
+          # become 3 and the manual test would notify nothing.
+          MIN_AGE_DAYS: ${{ inputs.min_age_days }}
+        run: |
+          MIN_AGE_DAYS="${MIN_AGE_DAYS:-3}"
+
+          if [ -z "$TELEGRAM_BOT_TOKEN" ] || [ -z "$TELEGRAM_CHAT_ID" ]; then
+            echo "::warning::TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID not configured — no notification sent"
+            exit 0
+          fi
+
+          # Matched on the head branch, not the "autorelease: pending" label:
+          # release-please cannot always apply its labels under GITHUB_TOKEN,
+          # while the branch name is fixed by the tool.
+          pr=$(gh api "repos/${REPO}/pulls?state=open&per_page=100" \
+            --jq 'map(select(.head.ref == "release-please--branches--main")) | first')
+
+          if [ -z "$pr" ] || [ "$pr" = null ]; then
+            echo "No open release PR — nothing to notify"
+            exit 0
+          fi
+
+          created=$(printf '%s' "$pr" | jq -r '.created_at')
+          age=$(( ( $(date -u +%s) - $(date -u -d "$created" +%s) ) / 86400 ))
+
+          if [ "$age" -lt "$MIN_AGE_DAYS" ]; then
+            echo "Release PR is ${age}d old, below the ${MIN_AGE_DAYS}d threshold — no notification"
+            exit 0
+          fi
+
+          # The PR body is the generated changelog: "### Features" and friends
+          # over "* " bullets. Counting per section says how much is waiting
+          # without pasting the whole changelog into a chat message.
+          summary=$(printf '%s' "$pr" | jq -r '.body // ""' | tr -d '\r' | awk '
+            /^### / { section = substr($0, 5); next }
+            /^\* / && section != "" { n[section]++ }
+            END { for (s in n) printf "• %s: %d\n", s, n[s] }
+          ')
+          [ -n "$summary" ] || summary="• no changelog entries parsed"
+
+          text=$(printf '%s\n' \
+            "📦 Terraform Companion — a release is waiting to be published" \
+            "" \
+            "$(printf '%s' "$pr" | jq -r '.title')" \
+            "open for ${age} day(s)" \
+            "" \
+            "$summary" \
+            "" \
+            "Merge it to tag, publish to the Marketplace and cut the release:" \
+            "$(printf '%s' "$pr" | jq -r '.html_url')")
+
+          # no parse_mode — a title with < or * would otherwise 400 the Bot API
+          curl -sS --fail-with-body --retry 3 --retry-delay 5 -o /dev/null \
+            -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=${text}" \
+            -d disable_web_page_preview=true
