@@ -1,9 +1,15 @@
 name: Release
 
+# Dispatch only. This used to also fire on "v*" tags, from back when ci.yml
+# could not release on its own — but release-please now creates those tags, so
+# every release raced this workflow against ci.yml's publish job. ci.yml always
+# won (it publishes seconds earlier, in the same run that cut the tag) and this
+# one always lost with "already exists", handing back a red run per release.
+# One publishing path, and it is the one where the checks gate it.
+#
+# The tag-guarded steps below are kept but now only reachable if the trigger
+# ever comes back; on dispatch the workflow just builds a VSIX to inspect.
 on:
-  push:
-    tags:
-      - "v*"
   workflow_dispatch:
 
 permissions:
