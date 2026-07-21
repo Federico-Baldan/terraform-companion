@@ -1,4 +1,13 @@
-# Terraform Companion
+<p align="center">
+  <img src="assets/logo/icon-256.png" alt="Terraform Companion" width="128" height="128">
+</p>
+
+<h1 align="center">Terraform Companion</h1>
+
+<p align="center">
+  Version CodeLens, resolved-value hover on <code>var</code> and <code>local</code>, <code>count</code>&nbsp;→&nbsp;<code>for_each</code> refactor,<br>
+  plus unused-local and version-constraint lints.
+</p>
 
 You almost certainly already run the [HashiCorp Terraform](https://marketplace.visualstudio.com/items?itemName=HashiCorp.terraform) extension. Keep it. Formatting, completion, syntax and validation all go through terraform-ls, and nothing here reaches into any of that.
 

@@ -25,6 +25,19 @@
     "automerge": true,
     "schedule": ["before 6am on monday"]
   },
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "biome.json carries the config schema version inside its $schema URL, and no manager reads that file — so a @biomejs/biome bump in package.json leaves the URL behind (it sat at 2.5.4 while the package was already 2.5.5, which silently validates the config against the wrong schema in the editor). This extracts the version from the URL as the same dep the npm manager already sees, so both updates share a branch and land in one PR. depTypeTemplate is what puts it under the devDependencies automerge rule below: without a depType it matches nothing, and an un-automergeable update sitting in the branch would block the automerge of the biome PR itself.",
+      "managerFilePatterns": ["/^biome\\.jsonc?$/"],
+      "matchStrings": [
+        "https://biomejs\\.dev/schemas/(?<currentValue>[^/]+)/schema\\.json"
+      ],
+      "depNameTemplate": "@biomejs/biome",
+      "datasourceTemplate": "npm",
+      "depTypeTemplate": "devDependencies"
+    }
+  ],
   "packageRules": [
     {
       "description": "One dependency per PR. Renovate groups by default via config:recommended (all @types together, all non-major devDependencies together), which makes a single PR carry several unrelated upgrades: a red CI then names the group rather than the package that broke it, and reverting takes the innocent ones with it. `null` cancels an inherited groupName, so this rule has to sit first and every deliberate grouping below has to re-declare its own.",
@@ -48,10 +61,10 @@
       "enabled": false
     },
     {
-      "description": "engines.vscode is a floor: it declares the oldest VS Code that may install the extension. Renovate resolves it from github-tags on microsoft/vscode, so every hotfix tag is a candidate and #38 landed ^1.129.1 — which excludes anyone still on 1.129.0 for a patch that, by VS Code's release model, carries no new API at all. API only ever arrives on a minor, so the floor only ever needs to move to a minor. allowedVersions keeps just the x.y.0 tags in play; every minor from 1.98 up has one, so this narrows the target rather than blocking the update.",
+      "description": "engines.vscode is a floor: it declares the oldest VS Code that may install the extension. Renovate resolves it from github-tags on microsoft/vscode, so every hotfix tag is a candidate and #38 landed ^1.129.1 — which excludes anyone still on 1.129.0 for a patch that, by VS Code's release model, carries no new API at all. API only ever arrives on a minor, so the floor only ever needs to move to a minor. allowedVersions keeps just the x.y.0 tags in play; every minor from 1.98 up has one, so this narrows the target rather than blocking the update. It has to be matchDepNames: the npm manager rewrites engines.vscode to packageName microsoft/vscode and leaves depName as vscode, and since Renovate 39 matchPackageNames only ever looks at packageName — the depName fallback (with its 'Use matchDepNames instead' warning) is gone. So `\"matchPackageNames\": [\"vscode\"]` matched nothing, the whole rule was inert, and #3 landed ^1.129.1 exactly like #38.",
       "matchManagers": ["npm"],
       "matchDepTypes": ["engines"],
-      "matchPackageNames": ["vscode"],
+      "matchDepNames": ["vscode"],
       "allowedVersions": "/^\\d+\\.\\d+\\.0$/"
     },
     {

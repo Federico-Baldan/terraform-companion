@@ -46,3 +46,82 @@ jobs:
           name: tf-companion-vsix
           path: "*.vsix"
           if-no-files-found: error
+          # Build artifact only: the published VSIX lives on the Marketplace
+          # and on the GitHub Release.
+          retention-days: 7
+
+  # `needs: build` is the gate. Releasing lives in this workflow, not its own,
+  # because only a job dependency guarantees the checks ran green on this exact
+  # commit — two workflows on the same push race instead of ordering.
+  #
+  # Keeps a "chore(main): release x.y.z" PR open and up to date with every
+  # feat/fix on main. Renovate's chore(deps) commits move nothing, so dependency
+  # merges never draft a release. Merging the PR tags the bump.
+  release-please:
+    name: Draft or land the release PR
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      # release-please tracks the release PR through its own "autorelease: *"
+      # labels, and creating a label that does not exist yet goes through the
+      # issues API. Without this it can fail to label the PR, and an unlabelled
+      # release PR is one it will not recognise as merged — the tag, and so the
+      # publish, would silently never happen.
+      issues: write
+    outputs:
+      released: ${{ steps.release.outputs.release_created }}
+      tag: ${{ steps.release.outputs.tag_name }}
+    steps:
+      - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        id: release
+        with:
+          # Same trap renovate.yml already documents, and it bites harder here.
+          # A PR opened or updated under GITHUB_TOKEN gets its CI runs queued in
+          # an approval-required state, so the release PR would sit with a
+          # "Approve workflows to run" banner and never go green on its own —
+          # auto-release.yml would correctly refuse to merge it, forever. Under
+          # the PAT the PR belongs to a real user and CI just runs. It also
+          # covers release-please creating its own "autorelease: *" labels.
+          token: ${{ secrets.RENOVATE_TOKEN }}
+          config-file: .github/release-please-config.json
+          manifest-file: .github/.release-please-manifest.json
+
+  # Only reached on the push that merges the release PR, and only after build
+  # went green. release.yml stays the manual path for a hand-pushed tag.
+  publish:
+    name: Publish the tagged release
+    needs: release-please
+    if: needs.release-please.outputs.released == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      VSCE_PAT: ${{ secrets.VSCE_PAT }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ needs.release-please.outputs.tag }}
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 24.18.0
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Package VSIX
+        run: npm run package
+
+      - name: Publish to VS Code Marketplace
+        if: env.VSCE_PAT != ''
+        run: npx @vscode/vsce publish --no-dependencies --packagePath ./*.vsix
+
+      # release-please already cut the GitHub Release; only the binary is missing.
+      - name: Attach the VSIX to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ needs.release-please.outputs.tag }}" ./*.vsix --clobber
