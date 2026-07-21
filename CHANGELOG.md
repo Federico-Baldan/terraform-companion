@@ -2,6 +2,16 @@
 
 Notable changes to Terraform Companion. Versions follow semver; dates are ISO (YYYY-MM-DD).
 
+## [1.1.3](https://github.com/Federico-Baldan/terraform-companion/compare/v1.1.2...v1.1.3) (2026-07-21)
+
+
+### Bug Fixes
+
+* align the VS Code floor with the newest API definitions that exist ([2122c51](https://github.com/Federico-Baldan/terraform-companion/commit/2122c51d71d02f83477a862285b1e2517c3f3376))
+* lower the VS Code floor to 1.125, matching the API actually used ([e1b6400](https://github.com/Federico-Baldan/terraform-companion/commit/e1b6400f2b2f1eb66983f5b4992807274740a9a6))
+* set the VS Code floor to 1.128 and slow its automatic bumps ([bda68c9](https://github.com/Federico-Baldan/terraform-companion/commit/bda68c9b96a92f36ca4db2f3a95b70c254a856e3))
+* sync the lockfile engines field with package.json ([ce8369e](https://github.com/Federico-Baldan/terraform-companion/commit/ce8369e8e271fd213d0fdc047687676c292673f8))
+
 ## [1.1.2](https://github.com/Federico-Baldan/terraform-companion/compare/v1.1.1...v1.1.2) (2026-07-21)
 
 
