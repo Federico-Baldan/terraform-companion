@@ -50,8 +50,16 @@ jobs:
           # Matched on the head branch, not the "autorelease: pending" label:
           # release-please cannot always apply its labels under GITHUB_TOKEN,
           # while the branch name is fixed by the tool.
+          #
+          # Prefix and not equality: a manifest-based config appends
+          # "--components--<package>", so the branch is really
+          # release-please--branches--main--components--<name from package.json>,
+          # which also moves whenever that name does. The exact
+          # match this used to do found nothing and exited quietly, which looks
+          # exactly like "no release pending" — a reminder that never fires and
+          # never explains itself.
           pr=$(gh api "repos/${REPO}/pulls?state=open&per_page=100" \
-            --jq 'map(select(.head.ref == "release-please--branches--main")) | first')
+            --jq 'map(select(.head.ref | startswith("release-please--branches--main"))) | first')
 
           if [ -z "$pr" ] || [ "$pr" = null ]; then
             echo "No open release PR — nothing to notify"

@@ -75,8 +75,23 @@ jobs:
           # label, for the reason release-reminder.yml already records: the
           # branch name is fixed by the tool, the labels are not always applied.
           prs=$(gh api "repos/${REPO}/pulls?state=open&per_page=100")
-          pr=$(printf '%s' "$prs" | jq -c --arg b "$BRANCH" \
-            'map(select(.head.ref == $b)) | first')
+
+          # Prefix, not equality. A manifest-based config appends
+          # "--components--<package>" to the branch, and include-component-in-tag
+          # drops the component from the tag but not from the branch — the real
+          # one is release-please--branches--main--components--<name from
+          # package.json>, so it also moves whenever that name does.
+          # An exact match found nothing and said nothing, which is the failure
+          # mode this whole workflow exists to avoid. More than one hit means a
+          # layout this was not written for, so it stops rather than guess.
+          matches=$(printf '%s' "$prs" | jq -c --arg b "$BRANCH" \
+            '[.[] | select(.head.ref | startswith($b))]')
+          if [ "$(printf '%s' "$matches" | jq 'length')" -gt 1 ]; then
+            refs=$(printf '%s' "$matches" | jq -r '[.[].head.ref] | join(", ")')
+            echo "::warning::Several PRs match ${BRANCH}*: ${refs} — refusing to pick one"
+            exit 0
+          fi
+          pr=$(printf '%s' "$matches" | jq -c 'first // null')
 
           if [ "$pr" = null ]; then
             # An exact-match miss is indistinguishable from "nothing to release"
