@@ -2,6 +2,13 @@
 
 Notable changes to Terraform Companion. Versions follow semver; dates are ISO (YYYY-MM-DD).
 
+## [1.1.1](https://github.com/Federico-Baldan/terraform-companion/compare/v1.1.0...v1.1.1) (2026-07-21)
+
+
+### Bug Fixes
+
+* publish under the terraform-companion extension id ([cf0011a](https://github.com/Federico-Baldan/terraform-companion/commit/cf0011a6239941ca927cc26ab7809b3adbb2f7ad))
+
 ## [1.1.0](https://github.com/Federico-Baldan/terraform-companion/compare/v1.0.0...v1.1.0) (2026-07-21)
 
 
