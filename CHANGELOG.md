@@ -2,26 +2,15 @@
 
 Notable changes to Terraform Companion. Versions follow semver; dates are ISO (YYYY-MM-DD).
 
-## [1.1.2](https://github.com/Federico-Baldan/terraform-companion/compare/v1.1.1...v1.1.2) (2026-07-21)
+## 1.1.2 - 2026-07-21
 
+First version on the Marketplace. Nothing in the extension changed: every
+feature below is exactly as it shipped in 1.0.0.
 
-### Bug Fixes
-
-* restore the tf-companion extension id ([59c7a72](https://github.com/Federico-Baldan/terraform-companion/commit/59c7a7201f8d912af5c370876f6e60c785710a4a))
-
-## [1.1.1](https://github.com/Federico-Baldan/terraform-companion/compare/v1.1.0...v1.1.1) (2026-07-21)
-
-
-### Bug Fixes
-
-* publish under the terraform-companion extension id ([cf0011a](https://github.com/Federico-Baldan/terraform-companion/commit/cf0011a6239941ca927cc26ab7809b3adbb2f7ad))
-
-## [1.1.0](https://github.com/Federico-Baldan/terraform-companion/compare/v1.0.0...v1.1.0) (2026-07-21)
-
-
-### Features
-
-* enhance CI/CD workflows and update project metadata ([deb5b97](https://github.com/Federico-Baldan/terraform-companion/commit/deb5b97a8dd27ecfd3109908f6b2bac281778175))
+The three version numbers between the two were spent getting the release
+pipeline right, and none of them reached anyone. Releases are cut
+automatically from commit messages now, so from here on every entry in this
+file is a real change to what the extension does.
 
 ## 1.0.0 - 2026-07-20
 
