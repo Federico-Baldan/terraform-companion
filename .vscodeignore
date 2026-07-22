@@ -11,6 +11,13 @@ assets/logo/**
 !assets/logo/icon-256.png
 
 *.vsix
+# scratch .tf/.tfvars used to exercise the extension by hand live at the repo
+# root and are untracked, so git never catches them — vsce would ship them
+*.tf
+*.tfvars
+*.tfvars.json
+.terraform/**
+.terraform.lock.hcl
 esbuild.mjs
 vitest.config.ts
 tsconfig.json
