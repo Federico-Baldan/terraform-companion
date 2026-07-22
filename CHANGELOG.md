@@ -2,6 +2,18 @@
 
 Notable changes to Terraform Companion. Versions follow semver; dates are ISO (YYYY-MM-DD).
 
+## [1.1.4](https://github.com/Federico-Baldan/terraform-companion/compare/v1.1.3...v1.1.4) (2026-07-22)
+
+
+### Features
+
+* scope tfvars pins to a module and add a proximity picker ([#9](https://github.com/Federico-Baldan/terraform-companion/issues/9)) ([4b6c1dd](https://github.com/Federico-Baldan/terraform-companion/commit/4b6c1dd3ec32614ef903f46f90ac71f85c513eca))
+
+
+### Miscellaneous Chores
+
+* release 1.1.4 ([d3d155e](https://github.com/Federico-Baldan/terraform-companion/commit/d3d155e227f389c9b04398b04ea0ec38e2b10c32))
+
 ## [1.1.3](https://github.com/Federico-Baldan/terraform-companion/compare/v1.1.2...v1.1.3) (2026-07-21)
 
 
