@@ -49,7 +49,7 @@ async function scan(log: (m: string) => void, cancelled: () => boolean): Promise
   for (const c of stale) log(`cacheCleaner: stale ${c.dir} (${formatSize(c.sizeBytes)})`);
   if (!cacheCleanerAutoDelete()) {
     const choice = await vscode.window.showWarningMessage(
-      `Terraform Companion: ${stale.length} .terraform folder${stale.length === 1 ? '' : 's'} with no activity for over ${effectiveStaleDays(staleDays)} days (${formatSize(total)}). Delete them? They are only caches: terraform init recreates them (the selected workspace resets to default).`,
+      `Terraform Companion: ${stale.length} .terraform folder${stale.length === 1 ? '' : 's'} with no activity for over ${effectiveStaleDays(staleDays)} days (${formatSize(total)}). Delete them? They are only caches: terraform init recreates them (the selected workspace resets to default, and a module initialised with -backend-config needs those flags again).`,
       'Delete',
       'Ignore',
     );
