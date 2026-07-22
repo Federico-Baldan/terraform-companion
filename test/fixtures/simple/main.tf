@@ -12,9 +12,14 @@ locals {
 }
 
 resource "aws_db_instance" "main" {
-  identifier = local.name_prefix
-  count      = length(var.lista)
-  name       = var.lista[count.index]
+  identifier     = local.name_prefix
+  count          = length(var.lista)
+  db_name        = "mydb"
+  instance_class = "db.t3.micro"
+
+  tags = {
+    Name = var.lista[count.index]
+  }
 
   lifecycle {
     prevent_destroy = true
