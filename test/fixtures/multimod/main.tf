@@ -27,7 +27,8 @@ resource "aws_instance" "web" {
 }
 
 resource "aws_db_instance" "db" {
-  identifier = local.name_prefix
+  identifier     = local.name_prefix
+  instance_class = "db.t3.micro"
 }
 
 output "web_id" {
