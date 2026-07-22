@@ -9,6 +9,14 @@
   plus unused-local and version-constraint lints.
 </p>
 
+<p align="center"><em>What does that <code>var.*</code> or <code>local.*</code> actually resolve to? Hover and find out.</em></p>
+
+<p align="center">
+  <img src="assets/demos/resolved-hover-demo.gif" alt="Hovering over a var or local shows its resolved value">
+</p>
+
+<br>
+
 You almost certainly already run the [HashiCorp Terraform](https://marketplace.visualstudio.com/items?itemName=HashiCorp.terraform) extension. Keep it. Formatting, completion, syntax and validation all go through terraform-ls, and nothing here reaches into any of that.
 
 This fills the gaps terraform-ls leaves: it won't tell you a provider constraint is a major release behind, and it won't tell you what `var.environment` resolves to until you run a plan. Install both and they stay out of each other's way.
