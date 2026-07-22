@@ -70,6 +70,134 @@ export function autoLoadedTfvars(index: WorkspaceIndex, moduleDir: string): stri
   ];
 }
 
+/** Directory names that conventionally hold one tfvars per environment. A
+ *  central vars folder is the layout Terraform's own docs reach for once a
+ *  root module serves more than one environment. */
+const VAR_DIR_NAMES = new Set(['env', 'envs', 'vars', 'tfvars', 'environments']);
+
+/** Enough to cover any real module's neighbourhood; past this the list stops
+ *  being scannable and Browse is the better tool. */
+const MAX_CANDIDATES = 20;
+
+export interface TfvarsCandidate {
+  path: string;
+  /** files the module auto-loads sit in 'module'; everything reachable by a
+   *  -var-file sits in 'nearby' */
+  group: 'module' | 'nearby';
+  /** path relative to the module dir — the label the picker shows */
+  label: string;
+}
+
+function dirName(p: string): string {
+  const n = p.replace(/\\/g, '/');
+  const i = n.lastIndexOf('/');
+  return i === -1 ? '.' : n.slice(0, i);
+}
+
+/** `dir` and every ancestor up to the workspace root containing it, nearest
+ *  first. A dir under no known root yields only itself, so an out-of-workspace
+ *  module can't walk up to the filesystem root. */
+function ancestorsWithin(dir: string, roots: string[]): string[] {
+  const root = roots.find((r) => dir === r || dir.startsWith(`${r}/`));
+  if (root === undefined) return [dir];
+  const out: string[] = [];
+  let cur = dir;
+  for (;;) {
+    out.push(cur);
+    if (cur === root || cur.length <= root.length) break;
+    cur = dirName(cur);
+    if (cur === '.') break;
+  }
+  return out;
+}
+
+/** Path of `target` as written from `fromDir`, e.g. "../environments/prod.tfvars".
+ *  Basenames collide constantly across environments; this doesn't. */
+export function relativeTo(fromDir: string, target: string): string {
+  const from = fromDir.replace(/\\/g, '/').split('/');
+  const to = target.replace(/\\/g, '/').split('/');
+  let i = 0;
+  while (i < from.length && i < to.length - 1 && from[i] === to[i]) i++;
+  const up = from.length - i;
+  const rest = to.slice(i);
+  return up === 0 ? rest.join('/') : [...new Array(up).fill('..'), ...rest].join('/');
+}
+
+/** tfvars a module could plausibly be driven by, nearest first: its own dir,
+ *  then ancestors and their conventional vars folders. Deliberately not "every
+ *  tfvars in the workspace" — a monorepo has hundreds, and all but a handful
+ *  belong to other modules. Browse covers the rest. */
+export function tfvarsCandidates(
+  index: WorkspaceIndex,
+  moduleDir: string,
+  roots: string[],
+): { candidates: TfvarsCandidate[]; truncated: boolean } {
+  const ancestors = ancestorsWithin(moduleDir, roots);
+  // a dir qualifies when it is an ancestor, or a conventional vars folder
+  // hanging off one — which also catches siblings of the module itself
+  const distance = (dir: string): number | undefined => {
+    const direct = ancestors.indexOf(dir);
+    if (direct !== -1) return direct;
+    if (VAR_DIR_NAMES.has(dir.slice(dir.lastIndexOf('/') + 1))) {
+      const parent = ancestors.indexOf(dirName(dir));
+      if (parent !== -1) return parent + 0.5;
+    }
+    return undefined;
+  };
+
+  const scored: { c: TfvarsCandidate; d: number }[] = [];
+  for (const file of index.files()) {
+    if (!file.path.endsWith('.tfvars')) continue;
+    const dir = dirName(file.path);
+    if (dir === moduleDir) {
+      scored.push({ c: { path: file.path, group: 'module', label: baseName(file.path) }, d: -1 });
+      continue;
+    }
+    const d = distance(dir);
+    if (d === undefined) continue;
+    scored.push({
+      c: { path: file.path, group: 'nearby', label: relativeTo(moduleDir, file.path) },
+      d,
+    });
+  }
+  scored.sort((a, b) => a.d - b.d || a.c.label.localeCompare(b.c.label));
+  return {
+    candidates: scored.slice(0, MAX_CANDIDATES).map((s) => s.c),
+    truncated: scored.length > MAX_CANDIDATES,
+  };
+}
+
+/** Files a module resolves through, lowest precedence first: what Terraform
+ *  auto-loads, then the pin. The pin models `-var-file`, so it may live
+ *  anywhere — a central `environments/` folder is the common case — and it
+ *  merges last even when it is also auto-loaded. A called module gets nothing:
+ *  its values come from the call site. */
+export function tfvarsChain(
+  index: WorkspaceIndex,
+  moduleDir: string,
+  pinned: string | undefined,
+): string[] {
+  // externalCallSitesOf, not callSitesOf — the evaluator ignores calls from
+  // a module's own tree, so one with an examples/ folder is still a root here
+  if (index.externalCallSitesOf(moduleDir).length > 0) return [];
+  const files = autoLoadedTfvars(index, moduleDir);
+  if (!pinned) return files;
+  return [...files.filter((p) => p !== pinned), pinned];
+}
+
+/** Pins as stored in workspaceState. Before pins were per-module the key held
+ *  a bare path that applied to the directory containing it; that shape is
+ *  migrated to exactly that meaning, so an upgrade loses nothing. */
+export function readPins(stored: unknown, dirOf: (p: string) => string): Record<string, string> {
+  if (typeof stored === 'string') return stored ? { [dirOf(stored)]: stored } : {};
+  if (!stored || typeof stored !== 'object') return {};
+  const out: Record<string, string> = {};
+  for (const [dir, path] of Object.entries(stored as Record<string, unknown>)) {
+    if (typeof path === 'string' && path) out[dir] = path;
+  }
+  return out;
+}
+
 export interface HoverContext {
   index: WorkspaceIndex;
   /** the tfvars in force for a module directory (see EvalScope.tfvarsOf) */

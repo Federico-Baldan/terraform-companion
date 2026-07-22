@@ -37,7 +37,11 @@ Point at a `var.*` or `local.*` and you get the string that actually lands there
 
 It follows the whole chain. `local.name = "app-${var.env}"` with `var.env = "dev"` in tfvars resolves to `app-dev`, not a bare `dev`. Inside a called module, `var.*` comes from the call site and walks back up to the root and its tfvars, falling back to the module's own default when nobody passes it. Two `module` blocks passing different values? You get one line per instance instead of a lie about which one won.
 
-A status bar item pins which tfvars file counts as active, for when auto-loading isn't what you want.
+A status bar item pins which tfvars file counts as active, for when auto-loading isn't what you want. The pin behaves like `-var-file`: it belongs to the module you were in when you set it, and the file itself can live anywhere — a central `environments/prod.tfvars` beside the module, or a folder above it. Each module keeps its own pin, and the bar reports the one for the file you're looking at.
+
+The picker lists what that module could plausibly read — its own directory, then ancestors and any `env` / `vars` / `environments` folder hanging off them — labelled by path relative to the module, so twenty files named `prod.tfvars` stay distinguishable. It deliberately doesn't enumerate the whole repo; **Browse…** covers everything else, including files outside the workspace.
+
+Because a pin belongs to a module, the picker needs a `.tf` file open to know which one you mean. Open it on a module that's called from somewhere else and it says so instead of taking a pin it would then ignore — Terraform never reads tfvars for a called module, its values come from the call site.
 
 ## count → for_each
 
@@ -60,7 +64,7 @@ It only offers the rewrite when the rewrite is safe. If `count.index` also drive
 
 ## .terraform cache cleanup
 
-On startup it looks for `.terraform` folders whose module hasn't been touched in 30 days, and asks before deleting. These are caches `terraform init` rebuilds; the one thing you lose is the selected workspace, which resets to `default`. The scan never follows symlinks, so it can't wander out of the workspace, and it only ever removes a directory named exactly `.terraform`. Flip `cacheCleaner.autoDelete` on to skip the prompt.
+On startup it looks for `.terraform` folders whose module hasn't been touched in 30 days, and asks before deleting. These are caches `terraform init` rebuilds. Your state is never touched: it lives in `terraform.tfstate` and `terraform.tfstate.d/` beside `.terraform`, not inside it, and `.terraform.lock.hcl` is a sibling too. What you do lose is the selected workspace, which resets to `default`, and the cached backend configuration — a module initialised with `terraform init -backend-config=…` needs those flags again. The scan never follows symlinks, so it can't wander out of the workspace, and it only ever removes a directory named exactly `.terraform`. Flip `cacheCleaner.autoDelete` on to skip the prompt.
 
 ## Offline
 
