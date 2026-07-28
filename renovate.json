@@ -36,6 +36,18 @@
       "depNameTemplate": "@biomejs/biome",
       "datasourceTemplate": "npm",
       "depTypeTemplate": "devDependencies"
+    },
+    {
+      "customType": "regex",
+      "description": "Re-reads engines.vscode as a dep whose versions come from npm @types/vscode rather than github-tags on microsoft/vscode (the npm manager's own copy is disabled in packageRules). The floor and the types then move on the same version list, so Renovate cannot propose a floor whose types are unpublished. currentValue captures only the number and leaves the ^ outside the match, so the range prefix survives the rewrite untouched. depName is deliberately not @types/vscode: that name is disabled as a devDependency, and matchPackageNames would catch this one too — packageNameTemplate carries the lookup, depNameTemplate keeps the two matchable apart.",
+      "managerFilePatterns": ["/^package\\.json$/"],
+      "matchStrings": [
+        "\"engines\"\\s*:\\s*\\{\\s*\"vscode\"\\s*:\\s*\"\\^?(?<currentValue>\\d+\\.\\d+\\.\\d+)\""
+      ],
+      "depNameTemplate": "vscode-engines-floor",
+      "packageNameTemplate": "@types/vscode",
+      "datasourceTemplate": "npm",
+      "versioningTemplate": "npm"
     }
   ],
   "packageRules": [
@@ -56,15 +68,20 @@
       "automerge": true
     },
     {
-      "description": "@types/vscode must stay in sync with engines.vscode (the minimum supported VS Code version). Never bump it automatically — raise engines.vscode by hand first.",
-      "matchPackageNames": ["@types/vscode"],
+      "description": "@types/vscode must stay in sync with engines.vscode (the minimum supported VS Code version). Never bump it automatically — raise engines.vscode by hand first. This has to be matchDepNames, not matchPackageNames: the engines floor below is resolved from packageName @types/vscode so that it can only ever target a version whose types exist, and since Renovate 39 matchPackageNames looks at packageName — `\"matchPackageNames\": [\"@types/vscode\"]` would therefore also match the floor and disable it, silently reverting this repo to never seeing an engines PR at all. depName keeps the two apart: the devDependency is @types/vscode, the floor is vscode-engines-floor.",
+      "matchDepNames": ["@types/vscode"],
       "enabled": false
     },
     {
-      "description": "engines.vscode is a floor: it declares the oldest VS Code that may install the extension. Renovate resolves it from github-tags on microsoft/vscode, so every hotfix tag is a candidate and #38 landed ^1.129.1 — which excludes anyone still on 1.129.0 for a patch that, by VS Code's release model, carries no new API at all. API only ever arrives on a minor, so the floor only ever needs to move to a minor. allowedVersions keeps just the x.y.0 tags in play; every minor from 1.98 up has one, so this narrows the target rather than blocking the update. It has to be matchDepNames: the npm manager rewrites engines.vscode to packageName microsoft/vscode and leaves depName as vscode, and since Renovate 39 matchPackageNames only ever looks at packageName — the depName fallback (with its 'Use matchDepNames instead' warning) is gone. So `\"matchPackageNames\": [\"vscode\"]` matched nothing, the whole rule was inert, and #3 landed ^1.129.1 exactly like #38. The floor may follow VS Code, but late and never by itself: minimumReleaseAge holds a fresh minor back a month, automerge is off and needs-review marks it as a human call. Unattended it had climbed to ^1.129.0 while @types/vscode sat at 1.125.0 (that one is enabled: false), shipping an extension nobody between the two could install — a floor above the API level actually compiled against costs users and buys nothing, so whoever reviews the PR raises @types/vscode in the same breath or closes it.",
+      "description": "The npm manager resolves engines.vscode from github-tags on microsoft/vscode, which is the wrong source for a floor. It offers every VS Code tag the moment it exists, including minors whose @types/vscode has not been published — #13 asked for ^1.126.0 while npm still had no @types/vscode above 1.125.0, so there was no way to raise the two together and the PR could only be closed. The floor is re-derived from npm below instead; this turns the github-tags copy off so the two do not race to open the same PR.",
       "matchManagers": ["npm"],
       "matchDepTypes": ["engines"],
       "matchDepNames": ["vscode"],
+      "enabled": false
+    },
+    {
+      "description": "engines.vscode is a floor: it declares the oldest VS Code that may install the extension, and it is only honest up to the API level actually compiled against — which is @types/vscode, not whatever microsoft/vscode has tagged. So the floor is resolved from the npm versions of @types/vscode (see the customManager above), which makes an unsatisfiable bump structurally impossible: a version is only ever offered once its types are on npm to be raised alongside it. That also subsumes the old hotfix problem — #38 and #3 both landed ^1.129.1, excluding anyone on 1.129.0 for a patch that by VS Code's release model carries no new API — because @types/vscode is published sparsely and mostly on minors; allowedVersions keeps only x.y.0 in play so a stray 1.106.1 cannot become the floor. The floor may follow VS Code, but late and never by itself: minimumReleaseAge holds a fresh release back a month, automerge is off, and needs-review marks it as a human call. The reviewer still raises the @types/vscode devDependency by hand in the same PR (that one is enabled: false) — the difference is that now the version they need is guaranteed to exist.",
+      "matchDepNames": ["vscode-engines-floor"],
       "allowedVersions": "/^\\d+\\.\\d+\\.0$/",
       "minimumReleaseAge": "30 days",
       "automerge": false,
