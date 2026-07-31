@@ -11,8 +11,11 @@ export function parseConstraint(text: string): ConstraintClause[] {
     const part = raw.trim();
     if (!part) continue;
     // anchoring the version to a digit stops alternation backtracking — a
-    // half-typed ">=" would otherwise parse as `>` with version "="
-    const m = part.match(/^(~>|>=|<=|!=|[=<>])?\s*(\d.*)$/);
+    // half-typed ">=" would otherwise parse as `>` with version "=". The `v` is
+    // optional in go-version's own regexp, so `~> v5.0` is a constraint people
+    // really write; dropping the clause made it admit everything, which is the
+    // one way to be wrong that the lens then acts on.
+    const m = part.match(/^(~>|>=|<=|!=|[=<>])?\s*v?(\d.*)$/);
     if (!m) continue;
     clauses.push({ op: m[1] ?? '=', version: (m[2] ?? '').trim() });
   }

@@ -1,5 +1,5 @@
 import { Language, type Node, Parser } from 'web-tree-sitter';
-import { stripQuotes } from './hcl';
+import { stripComments, stripQuotes } from './hcl';
 import type { ParsedFile, Span, TfAttr, TfBlock, TfRef } from './model';
 
 let language: Language | undefined;
@@ -147,11 +147,20 @@ function collectRefs(node: Node, refs: TfRef[]): void {
       const parts = [c.text];
       let end = c.endPosition;
       let j = i + 1;
+      // a comment is a node of its own between the subject and the dot, and
+      // stopping on it truncates the reference — `local /*c*/ .x` collected
+      // nothing and the unused-locals lint then offered to delete a local that
+      // is used, the expensive direction to be wrong in
+      while (node.namedChild(j)?.type === 'comment') j++;
       let next = node.namedChild(j);
       while (next?.type === 'get_attr') {
-        parts.push(next.text.replace(/^\s*\./, ''));
+        // whitespace and comments are both legal around the dot — `local. name`
+        // and `local. /*c*/ x` are each one clean get_attr, and a part that
+        // keeps the padding matches no local
+        parts.push(stripComments(next.text.replace(/^\s*\.\s*/, '')).trim());
         end = next.endPosition;
         j++;
+        while (node.namedChild(j)?.type === 'comment') j++;
         next = node.namedChild(j);
       }
       if (parts.length >= 2) {

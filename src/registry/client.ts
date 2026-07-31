@@ -5,7 +5,15 @@ const BASE = 'https://registry.terraform.io/v1';
  *  past from smuggling a `..` or `?query` into the path. Slashes survive,
  *  since they're structure. */
 function encodePathSegments(source: string): string {
-  return source.split('/').map(encodeURIComponent).join('/');
+  // encoding alone cannot stop a dot segment: `.` and `..` are unreserved, so
+  // encodeURIComponent returns them unchanged and the URL parser then resolves
+  // them away, aiming the request at a path the file never named. Reject
+  // rather than encode.
+  const segments = source.split('/');
+  if (segments.some((s) => s === '.' || s === '..')) {
+    throw new Error(`refusing to build a registry path from "${source}"`);
+  }
+  return segments.map(encodeURIComponent).join('/');
 }
 
 export interface CacheEntry {
@@ -38,6 +46,10 @@ export function pruneRegistryCache(
       !entry ||
       typeof entry.fetchedAt !== 'number' ||
       !Array.isArray(entry.versions) ||
+      // a clock that moved backwards leaves an entry stamped in the future.
+      // Comparing only the upper bound reads that as permanently fresh, so it
+      // is never pruned and never refetched — drop it instead.
+      entry.fetchedAt > now ||
       now - entry.fetchedAt > CACHE_MAX_AGE_MS
     ) {
       remove(key);
@@ -133,7 +145,10 @@ export class RegistryClient {
     extract: (json: T) => string[],
   ): Promise<string[] | undefined> {
     const entry = this.store.get(key);
-    if (entry && this.now() - entry.fetchedAt < this.ttl()) {
+    // a negative age means the entry is stamped in the future — a clock that
+    // moved backwards. Treating that as fresh pins it forever, so refetch.
+    const age = entry ? this.now() - entry.fetchedAt : 0;
+    if (entry && age >= 0 && age < this.ttl()) {
       return Promise.resolve(entry.versions);
     }
     const existing = this.inflight.get(key);

@@ -212,3 +212,36 @@ describe('scientific notation resolves to unknown, never to its mantissa', () =>
     expect(resolveExpr('1e10', scope)).toBe(UNKNOWN);
   });
 });
+
+/** A reference reached N ways was evaluated N times, each hop re-parsing the
+ *  local's text, so the cost of one hover was fan-out to the power of the chain
+ *  length. Twelve lines of HCL took over a minute of frozen extension host and
+ *  produced tens of megabytes of ⟨unknown⟩ that the renderer discards. */
+describe('a reference that fans out', () => {
+  it('resolves in linear time and returns a bounded value', async () => {
+    const index = new WorkspaceIndex();
+    const fanout = 4;
+    const levels = 12;
+    const lines = ['locals {'];
+    for (let i = 0; i < levels; i++) {
+      lines.push(`  l${i} = "${`\${local.l${i + 1}}`.repeat(fanout)}"`);
+    }
+    lines.push(`  l${levels} = "leaf"`, '}', '');
+    await index.updateFile('/fan/locals.tf', lines.join('\n'));
+    const fanScope: EvalScope = { index, moduleDir: '/fan' };
+
+    const started = Date.now();
+    const value = resolveRef(['local', 'l0'], fanScope);
+    const elapsed = Date.now() - started;
+
+    expect(elapsed).toBeLessThan(2000);
+    // capped rather than 4^12 copies of "leaf"
+    expect(value.length).toBeLessThan(600_000);
+  });
+
+  it('still resolves a chain longer than the old depth cap', () => {
+    // cycles are cut by the in-progress guard now, so an honest chain is no
+    // longer truncated at ten hops
+    expect(resolveRef(['local', 'double'], scope)).toBe('dev-app-x');
+  });
+});

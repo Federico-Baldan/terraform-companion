@@ -368,3 +368,18 @@ describe('a bump must actually change the constraint', () => {
     expect(updatedConstraintText(target('~> 5.34.0'), '5.98.0')).toBe('"~> 5.98.0"');
   });
 });
+
+/** `.` and `..` are built from characters the registry slug charset allows, and
+ *  a dot is unreserved so per-segment encoding leaves it intact. The URL parser
+ *  then resolves it away, aiming the request at a module the file never named. */
+describe('a dot segment is not a registry source', () => {
+  it('rejects a source that climbs', () => {
+    expect(isRegistryModuleSource('a/../b')).toBe(false);
+    expect(isRegistryModuleSource('a/b/..')).toBe(false);
+    expect(isRegistryModuleSource('a/./b')).toBe(false);
+  });
+
+  it('still accepts an ordinary registry address', () => {
+    expect(isRegistryModuleSource('terraform-aws-modules/vpc/aws')).toBe(true);
+  });
+});

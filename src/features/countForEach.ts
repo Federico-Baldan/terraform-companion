@@ -5,7 +5,7 @@ import {
   listShape,
   type TfvarsValue,
 } from '../core/evaluator';
-import { attrOf, spanContains, type TextEdit } from '../core/hcl';
+import { attrOf, spanContains, stripComments, type TextEdit } from '../core/hcl';
 import type { LintFinding, ParsedFile, Span, TfAttr, TfBlock } from '../core/model';
 import type { ModuleCallSite, WorkspaceIndex } from '../core/workspaceIndex';
 
@@ -55,9 +55,12 @@ const ELEMENT_ACCESS = /^\s*(?:\.\s*[\w-]|\[)/;
  *  there. Scanning ahead can only withhold the fix, not wrongly offer it. */
 function usedAsObject(file: ParsedFile, uses: Span[]): boolean {
   return uses.some((use) => {
-    let rest = (file.lines[use.end.row] ?? '').slice(use.end.column);
+    // comments skip like blanks — a comment between the element and its
+    // accessor hid the accessor, and the refactor was then offered on a list of
+    // objects that for_each rejects
+    let rest = stripComments((file.lines[use.end.row] ?? '').slice(use.end.column));
     for (let row = use.end.row; rest.trim() === '' && row + 1 < file.lines.length; ) {
-      rest = file.lines[++row] ?? '';
+      rest = stripComments(file.lines[++row] ?? '');
     }
     return ELEMENT_ACCESS.test(rest);
   });

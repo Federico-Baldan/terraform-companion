@@ -36,8 +36,13 @@ export function resolveRel(baseDir: string, rel: string): string {
   for (const seg of norm(rel).split('/')) {
     if (seg === '' || seg === '.') continue;
     if (seg === '..') {
-      // an absolute path cannot climb above its own root
-      if (parts.length > 0) parts.pop();
+      // an absolute path cannot climb above its own root, but a relative one
+      // has no root to stop at — above the base is simply outside the opened
+      // folder, where a shared module legitimately lives. Dropping the extra
+      // `..` collapsed that onto a real in-workspace dir and bound the call
+      // site to the wrong module.
+      if (parts.length > 0 && parts[parts.length - 1] !== '..') parts.pop();
+      else if (!isAbsolute) parts.push('..');
     } else {
       parts.push(seg);
     }
@@ -121,8 +126,16 @@ export class WorkspaceIndex {
     const variablesByDir = new Map<string, Map<string, { file: string; block: TfBlock }>>();
     const localsByDir = new Map<string, { name: string; file: string; attr: TfAttr }[]>();
     const moduleCalls: DirIndex['moduleCalls'] = [];
-    const visit = (file: string, dir: string, blocks: TfBlock[]) => {
+    // `variable`, `locals` and `module` are declarations only at the top level
+    // of a file. A provider schema is free to define a nested block that
+    // happens to share one of those names, and reading it as a declaration
+    // invented locals that the unused-locals lint then reported.
+    const visit = (file: string, dir: string, blocks: TfBlock[], top: boolean) => {
       for (const b of blocks) {
+        if (!top) {
+          visit(file, dir, b.blocks, false);
+          continue;
+        }
         if (b.kind === 'variable' && b.labels[0]) {
           let byName = variablesByDir.get(dir);
           if (!byName) {
@@ -143,13 +156,13 @@ export class WorkspaceIndex {
           const target = raw && isLocalSource(raw) ? resolveRel(dir, raw) : undefined;
           moduleCalls.push({ file, callerDir: dir, block: b, target });
         }
-        visit(file, dir, b.blocks);
+        visit(file, dir, b.blocks, false);
       }
     };
     const refsByAddress = new Map<string, { file: string; ref: TfRef }[]>();
     for (const f of this.parsed.values()) {
       if (!f.path.endsWith('.tf')) continue;
-      visit(f.path, dirOf(f.path), f.blocks);
+      visit(f.path, dirOf(f.path), f.blocks, true);
       for (const ref of f.refs) {
         if (ref.parts.length < 2) continue;
         const key = `${ref.parts[0]}.${ref.parts[1]}`;

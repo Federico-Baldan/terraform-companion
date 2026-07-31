@@ -366,3 +366,62 @@ locals {
     expect(body).not.toContain('differs per module instance');
   });
 });
+
+/** Terraform reads an explicit `null` module input as "not set", which is how a
+ *  caller opts back into the module's own default. Reporting `null` named a
+ *  value the module never sees. */
+describe('an explicit null at the call site', () => {
+  it('falls back to the module default', async () => {
+    const idx = await buildIndex({
+      '/n/main.tf': 'module "a" {\n  source = "./mod"\n  env    = null\n}\n',
+      '/n/mod/variables.tf': 'variable "env" {\n  default = "fallback"\n}\n',
+    });
+    const used = emptyUsage();
+    const scope: EvalScope = { index: idx, moduleDir: '/n/mod', used };
+    expect(resolveRef(['var', 'env'], scope)).toBe('fallback');
+    expect([...used.defaults.keys()]).toContain('env');
+  });
+
+  it('still reports a real value passed by another instance', async () => {
+    const idx = await buildIndex({
+      '/n2/main.tf':
+        'module "a" {\n  source = "./mod"\n  env    = null\n}\nmodule "b" {\n  source = "./mod"\n  env    = "prod"\n}\n',
+      '/n2/mod/variables.tf': 'variable "env" {\n  default = "fallback"\n}\n',
+    });
+    const used = emptyUsage();
+    const scope: EvalScope = { index: idx, moduleDir: '/n2/mod', used };
+    // the two instances genuinely differ: one takes the default, one does not
+    expect(resolveRef(['var', 'env'], scope)).toBe(UNKNOWN);
+    expect(used.divergedAt).toBeDefined();
+  });
+});
+
+/** Rendering throws the string/non-string distinction away, so instances
+ *  passing ["8080"] and [8080] compared equal and one instance's type was
+ *  handed back for both. for_each rejects numbers, so the refactor was offered
+ *  on a module where it cannot work. */
+describe('instances that differ only in element type', () => {
+  it('are reported as diverging, not as agreeing', async () => {
+    const idx = await buildIndex({
+      '/t/a/main.tf': 'module "m" {\n  source = "../mod"\n  items  = ["8080"]\n}\n',
+      '/t/b/main.tf': 'module "m" {\n  source = "../mod"\n  items  = [8080]\n}\n',
+      '/t/mod/variables.tf': 'variable "items" {}\n',
+    });
+    const used = emptyUsage();
+    const scope: EvalScope = { index: idx, moduleDir: '/t/mod', used };
+    expect(resolveRef(['var', 'items'], scope)).toBe(UNKNOWN);
+    expect(used.divergedAt).toBeDefined();
+  });
+
+  it('still agrees when the types match', async () => {
+    const idx = await buildIndex({
+      '/t2/a/main.tf': 'module "m" {\n  source = "../mod"\n  items  = ["8080"]\n}\n',
+      '/t2/b/main.tf': 'module "m" {\n  source = "../mod"\n  items  = ["8080"]\n}\n',
+      '/t2/mod/variables.tf': 'variable "items" {}\n',
+    });
+    const used = emptyUsage();
+    const scope: EvalScope = { index: idx, moduleDir: '/t2/mod', used };
+    expect(resolveRef(['var', 'items'], scope)).toBe('[8080]');
+    expect(used.divergedAt).toBeUndefined();
+  });
+});

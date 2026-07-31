@@ -1,4 +1,4 @@
-import { attrOf, spanContains, stripQuotes, walkBlocks } from '../core/hcl';
+import { attrOf, spanContains, stripComments, stripQuotes, walkBlocks } from '../core/hcl';
 import type { LintFinding, ParsedFile, Span, TfRef } from '../core/model';
 
 const DEPENDABLE = new Set(['resource', 'data', 'module', 'output']);
@@ -86,9 +86,13 @@ const SPLAT_INDEX = /^\s*\[\s*\*\s*\]/;
  *  `[*]` is the exception, reading the whole set. An unrecognised index reads
  *  as narrowing, so the fix is withheld. */
 function coversAllInstances(file: ParsedFile, ref: TfRef): boolean {
-  let rest = (file.lines[ref.span.end.row] ?? '').slice(ref.span.end.column);
+  // comments are skipped like blanks: a comment between the reference and its
+  // index used to stop the scan, and the index it was hiding then never got
+  // tested — so `aws_x.y # note` + newline + `[0].id` read as covering every
+  // instance and the fix deleted a depends_on that was holding a real edge
+  let rest = stripComments((file.lines[ref.span.end.row] ?? '').slice(ref.span.end.column));
   for (let row = ref.span.end.row; rest.trim() === '' && row + 1 < file.lines.length; ) {
-    rest = file.lines[++row] ?? '';
+    rest = stripComments(file.lines[++row] ?? '');
   }
   return ANY_INDEX.test(rest) ? SPLAT_INDEX.test(rest) : true;
 }

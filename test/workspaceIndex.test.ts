@@ -45,6 +45,19 @@ describe('resolveRel', () => {
     expect(resolveRel('modules/vpc', '..')).toBe('modules');
   });
 
+  /** A relative base has no root to clamp at: climbing above it lands outside
+   *  the opened folder, which is a real place a `module` block can point.
+   *  Dropping the extra `..` collapsed it onto an unrelated in-workspace dir, so
+   *  `live/app` sourcing `../../../modules/vpc` was attributed to the workspace's
+   *  own `modules/vpc` — and its vars then resolved from the wrong call site. */
+  it('keeps climbing above a relative base instead of collapsing onto the top', () => {
+    expect(resolveRel('live/app', '../../../modules/vpc')).toBe('../modules/vpc');
+    // the in-workspace path it used to be confused with stays distinct
+    expect(resolveRel('live/app', '../../modules/vpc')).toBe('modules/vpc');
+    expect(resolveRel('sibling', '../..')).toBe('..');
+    expect(resolveRel('..', '..')).toBe('../..');
+  });
+
   it('clamps at the filesystem root instead of turning absolute into relative', () => {
     // popping past the root used to erase that the base was absolute,
     // resolving "/a" + "../../b" to the relative key "b"
@@ -183,5 +196,23 @@ describe('build resilience', () => {
     );
     expect(index.files().map((f) => f.path)).toEqual(['/w/a.tf', '/w/b.tf']);
     expect(skipped).toEqual(['/w/gone.tf']);
+  });
+});
+
+/** `variable`, `locals` and `module` declare things only at the top level of a
+ *  file. A provider schema may define a nested block sharing one of those
+ *  names, and reading it as a declaration invented a local that the
+ *  unused-locals lint then reported against code that has no such local. */
+describe('declarations are top-level only', () => {
+  it('ignores a nested block that happens to be called locals', async () => {
+    const idx = new WorkspaceIndex();
+    await idx.updateFile('/n/main.tf', 'resource "a" "b" {\n  locals {\n    x = 1\n  }\n}\n');
+    expect(idx.localsOf('/n')).toEqual([]);
+  });
+
+  it('still indexes a real top-level locals block', async () => {
+    const idx = new WorkspaceIndex();
+    await idx.updateFile('/n2/main.tf', 'locals {\n  x = 1\n}\n');
+    expect(idx.localsOf('/n2').map((l) => l.name)).toEqual(['x']);
   });
 });

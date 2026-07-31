@@ -16,7 +16,11 @@ export function registerCacheCleaner(
 ): void {
   // deferred: scanning disk sizes must never slow down activation
   let disposed = false;
-  const timer = setTimeout(() => void scan(log, () => disposed), 5_000);
+  // caught rather than voided: nothing is awaiting this, so a rejection would
+  // land on the extension host as an unhandled one
+  const timer = setTimeout(() => {
+    scan(log, () => disposed).catch((e) => log(`cacheCleaner: scan failed: ${e}`));
+  }, 5_000);
   // clearTimeout only helps before the 5s elapses — a scan already walking the
   // disk needs its own stop signal, or it deletes caches after deactivation
   context.subscriptions.push({
@@ -43,13 +47,18 @@ async function scan(log: (m: string) => void, cancelled: () => boolean): Promise
       log(`cacheCleaner: scan failed in ${folder.uri.fsPath}: ${e}`);
     }
   }
-  if (stale.length === 0 || cancelled()) return;
+  // workspace folders may nest — VS Code allows both /repo and /repo/infra —
+  // and a cache under both is found once per folder. Counted twice it inflates
+  // the number and the size in the prompt, and the second delete of an
+  // already-deleted path succeeds silently and inflates the result too.
+  const unique = [...new Map(stale.map((c) => [c.dir, c])).values()];
+  if (unique.length === 0 || cancelled()) return;
 
-  const total = stale.reduce((s, c) => s + c.sizeBytes, 0);
-  for (const c of stale) log(`cacheCleaner: stale ${c.dir} (${formatSize(c.sizeBytes)})`);
+  const total = unique.reduce((s, c) => s + c.sizeBytes, 0);
+  for (const c of unique) log(`cacheCleaner: stale ${c.dir} (${formatSize(c.sizeBytes)})`);
   if (!cacheCleanerAutoDelete()) {
     const choice = await vscode.window.showWarningMessage(
-      `Terraform Companion: ${stale.length} .terraform folder${stale.length === 1 ? '' : 's'} with no activity for over ${effectiveStaleDays(staleDays)} days (${formatSize(total)}). Delete them? They are only caches: terraform init recreates them (the selected workspace resets to default, and a module initialised with -backend-config needs those flags again).`,
+      `Terraform Companion: ${unique.length} .terraform folder${unique.length === 1 ? '' : 's'} with no activity for over ${effectiveStaleDays(staleDays)} days (${formatSize(total)}). Delete them? They are only caches: terraform init recreates them (the selected workspace resets to default, and a module initialised with -backend-config needs those flags again).`,
       'Delete',
       'Ignore',
     );
@@ -58,7 +67,7 @@ async function scan(log: (m: string) => void, cancelled: () => boolean): Promise
 
   let freed = 0;
   let deleted = 0;
-  for (const c of stale) {
+  for (const c of unique) {
     if (cancelled()) return;
     if (!isTerraformCacheDir(c.dir)) continue; // hard guard: only .terraform dirs
     // the prompt may have sat open for a long time

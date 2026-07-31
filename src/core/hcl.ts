@@ -30,6 +30,31 @@ export function walkBlocks(blocks: TfBlock[], visit: (b: TfBlock) => void): void
   }
 }
 
+/** A line's text with its comments removed, for look-ahead that asks "is there
+ *  anything meaningful left here". `#` and `//` run to the end of the line;
+ *  `/*` can close and be followed by real code, and if it doesn't close on this
+ *  line the remainder is comment too.
+ *
+ *  Deliberately not a lexer: it does not know a `#` inside a string literal
+ *  from a real comment. Both callers scan the text *after* a reference and use
+ *  the result only to decide whether to withhold a fix, so the worst a
+ *  misreading does is withhold one — never offer an edit it shouldn't. */
+export function stripComments(text: string): string {
+  let out = '';
+  let i = 0;
+  while (i < text.length) {
+    if (text.startsWith('#', i) || text.startsWith('//', i)) break;
+    if (text.startsWith('/*', i)) {
+      const close = text.indexOf('*/', i + 2);
+      if (close === -1) break;
+      i = close + 2;
+      continue;
+    }
+    out += text[i++];
+  }
+  return out;
+}
+
 export interface TextEdit {
   span: Span;
   newText: string;

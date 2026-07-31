@@ -279,3 +279,39 @@ describe('an indexed reference does not make a bare depends_on redundant', () =>
     expect(findings[0]!.fix!.newText).toBe('[aws_s3_bucket.b]');
   });
 });
+
+/** The look-ahead that finds an index on a later line stopped at the first
+ *  non-blank remainder, and a comment is not blank. The index behind it was
+ *  never tested, so the reference read as covering every instance and the fix
+ *  offered to delete a depends_on that was holding a real edge. */
+describe('a comment does not hide the index behind it', () => {
+  it('keeps depends_on when a trailing comment precedes the index', () => {
+    const src = `resource "aws_instance" "web" {
+  bucket = aws_s3_bucket.b # the primary bucket
+    [0].id
+  depends_on = [aws_s3_bucket.b]
+}
+`;
+    expect(detectRedundantDependsOn(parseFile('a.tf', src))).toEqual([]);
+  });
+
+  it('keeps depends_on when a whole comment line sits between them', () => {
+    const src = `resource "aws_instance" "web" {
+  bucket = aws_s3_bucket.b
+  // pick the first one
+    [0].id
+  depends_on = [aws_s3_bucket.b]
+}
+`;
+    expect(detectRedundantDependsOn(parseFile('a.tf', src))).toEqual([]);
+  });
+
+  it('still reports a genuinely redundant entry that only carries a comment', () => {
+    const src = `resource "aws_instance" "web" {
+  bucket = aws_s3_bucket.b.id # the primary bucket
+  depends_on = [aws_s3_bucket.b]
+}
+`;
+    expect(detectRedundantDependsOn(parseFile('a.tf', src))).toHaveLength(1);
+  });
+});

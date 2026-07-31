@@ -675,3 +675,45 @@ describe('safeToRefactor is computed only when read', () => {
     expect(scans).toBe(afterFirstRead);
   });
 });
+
+/** The scan that finds an accessor on the next line stopped at the first
+ *  non-blank remainder, and a comment is not blank. The `.ami` behind it went
+ *  unseen, so a list of objects looked like a list of strings and the refactor
+ *  was offered — for_each rejects it at plan time, and on applied state the
+ *  rewrite recreates every instance. */
+describe('a comment does not hide the element access behind it', () => {
+  it('stays unsafe when a trailing comment precedes the accessor', () => {
+    const src = `resource "aws_instance" "srv" {
+  count = length(var.servers)
+  ami   = var.servers[count.index] # pick the ami
+    .ami
+}
+`;
+    const patterns = detectCountLength(parseFile(normalizePath('/w/c1.tf'), src));
+    expect(patterns).toHaveLength(1);
+    expect(patterns[0]!.safeToRefactor).toBe(false);
+  });
+
+  it('stays unsafe when a whole comment line sits between them', () => {
+    const src = `resource "aws_instance" "srv" {
+  count = length(var.servers)
+  ami   = var.servers[count.index]
+  // the image for this one
+    ["ami"]
+}
+`;
+    const patterns = detectCountLength(parseFile(normalizePath('/w/c2.tf'), src));
+    expect(patterns).toHaveLength(1);
+    expect(patterns[0]!.safeToRefactor).toBe(false);
+  });
+
+  it('is still safe when the comment hides nothing', () => {
+    const src = `resource "aws_instance" "srv" {
+  count = length(var.names)
+  name  = var.names[count.index] # just a name
+}
+`;
+    const patterns = detectCountLength(parseFile(normalizePath('/w/c3.tf'), src));
+    expect(patterns[0]!.safeToRefactor).toBe(true);
+  });
+});

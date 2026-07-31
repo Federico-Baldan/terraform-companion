@@ -1,5 +1,11 @@
 import { beforeAll, describe, expect, it } from 'vitest';
-import { type EvalScope, emptyUsage, resolveRef, UNKNOWN } from '../src/core/evaluator';
+import {
+  type EvalScope,
+  emptyUsage,
+  type ResolvedValue,
+  resolveRef,
+  UNKNOWN,
+} from '../src/core/evaluator';
 import { parseFile } from '../src/core/parser';
 import { WorkspaceIndex } from '../src/core/workspaceIndex';
 import {
@@ -10,6 +16,10 @@ import {
   tfvarsValues,
 } from '../src/features/resolvedHover';
 import { initTestParser, tfvarsIn } from './helpers';
+
+/** A conflict row's value, as the evaluator hands it over. Every case here
+ *  passes a plain string; the shape only differs for a list or object. */
+const scalar = (text: string): ResolvedValue => ({ text, shape: 'scalar' });
 
 const LOCALS = `locals {
   name_prefix = "\${var.project_name}-\${var.environment}"
@@ -94,7 +104,7 @@ describe('F7 hover markdown', () => {
       copyCommand,
     });
     expect(md).toContain('**local.name_prefix** = `prod-name-dev`');
-    expect(md).toContain('_(from prod.tfvars + default in variables.tf)_');
+    expect(md).toContain('_13 chars · from prod.tfvars + default in variables.tf_');
     expect(md).toContain(
       `[Copy value](command:${copyCommand}?${encodeURIComponent(JSON.stringify(['prod-name-dev']))})`,
     );
@@ -113,14 +123,14 @@ describe('F7 hover markdown', () => {
       copyCommand,
     });
     expect(md).toContain(
-      '_(from terraform.tfvars + via module "app" (main.tf) → module "db" (app.tf))_',
+      '_4 chars · from terraform.tfvars + via module "app" (main.tf) → module "db" (app.tf)_',
     );
   });
 
   it('lists one value per instance when module calls disagree', () => {
     const used = emptyUsage();
-    used.conflicts.set('module "a" (main.tf)', 'one');
-    used.conflicts.set('module "b" (main.tf)', 'two');
+    used.conflicts.set('module "a" (main.tf)', scalar('one'));
+    used.conflicts.set('module "b" (main.tf)', scalar('two'));
     const md = hoverMarkdown({ target: ['var', 'env'], value: UNKNOWN, used, copyCommand });
     expect(md).toContain('**var.env** differs per module instance:');
     expect(md).toContain('- module "a" (main.tf): `one`');
@@ -130,7 +140,7 @@ describe('F7 hover markdown', () => {
 
   it('escapes markdown-active characters in labels and file names', () => {
     const used = emptyUsage();
-    used.conflicts.set('module "a" ([evil].tf)', 'one');
+    used.conflicts.set('module "a" ([evil].tf)', scalar('one'));
     const md = hoverMarkdown({ target: ['var', 'env'], value: UNKNOWN, used, copyCommand });
     // brackets escaped → the label cannot become link text for an injected link
     expect(md).toContain('- module "a" (\\[evil\\].tf): `one`');
@@ -160,6 +170,76 @@ describe('F7 hover markdown', () => {
     expect(md).toContain('``a`b``');
   });
 
+  it('leads the metadata line under the value with the character count', () => {
+    const used = emptyUsage();
+    used.tfvarsFiles.add('/mod/prod.tfvars');
+    const md = hoverMarkdown({
+      target: ['local', 'tg_name'],
+      value: 'satispay-payments-green-prod',
+      used,
+      copyCommand,
+    });
+    // one metadata line, not a stack of italics: count, then where it came from
+    expect(md).toContain(
+      '**local.tg_name** = `satispay-payments-green-prod`\n\n_28 chars · from prod.tfvars_',
+    );
+  });
+
+  it('says "char" for a value of one, and counts an empty value as zero', () => {
+    const one = hoverMarkdown({
+      target: ['var', 'x'],
+      value: 'a',
+      used: emptyUsage(),
+      copyCommand,
+    });
+    expect(one).toContain('_1 char_');
+    const none = hoverMarkdown({
+      target: ['var', 'x'],
+      value: '',
+      used: emptyUsage(),
+      copyCommand,
+    });
+    expect(none).toContain('_0 chars_');
+  });
+
+  it('counts the real value, not the escaped spelling or its UTF-16 units', () => {
+    // "a\nb" is 3 characters; the body renders it as the 4-character `a\nb`
+    const nl = hoverMarkdown({
+      target: ['local', 'motd'],
+      value: 'a\nb',
+      used: emptyUsage(),
+      copyCommand,
+    });
+    expect(nl).toContain('_3 chars_');
+    // 'é' plus an emoji: 2 characters, 3 UTF-16 units
+    const wide = hoverMarkdown({
+      target: ['local', 'tag'],
+      value: 'é🌍',
+      used: emptyUsage(),
+      copyCommand,
+    });
+    expect(wide).toContain('_2 chars_');
+  });
+
+  it('counts nothing when there is no value to count', () => {
+    const md = hoverMarkdown({
+      target: ['var', 'region'],
+      value: UNKNOWN,
+      used: emptyUsage(),
+      copyCommand,
+    });
+    expect(md).not.toContain('chars_');
+  });
+
+  it('gives every conflicting instance its own count', () => {
+    const used = emptyUsage();
+    used.conflicts.set('module "a" (main.tf)', scalar('short'));
+    used.conflicts.set('module "b" (main.tf)', scalar('a-much-longer-name'));
+    const md = hoverMarkdown({ target: ['var', 'env'], value: UNKNOWN, used, copyCommand });
+    expect(md).toContain('- module "a" (main.tf): `short` (5 chars) —');
+    expect(md).toContain('- module "b" (main.tf): `a-much-longer-name` (18 chars) —');
+  });
+
   it('explains an unknown var with no provenance', () => {
     const md = hoverMarkdown({
       target: ['var', 'region'],
@@ -168,7 +248,45 @@ describe('F7 hover markdown', () => {
       tfvarsNames: ['dev.tfvars'],
       copyCommand,
     });
-    expect(md).toContain('_(no value: not set in dev.tfvars and no default)_');
+    expect(md).toContain('_no value: not set in dev.tfvars and no default_');
+  });
+
+  /** The count exists to warn before a field's hard ceiling does. A number
+   *  measured on a string that still has ⟨unknown⟩ in it measures the
+   *  placeholder's spelling, so it would warn about the wrong length —
+   *  worse than staying quiet. */
+  it('counts nothing when part of the value is still unknown', () => {
+    const md = hoverMarkdown({
+      target: ['local', 'name'],
+      value: `app-${UNKNOWN}`,
+      used: emptyUsage(),
+      copyCommand,
+    });
+    expect(md).toContain(`**local.name** = \`app-${UNKNOWN}\``);
+    expect(md).not.toContain('chars');
+  });
+
+  it('gives a conflicting instance no count when its value is unknown', () => {
+    const used = emptyUsage();
+    used.conflicts.set('module "a" (main.tf)', scalar('dev'));
+    used.conflicts.set('module "b" (main.tf)', scalar(UNKNOWN));
+    const md = hoverMarkdown({ target: ['var', 'env'], value: UNKNOWN, used, copyCommand });
+    expect(md).toContain('- module "a" (main.tf): `dev` (3 chars) —');
+    expect(md).toContain(`- module "b" (main.tf): \`${UNKNOWN}\` —`);
+  });
+
+  /** Every other untrusted string in the hover goes through escapeMd; the
+   *  title is one the parser will accept verbatim from `variable "…"`, and the
+   *  hover is rendered trusted. */
+  it('escapes markdown in the name, which comes from a block label', () => {
+    const md = hoverMarkdown({
+      target: ['var', '![beacon](https://evil.example/x.png)'],
+      value: 'v',
+      used: emptyUsage(),
+      copyCommand,
+    });
+    expect(md).not.toContain('![beacon](https://evil.example/x.png)');
+    expect(md).toContain('\\[beacon\\]');
   });
 });
 
@@ -360,7 +478,7 @@ describe('multi-line values in the hover body', () => {
 
   it('escapes newlines in the per-instance conflict rows too', () => {
     const used = emptyUsage();
-    used.conflicts.set('module "app" (dev/main.tf)', 'a\n\nb');
+    used.conflicts.set('module "app" (dev/main.tf)', scalar('a\n\nb'));
     const body = hoverMarkdown({
       target: ['local', 'name'],
       value: UNKNOWN,
@@ -383,5 +501,94 @@ describe('multi-line values in the hover body', () => {
       { index, tfvarsOf: () => new Map(), copyCommand: 'c' },
     );
     expect(body).toContain('`Welcome\\n\\nPlease log out`');
+  });
+});
+
+/** The count answers "will this name fit in the field it's headed for", and a
+ *  list has no answer: `[a, b]` is this hover's notation for two values, and
+ *  its brackets and comma are punctuation nobody's infrastructure contains.
+ *  The rendered text alone cannot tell that from a string reading "[a, b]",
+ *  which is why the shape travels out of the evaluator with it. */
+describe('the character count follows the value, not its spelling', () => {
+  const copyCommand = 'tfCompanion.copyValue';
+  const path = '/shape/main.tf';
+  const src = `locals {
+  names   = ["alpha", "beta"]
+  cfg     = { host = "db.internal" }
+  literal = "[alpha, beta]"
+  port    = 8080
+}
+
+resource "aws_x" "y" {
+  a = local.names
+  b = local.cfg
+  c = local.literal
+  d = local.port
+}
+`;
+  let shapeIndex: WorkspaceIndex;
+
+  beforeAll(async () => {
+    const files: Record<string, string> = { [path]: src };
+    shapeIndex = await WorkspaceIndex.build({
+      listFiles: async () => Object.keys(files),
+      readFile: async (p) => files[p] ?? '',
+    });
+  });
+
+  const hoverAt = (parts: string[]) => {
+    const file = shapeIndex.file(path);
+    if (!file) throw new Error('fixture not indexed');
+    const ref = file.refs.find((r) => r.parts.join('.') === parts.join('.'));
+    if (!ref) throw new Error(`no reference to ${parts.join('.')}`);
+    return computeHover(file, ref.span.start, {
+      index: shapeIndex,
+      tfvarsOf: () => new Map(),
+      copyCommand,
+    });
+  };
+
+  it('counts nothing for a list', () => {
+    const md = hoverAt(['local', 'names']);
+    expect(md).toContain('**local.names** = `[alpha, beta]`');
+    expect(md).not.toContain('chars');
+  });
+
+  it('counts nothing for an object', () => {
+    const md = hoverAt(['local', 'cfg']);
+    expect(md).toContain('**local.cfg** = `{host = db.internal}`');
+    expect(md).not.toContain('chars');
+  });
+
+  /** The case that made the text-only rule impossible: identical spelling to a
+   *  two-element list, but it is one string and its length is real. */
+  it('still counts a string that is spelled like a list', () => {
+    const md = hoverAt(['local', 'literal']);
+    expect(md).toContain('**local.literal** = `[alpha, beta]`');
+    expect(md).toContain('_13 chars_');
+  });
+
+  it('still counts a number, which is one value with one spelling', () => {
+    expect(hoverAt(['local', 'port'])).toContain('_4 chars_');
+  });
+
+  it('counts nothing for a collection handed to the markdown directly', () => {
+    const md = hoverMarkdown({
+      target: ['local', 'names'],
+      value: '[alpha, beta]',
+      shape: 'collection',
+      used: emptyUsage(),
+      copyCommand,
+    });
+    expect(md).not.toContain('chars');
+  });
+
+  it('gives a conflicting instance no count when that instance passes a list', () => {
+    const used = emptyUsage();
+    used.conflicts.set('module "a" (main.tf)', scalar('prod'));
+    used.conflicts.set('module "b" (main.tf)', { text: '[a, b]', shape: 'collection' });
+    const md = hoverMarkdown({ target: ['var', 'env'], value: UNKNOWN, used, copyCommand });
+    expect(md).toContain('- module "a" (main.tf): `prod` (4 chars) —');
+    expect(md).toContain('- module "b" (main.tf): `[a, b]` —');
   });
 });

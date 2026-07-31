@@ -9,9 +9,20 @@ function cfg(): vscode.WorkspaceConfiguration {
   return vscode.workspace.getConfiguration('tfCompanion');
 }
 
+/** settings.json is not type-checked, so a value can be anything the user
+ *  typed. `"false"` is a string, and a truthy one — read as a boolean it turns
+ *  a feature on that was meant to be off, and for `cacheCleaner.autoDelete`
+ *  that means deleting without asking. Same reasoning as the numeric readers
+ *  below: a garbled value falls back to the declared default, never to the more
+ *  aggressive behaviour. */
+function bool(key: string, fallback: boolean): boolean {
+  const value = cfg().get<unknown>(key, fallback);
+  return typeof value === 'boolean' ? value : fallback;
+}
+
 /** Every feature exposes a tfCompanion.<feature>.enabled flag. */
 export function featureEnabled(feature: string): boolean {
-  return cfg().get<boolean>(`${feature}.enabled`, true);
+  return bool(`${feature}.enabled`, true);
 }
 
 /** Never below five minutes. Lenses recompute on every buffer change, so a TTL
@@ -30,13 +41,19 @@ export function versionLensCacheTtlHours(): number {
 }
 
 export function versionHygieneVariableDocs(): boolean {
-  return cfg().get<boolean>('versionHygiene.variableDocs', false);
+  return bool('versionHygiene.variableDocs', false);
 }
 
+const DEFAULT_STALE_DAYS = 30;
+/** package.json declares a minimum of 1: below that every cache in the
+ *  workspace reads as stale, which is the most destructive answer available. */
+const MIN_STALE_DAYS = 1;
+
 export function cacheCleanerStaleDays(): number {
-  return cfg().get<number>('cacheCleaner.staleDays', 30);
+  const configured = cfg().get<number>('cacheCleaner.staleDays', DEFAULT_STALE_DAYS);
+  return Number.isFinite(configured) ? Math.max(configured, MIN_STALE_DAYS) : DEFAULT_STALE_DAYS;
 }
 
 export function cacheCleanerAutoDelete(): boolean {
-  return cfg().get<boolean>('cacheCleaner.autoDelete', false);
+  return bool('cacheCleaner.autoDelete', false);
 }

@@ -204,3 +204,34 @@ describe('a constraint that matches nothing published', () => {
     expect(latestAdmitted(['5.0.0', '5.98.0', '6.2.0'], '4.0.0')).toBeUndefined();
   });
 });
+
+/** hashicorp/go-version — the parser Terraform actually uses — allows an
+ *  optional `v` on the version in a constraint, so `~> v5.0` is valid and in
+ *  the wild. Anchoring the clause regex on a digit dropped every such clause,
+ *  and a constraint that parses to nothing admits everything: the lens called a
+ *  blocked major "already allowed", and the bump quick fix rewrote the range as
+ *  an exact pin without warning that it had dropped a ceiling. */
+describe('a v-prefixed version is still a version', () => {
+  const versions = ['5.0.0', '5.100.0', '6.0.0'];
+
+  it('parses the clause instead of discarding it', () => {
+    expect(parseConstraint('~> v5.0')).toEqual([{ op: '~>', version: '5.0' }]);
+    expect(parseConstraint('>= v1.0.0, < v2.0.0')).toEqual([
+      { op: '>=', version: '1.0.0' },
+      { op: '<', version: '2.0.0' },
+    ]);
+    expect(parseConstraint('v1.2.3')).toEqual([{ op: '=', version: '1.2.3' }]);
+  });
+
+  it('holds the ceiling it was written to hold', () => {
+    expect(latestAdmitted(versions, '~> v5.0')).toBe('5.100.0');
+    expect(lens(versions, '~> v5.0')).toBe(lens(versions, '~> 5.0'));
+  });
+
+  it('still parses a half-typed operator as nothing', () => {
+    expect(parseConstraint('>=')).toEqual([]);
+    expect(parseConstraint('~>')).toEqual([]);
+    // a bare "v" is not a version either
+    expect(parseConstraint('v')).toEqual([]);
+  });
+});

@@ -31,8 +31,14 @@ export function normalizeRegistrySource(raw: string): string {
 export function isRegistryModuleSource(raw: string): boolean {
   if (raw.startsWith('./') || raw.startsWith('../')) return false;
   const base = normalizeRegistrySource(raw).split('//')[0] ?? raw;
+  const segments = base.split('/');
   // a dot in the first segment is a hostname, never a registry namespace
-  if ((base.split('/')[0] ?? '').includes('.')) return false;
+  if ((segments[0] ?? '').includes('.')) return false;
+  // `.` and `..` are made of characters the slug charset allows, and they are
+  // the two that mean something to a URL parser: `a/../b` builds a request for
+  // a different module than the file names. Per-segment encoding does not stop
+  // them — a dot is unreserved, so encodeURIComponent leaves it alone.
+  if (segments.some((s) => s === '.' || s === '..')) return false;
   return REGISTRY_MODULE.test(base);
 }
 

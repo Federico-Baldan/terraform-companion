@@ -53,7 +53,14 @@ export function registerCountForEach(
             for (const e of rewriteToForEach(pattern)) {
               action.edit.replace(doc.uri, toRange(e.span), e.newText);
             }
-            action.diagnostics = ctx.diagnostics.filter((d) => d.code === 'count.lengthPattern');
+            // only this block's diagnostic: with two count blocks in one file,
+            // filtering by code alone attached both, so each action claimed to
+            // fix the other block's warning too
+            action.diagnostics = ctx.diagnostics.filter(
+              (d) =>
+                d.code === 'count.lengthPattern' &&
+                !!d.range.intersection(toRange(pattern.countAttr.span)),
+            );
             actions.push(action);
           }
           return actions;
