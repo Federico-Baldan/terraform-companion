@@ -2,6 +2,13 @@
 
 Notable changes to Terraform Companion. Versions follow semver; dates are ISO (YYYY-MM-DD).
 
+## [1.1.6](https://github.com/Federico-Baldan/terraform-companion/compare/v1.1.5...v1.1.6) (2026-07-31)
+
+
+### Bug Fixes
+
+* stop quick fixes editing working config, and unfreeze a 73s hover ([8e4968d](https://github.com/Federico-Baldan/terraform-companion/commit/8e4968da45e1d243239d78b89cbaa8693638c7d0))
+
 ## [1.1.5](https://github.com/Federico-Baldan/terraform-companion/compare/v1.1.4...v1.1.5) (2026-07-22)
 
 
