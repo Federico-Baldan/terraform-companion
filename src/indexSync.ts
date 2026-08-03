@@ -1,8 +1,13 @@
 import * as vscode from 'vscode';
+import { TrackedDirs } from './core/trackedDirs';
 import { normalizePath, type WorkspaceIndex } from './core/workspaceIndex';
 import { isExcludedTfPath, isTfPath, TF_GLOB } from './vscodeUtils';
 
 const DEBOUNCE_MS = 500;
+/** How long a burst of index changes is allowed to gather before consumers are
+ *  told. Short enough to stay invisible next to DEBOUNCE_MS, long enough that a
+ *  git checkout's per-file watcher events land in one batch. */
+const COALESCE_MS = 50;
 
 /**
  * Keeps the workspace index in sync with the editor: re-parses on edit
@@ -14,6 +19,7 @@ export function registerIndexSync(
   /** paths whose indexed content just changed, so consumers recompute only what
    *  those reach instead of the whole workspace */
   onChanged: (changed: string[]) => void,
+  log?: (m: string) => void,
 ): void {
   const timers = new Map<string, ReturnType<typeof setTimeout>>();
   /** Bumped when a path's content is superseded. A disk read started before the
@@ -23,6 +29,38 @@ export function registerIndexSync(
     const next = (epoch.get(path) ?? 0) + 1;
     epoch.set(path, next);
     return next;
+  };
+  /** Ancestors of every path the three maps above can hold. Seeded from the
+   *  initial scan, then extended as timers arm and disk reads start, so it
+   *  always covers the index, `timers` and `epoch` together — the exact set the
+   *  folder-delete handler has to sweep. */
+  const tracked = new TrackedDirs();
+  for (const file of index.files()) tracked.add(file.path);
+
+  /** Changed paths waiting to be announced.
+   *
+   *  A burst — git checkout, git pull, `terraform fmt -recursive`, codegen —
+   *  reaches the watcher as one event per file, and announcing each one
+   *  separately makes every consumer redo workspace-wide work: the index drops
+   *  its whole derived directory map on any change, so the next lint rebuilds
+   *  it from every block and ref in the workspace. Per file that is O(files);
+   *  across a burst it was O(files²), which is the difference between a pull
+   *  costing milliseconds and costing a minute of pegged extension host.
+   *
+   *  Collapsing to one announcement per burst keeps consumers unchanged — they
+   *  already take a list — and a Set also drops the duplicate a save produces,
+   *  where the buffer debounce and the disk watcher both report the same path. */
+  const pendingChanged = new Set<string>();
+  let flushTimer: ReturnType<typeof setTimeout> | undefined;
+  const announce = (paths: readonly string[]): void => {
+    for (const p of paths) pendingChanged.add(p);
+    if (flushTimer || pendingChanged.size === 0) return;
+    flushTimer = setTimeout(() => {
+      flushTimer = undefined;
+      const batch = [...pendingChanged];
+      pendingChanged.clear();
+      onChanged(batch);
+    }, COALESCE_MS);
   };
   const scheduleRefresh = (doc: vscode.TextDocument) => {
     // open/change fire for virtual docs too (a git diff of a .tf, a search
@@ -34,6 +72,7 @@ export function registerIndexSync(
     if (!isTfPath(path) || isExcludedTfPath(path)) return;
     // a .tf opened from outside the workspace must not join (and stay in) the index
     if (!vscode.workspace.getWorkspaceFolder(doc.uri)) return;
+    tracked.add(path);
     const pending = timers.get(path);
     if (pending) clearTimeout(pending);
     timers.set(
@@ -42,8 +81,18 @@ export function registerIndexSync(
         timers.delete(path);
         // the buffer is newer: an in-flight disk read must not land on top of it
         supersede(path);
-        await index.updateFile(path, doc.getText());
-        onChanged([path]);
+        // Nothing awaits this callback, so a throw here lands on the extension
+        // host as an unhandled rejection. The parser recurses over the CST
+        // without a depth bound, so deeply nested HCL — a half-typed file with
+        // runaway brackets is enough — raises RangeError, and it would do so on
+        // every keystroke while the file stayed open.
+        try {
+          await index.updateFile(path, doc.getText());
+        } catch (e) {
+          log?.(`Not indexed (parse failed): ${path}: ${e}`);
+          return;
+        }
+        announce([path]);
       }, DEBOUNCE_MS),
     );
   };
@@ -56,6 +105,7 @@ export function registerIndexSync(
     if (vscode.workspace.textDocuments.some((d) => d.isDirty && d.uri.fsPath === uri.fsPath)) {
       return;
     }
+    tracked.add(uri.fsPath);
     const token = supersede(uri.fsPath);
     try {
       const text = new TextDecoder().decode(await vscode.workspace.fs.readFile(uri));
@@ -63,9 +113,11 @@ export function registerIndexSync(
       // would put the file back into the index after removeFile took it out.
       if (epoch.get(uri.fsPath) !== token) return;
       await index.updateFile(uri.fsPath, text);
-      onChanged([uri.fsPath]);
-    } catch {
-      // unreadable or deleted right after the event: nothing to index
+      announce([uri.fsPath]);
+    } catch (e) {
+      // unreadable or deleted right after the event — but a parse failure lands
+      // here too, and reading that as a missing file hid it completely
+      log?.(`Not indexed (unreadable, deleted, or parse failed): ${uri.fsPath}: ${e}`);
     }
   };
 
@@ -82,6 +134,12 @@ export function registerIndexSync(
       if (isTfPath(uri.fsPath)) return;
       // npm install / terraform init delete thousands of never-indexed paths
       if (isExcludedTfPath(`${uri.fsPath}/`)) return;
+      // Everything below is O(tracked paths), and this handler runs for every
+      // path removed anywhere in the workspace that the exclusions above don't
+      // cover — a branch switch, a `cargo build`, an `rm -rf dist`. Those hold
+      // nothing indexed, so the three sweeps found nothing and cost seconds of
+      // blocked extension host per operation. This is the O(1) way to ask.
+      if (!tracked.mayContain(uri.fsPath)) return;
       const prefix = `${normalizePath(uri.fsPath)}/`;
       // Both must run even when nothing under the folder is indexed yet: an
       // armed timer or an in-flight read would put a file back after the removal.
@@ -97,7 +155,7 @@ export function registerIndexSync(
       const gone = index.pathsUnder(uri.fsPath);
       if (gone.length === 0) return;
       for (const p of gone) index.removeFile(p);
-      onChanged(gone);
+      announce(gone);
     }),
   );
   context.subscriptions.push(
@@ -105,6 +163,11 @@ export function registerIndexSync(
       dispose: () => {
         for (const t of timers.values()) clearTimeout(t);
         timers.clear();
+        // a flush after deactivation would touch a disposed diagnostic
+        // collection and a disposed status bar item
+        if (flushTimer) clearTimeout(flushTimer);
+        flushTimer = undefined;
+        pendingChanged.clear();
       },
     },
     vscode.workspace.onDidChangeTextDocument((e) => scheduleRefresh(e.document)),
@@ -131,7 +194,13 @@ export function registerIndexSync(
       // unusual — and removeFile is a no-op for one, since files are keyed
       // individually. Sweeping pathsUnder() covers it, and is why folderWatcher
       // steps aside for isTfPath. A no-op for an ordinary single-file delete.
-      const nested = index.pathsUnder(uri.fsPath);
+      //
+      // Which is the point of the guard: an ordinary .tf file is never an
+      // ancestor of anything, so the scan is skipped outright, while a
+      // directory named `foo.tf` holding indexed files is in the set and still
+      // gets swept. Deleting a folder of 1000 .tf files used to be 1000 full
+      // passes over the index.
+      const nested = tracked.mayContain(uri.fsPath) ? index.pathsUnder(uri.fsPath) : [];
       for (const p of nested) {
         const t = timers.get(p);
         if (t) {
@@ -142,7 +211,7 @@ export function registerIndexSync(
       }
       index.removeFile(uri.fsPath);
       for (const p of nested) index.removeFile(p);
-      onChanged([uri.fsPath, ...nested]);
+      announce([uri.fsPath, ...nested]);
     }),
   );
 }

@@ -65,11 +65,16 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   registerCountForEach(context, index, activeTfvars);
   registerCacheCleaner(context, log);
 
-  registerIndexSync(context, index, (changed) => {
-    pipeline.refreshPaths(changed);
-    versionLens.refresh();
-    activeTfvars.updateStatusBar();
-  });
+  registerIndexSync(
+    context,
+    index,
+    (changed) => {
+      pipeline.refreshPaths(changed);
+      versionLens.refresh();
+      activeTfvars.updateStatusBar();
+    },
+    log,
+  );
 
   // settings changes must take effect without an edit: disabling a rule has to
   // clear its diagnostics right away, not leave them until the next keystroke

@@ -10,12 +10,31 @@ export interface ParserWasmPaths {
   grammarWasm: string;
 }
 
+/** In flight, so overlapping callers await the same init instead of racing.
+ *  Guarding on `parser` alone only closed the window *after* both awaits below
+ *  had resolved: two concurrent calls would each run `Parser.init` and
+ *  `Language.load`, re-initialising the Emscripten module and orphaning a
+ *  Parser and a Language in the WASM heap with nothing left to `.delete()`
+ *  them. One caller today, but it is the only unguarded allocation here. */
+let initializing: Promise<void> | undefined;
+
 export async function initParser(paths: ParserWasmPaths): Promise<void> {
   if (parser) return;
-  await Parser.init({ locateFile: () => paths.runtimeWasm });
-  language = await Language.load(paths.grammarWasm);
-  parser = new Parser();
-  parser.setLanguage(language);
+  if (initializing) return initializing;
+  initializing = (async () => {
+    await Parser.init({ locateFile: () => paths.runtimeWasm });
+    language = await Language.load(paths.grammarWasm);
+    const created = new Parser();
+    created.setLanguage(language);
+    parser = created;
+  })();
+  try {
+    await initializing;
+  } finally {
+    // cleared either way: a failed init must not pin the rejection and make
+    // every later attempt fail without retrying
+    initializing = undefined;
+  }
 }
 
 function span(node: Node): Span {
