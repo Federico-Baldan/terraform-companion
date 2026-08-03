@@ -5,6 +5,7 @@ import {
   FAILURE_COOLDOWN_MS,
   failureCooldownMs,
   MAX_FAILURE_COOLDOWN_MS,
+  MAX_FAILURE_ENTRIES,
   pruneRegistryCache,
   RegistryClient,
   type RegistryStore,
@@ -335,5 +336,51 @@ describe('an error response must not park its connection', () => {
     })) as unknown as typeof fetch;
     const client = new RegistryClient(mapStore(), fetchFn, TTL, () => 0);
     expect(await client.providerVersions('hashicorp/typo')).toBeUndefined();
+  });
+
+  /** The cooldown is keyed per source, so typing a source one character at a
+   *  time makes every prefix its own key — each firing a real request and
+   *  leaving an entry for a source that can never exist. Nothing removed them
+   *  except success, so the map grew for the life of the window. */
+  it('bounds the remembered failures instead of keeping one per source ever typed', async () => {
+    const fetchFn = (async () => ({
+      ok: false,
+      json: async () => ({}),
+    })) as unknown as typeof fetch;
+    // every key is distinct, so no cooldown is ever consulted and time can stand still
+    const client = new RegistryClient(mapStore(), fetchFn, TTL, () => 0);
+
+    const typed = MAX_FAILURE_ENTRIES + 250;
+    for (let i = 0; i < typed; i++) {
+      await client.providerVersions(`hashicorp/typo${i}`);
+    }
+    const failures = (client as unknown as { failures: Map<string, unknown> }).failures;
+    expect(failures.size).toBeLessThanOrEqual(MAX_FAILURE_ENTRIES);
+    // the most recent failures are the ones kept — evicting those would drop
+    // the cooldown for sources still being retried
+    expect(failures.has(`provider:hashicorp/typo${typed - 1}`)).toBe(true);
+    expect(failures.has('provider:hashicorp/typo0')).toBe(false);
+  });
+
+  /** A key still being retried must survive eviction: re-inserting on each
+   *  failure is what keeps Map order recency order. */
+  it('keeps a repeatedly failing source across evictions', async () => {
+    const fetchFn = (async () => ({
+      ok: false,
+      json: async () => ({}),
+    })) as unknown as typeof fetch;
+    let time = 0;
+    const client = new RegistryClient(mapStore(), fetchFn, TTL, () => time);
+
+    await client.providerVersions('hashicorp/hot');
+    for (let i = 0; i < MAX_FAILURE_ENTRIES; i++) {
+      // past the growing cooldown, so the hot key actually refetches and refreshes
+      time += MAX_FAILURE_COOLDOWN_MS + 1;
+      await client.providerVersions('hashicorp/hot');
+      await client.providerVersions(`hashicorp/cold${i}`);
+    }
+    const failures = (client as unknown as { failures: Map<string, unknown> }).failures;
+    expect(failures.size).toBeLessThanOrEqual(MAX_FAILURE_ENTRIES);
+    expect(failures.has('provider:hashicorp/hot')).toBe(true);
   });
 });

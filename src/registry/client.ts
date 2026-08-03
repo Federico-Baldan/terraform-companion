@@ -65,6 +65,20 @@ export const FAILURE_COOLDOWN_MS = 60_000;
 
 export const MAX_FAILURE_COOLDOWN_MS = 30 * 60_000;
 
+/** Ceiling on remembered failures.
+ *
+ *  Keys are source strings read from file content, and the cooldown is keyed
+ *  per source — so typing `hashicorp/aws` one character at a time makes
+ *  `hashicorp/a`, `/aw`, `/aws` each a distinct key with no cooldown of its
+ *  own. Every one fires a real request and leaves a permanent entry for a
+ *  source that can never exist. Nothing removed from this map except on
+ *  success, so a long session in a repo with churn grew it without bound.
+ *
+ *  Far above the few hundred distinct providers and modules a real workspace
+ *  references, so eviction only ever reaches typing debris. Evicting costs at
+ *  most one extra request for a source that failed long ago. */
+export const MAX_FAILURE_ENTRIES = 500;
+
 /** One minute, doubling to a thirty-minute ceiling. A hiccup and a
  *  permanently unresolvable source aren't the same failure: the first retry
  *  stays unchanged so a hiccup heals fast, and only a repeat failure decays. */
@@ -163,7 +177,16 @@ export class RegistryClient {
 
     const fail = () => {
       const previous = this.failures.get(key)?.count ?? 0;
+      // delete before set so Map iteration order is recency order — that is
+      // what the eviction below reads, and a plain re-set keeps a key at its
+      // original position, which would drop the sources still being retried
+      this.failures.delete(key);
       this.failures.set(key, { at: this.now(), count: previous + 1 });
+      while (this.failures.size > MAX_FAILURE_ENTRIES) {
+        const oldest = this.failures.keys().next();
+        if (oldest.done) break;
+        this.failures.delete(oldest.value);
+      }
     };
     const promise = (async (): Promise<string[] | undefined> => {
       try {
