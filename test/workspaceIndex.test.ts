@@ -66,6 +66,25 @@ describe('resolveRel', () => {
     expect(resolveRel('/a/b', '../../../c')).toBe('/c');
   });
 
+  /** Same clamp, on the two roots Windows has. A `startsWith('/')` test reads
+   *  `C:/w` as relative, so `..` walked off the drive and `C:/w` +
+   *  `../../modules/vpc` became the bare key `modules/vpc` — matching no
+   *  indexed directory, leaving the call site invisible, and resolving the
+   *  submodule's vars from its own defaults instead of the caller's values.
+   *  Every other case here uses a POSIX or relative base, so CI never saw it. */
+  it('clamps at a Windows drive root and a UNC share root too', () => {
+    expect(resolveRel('C:/w', '../../x')).toBe('C:/x');
+    expect(resolveRel('C:/w/envs/dev', '../../modules/vpc')).toBe('C:/w/modules/vpc');
+    // emptied down to the root, spelled the way dirOf() spells it
+    expect(resolveRel('C:/w', '..')).toBe('C:');
+    expect(resolveRel('C:/', '../x')).toBe('C:/x');
+    // a UNC share is a root as well: climbing past it must not drop the share
+    expect(resolveRel('//server/share', '../..')).toBe('//server/share');
+    expect(resolveRel('//server/share/w', '../../x')).toBe('//server/share/x');
+    // and an ordinary downward hop on either is untouched
+    expect(resolveRel('C:/w', './modules/vpc')).toBe('C:/w/modules/vpc');
+  });
+
   it('resolves a call site from a root module sitting at the top of the tree', async () => {
     const idx = new WorkspaceIndex();
     await idx.updateFile('main.tf', 'module "v" {\n  source = "./modules/vpc"\n  name = "x"\n}\n');

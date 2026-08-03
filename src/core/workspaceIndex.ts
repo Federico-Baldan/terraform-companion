@@ -23,6 +23,27 @@ function dirOf(p: string): string {
   return i === -1 ? '.' : n.slice(0, i);
 }
 
+/** The leading part of an absolute base that `..` can never climb past.
+ *
+ *  POSIX spells that one way, Windows spells it two — a drive (`C:/…`) and a
+ *  UNC share (`//server/share/…`) — and VS Code hands out both as `fsPath`. A
+ *  plain `startsWith('/')` test reads a drive path as *relative*, so the root
+ *  clamp below never fired: `C:/w` + `../../x` resolved to a bare `x`, which
+ *  matches no indexed directory. The call site then looked uninstantiated, and
+ *  the submodule's variables resolved from its own defaults instead of the
+ *  caller's values — a confidently wrong hover, on Windows only.
+ *
+ *  Returned without a trailing slash, which is also how `dirOf` spells a root
+ *  ('' for POSIX, 'C:' for a drive): the two have to agree or directory keys
+ *  stop matching. */
+function absoluteRootOf(base: string): string | undefined {
+  const unc = base.match(/^\/\/[^/]+\/[^/]+/);
+  if (unc?.[0]) return unc[0];
+  const drive = base.match(/^[A-Za-z]:(?=\/|$)/);
+  if (drive?.[0]) return drive[0];
+  return base.startsWith('/') ? '' : undefined;
+}
+
 export function resolveRel(baseDir: string, rel: string): string {
   // resolveRel and dirOf must agree on one spelling per dir: dirOf keys
   // "modules/vpc", not "./modules/vpc", so "." segments get stripped.
@@ -31,8 +52,12 @@ export function resolveRel(baseDir: string, rel: string): string {
   // the array, popping past it with "../.." would lose the only record the
   // base was absolute, turning "/a" + "../../b" into "b" instead of "/b"
   const base = norm(baseDir);
-  const isAbsolute = base.startsWith('/');
-  const parts = base.split('/').filter((seg) => seg !== '' && seg !== '.');
+  const root = absoluteRootOf(base);
+  const isAbsolute = root !== undefined;
+  const parts = base
+    .slice(root?.length ?? 0)
+    .split('/')
+    .filter((seg) => seg !== '' && seg !== '.');
   for (const seg of norm(rel).split('/')) {
     if (seg === '' || seg === '.') continue;
     if (seg === '..') {
@@ -50,8 +75,10 @@ export function resolveRel(baseDir: string, rel: string): string {
   // same agreement in reverse: an emptied relative parts joins to "", but
   // dirOf() calls that ".". An absolute base keeps its root marker, so empty
   // parts there already matches dirOf()
-  if (parts.length > 0) return (isAbsolute ? '/' : '') + parts.join('/');
-  return isAbsolute ? '' : '.';
+  if (parts.length > 0) return isAbsolute ? `${root}/${parts.join('/')}` : parts.join('/');
+  // an absolute base emptied down to its root spells that root exactly as
+  // dirOf() would: '' for POSIX, 'C:' for a drive, '//server/share' for a UNC
+  return isAbsolute ? (root as string) : '.';
 }
 
 export function isLocalSource(source: string): boolean {
