@@ -142,10 +142,18 @@ export async function findStaleTerraformDirs(
   staleDays: number,
   now: number = Date.now(),
   onSkip?: (dir: string) => void,
+  /** Checked at every directory. The walk is the long pole in this feature —
+   *  `dist`, `build`, `target` and `vendor` are deliberately in scope, so a
+   *  monorepo means hundreds of thousands of entries — and without a signal
+   *  reaching it, closing the folder left it crawling the disk to completion
+   *  for a result nobody would read. The caller's flag only ever gated the
+   *  prompt and the deletes, which is after all the work. */
+  cancelled?: () => boolean,
 ): Promise<StaleCache[]> {
   const out: StaleCache[] = [];
   const cutoff = staleCutoff(staleDays, now);
   const visit = async (dir: string, depth: number): Promise<void> => {
+    if (cancelled?.()) return;
     if (depth > MAX_DEPTH) {
       onSkip?.(dir);
       return;
@@ -157,6 +165,8 @@ export async function findStaleTerraformDirs(
       return;
     }
     for (const name of entries) {
+      // a large tree is thousands of iterations between the checks above
+      if (cancelled?.()) return;
       const p = join(dir, name);
       let isDir = false;
       try {

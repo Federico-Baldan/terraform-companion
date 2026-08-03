@@ -37,10 +37,16 @@ async function scan(log: (m: string) => void, cancelled: () => boolean): Promise
 
   const stale: StaleCache[] = [];
   for (const folder of vscode.workspace.workspaceFolders ?? []) {
+    // a multi-root workspace must not start the next folder's walk either
+    if (cancelled()) return;
     try {
       stale.push(
-        ...(await findStaleTerraformDirs(folder.uri.fsPath, staleDays, Date.now(), (dir) =>
-          log(`cacheCleaner: depth limit reached, not scanned below ${dir}`),
+        ...(await findStaleTerraformDirs(
+          folder.uri.fsPath,
+          staleDays,
+          Date.now(),
+          (dir) => log(`cacheCleaner: depth limit reached, not scanned below ${dir}`),
+          cancelled,
         )),
       );
     } catch (e) {

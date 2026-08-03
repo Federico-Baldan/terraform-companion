@@ -43,8 +43,14 @@ export function registerCountForEach(
           for (const pattern of detectCountLength(file, index, {
             tfvarsOf: (dir) => tfvars?.valuesFor(dir) ?? new Map(),
           })) {
-            if (!pattern.safeToRefactor) continue;
+            // range first: VS Code asks for code actions on every cursor move,
+            // and `safeToRefactor` is the lazy cross-file safety analysis whose
+            // own comment puts it at ~100x the detection. Reading it before the
+            // range filter paid that for every counted block in the file rather
+            // than the one under the caret — the laziness the detector went to
+            // trouble for, spent by its only caller.
             if (!range.intersection(toRange(pattern.countAttr.span))) continue;
+            if (!pattern.safeToRefactor) continue;
             const action = new vscode.CodeAction(
               'Refactor: count → for_each',
               vscode.CodeActionKind.RefactorRewrite,
