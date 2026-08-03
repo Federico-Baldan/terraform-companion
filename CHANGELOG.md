@@ -2,6 +2,16 @@
 
 Notable changes to Terraform Companion. Versions follow semver; dates are ISO (YYYY-MM-DD).
 
+## [1.1.7](https://github.com/Federico-Baldan/terraform-companion/compare/v1.1.6...v1.1.7) (2026-08-03)
+
+
+### Bug Fixes
+
+* bound registry requests and stop offering no-op version updates ([1be7287](https://github.com/Federico-Baldan/terraform-companion/commit/1be7287ca61ca2293a33647187d359db0caa1c74))
+* bound the value renderer so a hover cannot freeze the editor ([369bd03](https://github.com/Federico-Baldan/terraform-companion/commit/369bd03dc6bace7e9131e3874331399ae5660e97))
+* keep module paths anchored at a Windows drive or UNC root ([58ea927](https://github.com/Federico-Baldan/terraform-companion/commit/58ea927ead7ced9d6a2551705c27d43de1d66cb2))
+* stop burning extension-host CPU on unrelated file activity ([118d2c8](https://github.com/Federico-Baldan/terraform-companion/commit/118d2c87f8c01ff6b7a9521ad32777caaa5a0ed7))
+
 ## [1.1.6](https://github.com/Federico-Baldan/terraform-companion/compare/v1.1.5...v1.1.6) (2026-07-31)
 
 
