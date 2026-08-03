@@ -15,6 +15,10 @@ import {
 
 export const UPDATE_COMMAND = 'tfCompanion.updateVersion';
 
+/** Enough that a normal file still resolves in one round trip, low enough that
+ *  a generated `versions.tf` cannot open a connection per provider. */
+const MAX_CONCURRENT_REGISTRY_REQUESTS = 6;
+
 export class VersionLensProvider implements vscode.CodeLensProvider {
   private emitter = new vscode.EventEmitter<void>();
   readonly onDidChangeCodeLenses = this.emitter.event;
@@ -23,6 +27,13 @@ export class VersionLensProvider implements vscode.CodeLensProvider {
 
   refresh(): void {
     this.emitter.fire();
+  }
+
+  /** Every other resource here is disposed — the diagnostic collection, the
+   *  status bar item, the watchers. This emitter was the one that outlived
+   *  deactivation, so a reload left its listeners attached. */
+  dispose(): void {
+    this.emitter.dispose();
   }
 
   async provideCodeLenses(
@@ -37,18 +48,39 @@ export class VersionLensProvider implements vscode.CodeLensProvider {
     // parse the live buffer — the index is debounced and its spans may be
     // stale, which would anchor lenses on the wrong lines
     const file = parseFile(normalizePath(document.uri.fsPath), document.getText());
-    // parallel: the client dedupes and caches, so a cold file does not serialise
-    const resolved = await Promise.all(
-      computeVersionTargets(file).map(async (target) => ({
-        target,
-        versions: target.isModule
+    // Parallel, but bounded: the client dedupes and caches, so a cold file does
+    // not serialise — yet an unbounded fan-out meant one `required_providers`
+    // block with forty distinct providers opened forty simultaneous
+    // connections, each holding its own 8s timeout, multiplied again per
+    // visible editor in a split view.
+    //
+    // The cancellation check moved inside the loop for the same reason it is
+    // bounded: checking only after the fan-out settled discarded the result but
+    // never stopped the work, so closing the file still paid for every request.
+    const targets = computeVersionTargets(file);
+    const resolved: { target: VersionTarget; versions: string[] | undefined }[] = [];
+    let next = 0;
+    const worker = async (): Promise<void> => {
+      while (next < targets.length) {
+        if (token.isCancellationRequested) return;
+        const slot = next++;
+        const target = targets[slot];
+        if (!target) continue;
+        const versions = target.isModule
           ? await this.client.moduleVersions(target.source)
-          : await this.client.providerVersions(target.source),
-      })),
+          : await this.client.providerVersions(target.source);
+        resolved[slot] = { target, versions };
+      }
+    };
+    await Promise.all(
+      Array.from({ length: Math.min(MAX_CONCURRENT_REGISTRY_REQUESTS, targets.length) }, worker),
     );
     if (token.isCancellationRequested) return [];
     const lenses: vscode.CodeLens[] = [];
-    for (const { target, versions } of resolved) {
+    for (const entry of resolved) {
+      // assigned by slot, so a run stopped by cancellation leaves holes
+      if (!entry) continue;
+      const { target, versions } = entry;
       if (!versions) continue; // offline / unknown: show nothing, never an error
       // two facts, and the title needs both: what the constraint resolves to
       // today, and what exists at all
@@ -100,6 +132,7 @@ export function registerVersionLens(
 ): VersionLensProvider {
   const provider = new VersionLensProvider(client);
   context.subscriptions.push(
+    { dispose: () => provider.dispose() },
     // scheme:'file': in a git diff view "Update to …" silently does nothing
     vscode.languages.registerCodeLensProvider([{ scheme: 'file', pattern: '**/*.tf' }], provider),
     vscode.commands.registerCommand(
@@ -107,20 +140,33 @@ export function registerVersionLens(
       async (uri: vscode.Uri, target: VersionTarget, latest: string) => {
         const update = updateChoiceLabel(target, latest);
         const open = 'Open in the registry';
-        const choice = await vscode.window.showQuickPick([update, open], {
-          placeHolder: `${target.source}: ${latest} available`,
+        // A `~>` bump keeps the precision that was written, so `~> 5.98` with
+        // 5.98.1 as the newest produces `~> 5.98` again — byte-identical to
+        // what is already there. Offering that promised a change that could not
+        // happen, and taking it replaced the range with itself: the file went
+        // dirty and an undo stop was pushed for nothing. Common shape, since
+        // two-segment `~>` pins are how most providers are written.
+        //
+        // Resolved against the live buffer rather than the lens's own text, so
+        // an edit made since the lens was drawn is caught by the same check.
+        const doc = await vscode.workspace.openTextDocument(uri);
+        const fresh = relocateTarget(doc, target);
+        const updated = fresh && updatedConstraintText(fresh, latest);
+        const isNoOp = fresh !== undefined && updated === doc.getText(toRange(fresh.valueSpan));
+        const choice = await vscode.window.showQuickPick(isNoOp ? [open] : [update, open], {
+          placeHolder: isNoOp
+            ? `${target.source}: ${latest} is already allowed by this constraint`
+            : `${target.source}: ${latest} available`,
         });
         if (choice === update) {
-          const doc = await vscode.workspace.openTextDocument(uri);
-          const fresh = relocateTarget(doc, target);
-          if (!fresh) {
+          if (!fresh || updated === undefined) {
             void vscode.window.showInformationMessage(
               `${target.source}: the constraint changed in the meantime — no update applied`,
             );
             return;
           }
           const edit = new vscode.WorkspaceEdit();
-          edit.replace(uri, toRange(fresh.valueSpan), updatedConstraintText(fresh, latest));
+          edit.replace(uri, toRange(fresh.valueSpan), updated);
           await vscode.workspace.applyEdit(edit);
         } else if (choice === open) {
           await vscode.env.openExternal(vscode.Uri.parse(registryUrl(target)));

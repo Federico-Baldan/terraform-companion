@@ -363,6 +363,22 @@ describe('a bump must actually change the constraint', () => {
     expect(updatedConstraintText(target('~> 5'), '6.2.0')).toBe('"~> 6.2"');
   });
 
+  /** The same shape the single-segment case above fixed, one segment up, and
+   *  the one that is actually common: a two-segment `~>` whose newest stable
+   *  differs only in the patch renders straight back to itself.
+   *
+   *  Keeping the precision is correct — writing "~> 5.98.1" would demote a
+   *  minor-range pin to patch-range. So this stays a no-op by design, and the
+   *  command in versionLensProvider is what must not offer it: applying it
+   *  replaced the range with itself, dirtying the file and pushing an undo stop
+   *  for a change that did not exist. */
+  it('renders a two-segment ~> back to itself when only the patch moved', () => {
+    expect(updatedConstraintText(target('~> 5.98'), '5.98.1')).toBe('"~> 5.98"');
+    expect(updatedConstraintText(target('~> 5.98'), '5.98.0')).toBe('"~> 5.98"');
+    // and it is a real bump as soon as the minor moves
+    expect(updatedConstraintText(target('~> 5.98'), '5.99.0')).toBe('"~> 5.99"');
+  });
+
   it('still keeps the precision the author wrote when it moves', () => {
     expect(updatedConstraintText(target('~> 5.34'), '5.98.0')).toBe('"~> 5.98"');
     expect(updatedConstraintText(target('~> 5.34.0'), '5.98.0')).toBe('"~> 5.98.0"');
