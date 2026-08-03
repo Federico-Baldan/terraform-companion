@@ -245,3 +245,49 @@ describe('a reference that fans out', () => {
     expect(resolveRef(['local', 'double'], scope)).toBe('dev-app-x');
   });
 });
+
+/** The cap above only ever guarded the string-interpolation path. The memo
+ *  hands the same array or Map back on every cache hit, so `[local.b, local.b]`
+ *  holds one array twice — a DAG — and a renderer expanding it as a tree
+ *  doubled its work per level. Measured before the budget: 41,943,036
+ *  characters in 1.6s of blocked extension host, from these 25 lines. */
+describe('a value that shares structure', () => {
+  it('renders a list DAG within the cap instead of expanding it', async () => {
+    const index = new WorkspaceIndex();
+    const levels = 22;
+    const lines = ['locals {', '  a0 = ["leaf"]'];
+    for (let i = 1; i <= levels; i++) lines.push(`  a${i} = [local.a${i - 1}, local.a${i - 1}]`);
+    lines.push('}', '');
+    await index.updateFile('/dag/locals.tf', lines.join('\n'));
+
+    const started = Date.now();
+    const value = resolveRef(['local', `a${levels}`], { index, moduleDir: '/dag' });
+    const elapsed = Date.now() - started;
+
+    expect(elapsed).toBeLessThan(2000);
+    expect(value?.length ?? 0).toBeLessThan(200_000);
+    // truncated, and saying so — a clipped value must not read as a whole one
+    expect(value?.endsWith('…')).toBe(true);
+  });
+
+  it('renders an object DAG within the cap as well', async () => {
+    const index = new WorkspaceIndex();
+    const lines = ['locals {', '  m0 = { leaf = "x" }'];
+    for (let i = 1; i <= 20; i++) {
+      lines.push(`  m${i} = { a = local.m${i - 1}, b = local.m${i - 1} }`);
+    }
+    lines.push('}', '');
+    await index.updateFile('/dag/objects.tf', lines.join('\n'));
+
+    const started = Date.now();
+    const value = resolveRef(['local', 'm20'], { index, moduleDir: '/dag' });
+
+    expect(Date.now() - started).toBeLessThan(2000);
+    expect(value?.length ?? 0).toBeLessThan(200_000);
+  });
+
+  it('leaves a small shared value rendered in full', () => {
+    // the budget must not truncate anything a reader would actually be shown
+    expect(resolveRef(['local', 'double'], scope)).toBe('dev-app-x');
+  });
+});
