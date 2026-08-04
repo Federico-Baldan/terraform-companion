@@ -291,3 +291,120 @@ describe('a value that shares structure', () => {
     expect(resolveRef(['local', 'double'], scope)).toBe('dev-app-x');
   });
 });
+
+/** The DAG budget above rests on the memo handing back the *same* array, so a
+ *  value that is shared is not a value that is copied. `concat` breaks that: it
+ *  allocates a new array as long as the sum of its inputs, and `format`/`join`
+ *  do the same for strings. Each was unbounded, and each was built in full
+ *  before the renderer's char budget could look at it. */
+describe('values that are copied, not shared', () => {
+  it('bounds a concat that doubles its own input', async () => {
+    const index = new WorkspaceIndex();
+    const levels = 24;
+    const lines = ['locals {', '  a0 = ["leaf"]'];
+    for (let i = 1; i <= levels; i++) {
+      lines.push(`  a${i} = concat(local.a${i - 1}, local.a${i - 1})`);
+    }
+    lines.push('}', '');
+    await index.updateFile('/copy/locals.tf', lines.join('\n'));
+
+    // measured unbounded at these levels: ~2s and 560MB, rising to 7.4s and
+    // 2.6GB two levels up and a RangeError two levels above that
+    const started = Date.now();
+    const value = resolveRef(['local', `a${levels}`], { index, moduleDir: '/copy' });
+
+    expect(Date.now() - started).toBeLessThan(2000);
+    expect(value?.length ?? 0).toBeLessThan(200_000);
+  });
+
+  it('bounds a format that doubles its own input', async () => {
+    const index = new WorkspaceIndex();
+    const levels = 22;
+    const lines = ['locals {', '  f0 = "0123456789"'];
+    for (let i = 1; i <= levels; i++) {
+      lines.push(`  f${i} = format("%s%s", local.f${i - 1}, local.f${i - 1})`);
+    }
+    lines.push('}', '');
+    await index.updateFile('/copy/fmt.tf', lines.join('\n'));
+
+    const started = Date.now();
+    const value = resolveRef(['local', `f${levels}`], { index, moduleDir: '/copy' });
+
+    expect(Date.now() - started).toBeLessThan(2000);
+    expect(value?.length ?? 0).toBeLessThan(200_000);
+  });
+
+  it('bounds a join over a doubled list', async () => {
+    const index = new WorkspaceIndex();
+    const lines = ['locals {', '  b0 = ["0123456789"]'];
+    for (let i = 1; i <= 20; i++) lines.push(`  b${i} = concat(local.b${i - 1}, local.b${i - 1})`);
+    lines.push('  s = join("", local.b20)', '}', '');
+    await index.updateFile('/copy/join.tf', lines.join('\n'));
+
+    const value = resolveRef(['local', 's'], { index, moduleDir: '/copy' });
+    // the budget used to detect the overrun and emit the 10MB anyway
+    expect(value?.length ?? 0).toBeLessThan(200_000);
+  });
+
+  it('still resolves ordinary concat, format and join in full', async () => {
+    const index = new WorkspaceIndex();
+    await index.updateFile(
+      '/ok/locals.tf',
+      [
+        'locals {',
+        '  parts = concat(["a"], ["b", "c"])',
+        '  label = format("%s-%s", "app", "prod")',
+        '  csv   = join(",", ["x", "y"])',
+        '  padded = format("%08d", 42)',
+        '}',
+        '',
+      ].join('\n'),
+    );
+    const at = { index, moduleDir: '/ok' };
+    expect(resolveRef(['local', 'parts'], at)).toBe('[a, b, c]');
+    expect(resolveRef(['local', 'label'], at)).toBe('app-prod');
+    expect(resolveRef(['local', 'csv'], at)).toBe('x,y');
+    // a width is still rejected, exactly as before the regex was narrowed
+    expect(resolveRef(['local', 'padded'], at)).toBe(UNKNOWN);
+  });
+
+  /** A `%` followed by a long zero run and no verb letter used to make the
+   *  flags/width alternation backtrack quadratically: 40k zeros measured 2.7s,
+   *  per hover, on a template that can arrive from a resolved local. */
+  it('does not backtrack on a long run of zeros in a format template', async () => {
+    const index = new WorkspaceIndex();
+    await index.updateFile(
+      '/re/locals.tf',
+      ['locals {', `  bad = format("%${'0'.repeat(40_000)}!", "x")`, '}', ''].join('\n'),
+    );
+    const started = Date.now();
+    expect(resolveRef(['local', 'bad'], { index, moduleDir: '/re' })).toBe(UNKNOWN);
+    expect(Date.now() - started).toBeLessThan(1000);
+  });
+});
+
+/** `inProgress` stops a cycle but bounds an honest chain only at "distinct
+ *  references in the module", and each hop is four real JS frames. A generated
+ *  ladder overflowed the stack, and the RangeError escaped provideHover. */
+describe('a very long reference chain', () => {
+  it('resolves to unknown instead of throwing a stack overflow', async () => {
+    const index = new WorkspaceIndex();
+    const depth = 3000;
+    const lines = ['locals {'];
+    for (let i = 0; i < depth; i++) lines.push(`  c${i} = local.c${i + 1}`);
+    lines.push(`  c${depth} = "leaf"`, '}', '');
+    await index.updateFile('/deep/locals.tf', lines.join('\n'));
+
+    expect(() => resolveRef(['local', 'c0'], { index, moduleDir: '/deep' })).not.toThrow();
+    expect(resolveRef(['local', 'c0'], { index, moduleDir: '/deep' })).toBe(UNKNOWN);
+  });
+
+  it('still resolves a chain of ordinary length', async () => {
+    const index = new WorkspaceIndex();
+    const lines = ['locals {'];
+    for (let i = 0; i < 30; i++) lines.push(`  c${i} = local.c${i + 1}`);
+    lines.push('  c30 = "leaf"', '}', '');
+    await index.updateFile('/shallow/locals.tf', lines.join('\n'));
+    expect(resolveRef(['local', 'c0'], { index, moduleDir: '/shallow' })).toBe('leaf');
+  });
+});

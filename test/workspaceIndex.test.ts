@@ -197,6 +197,33 @@ describe('refsTo does not hand out index-owned state', () => {
   });
 });
 
+describe('re-indexing identical content', () => {
+  /** A save makes the disk watcher re-read what the debounce already parsed,
+   *  and `terraform fmt -recursive` reports every file as changed. Bumping the
+   *  generation drops the derived index for the whole workspace, so the next
+   *  lint rebuilds it from every block and ref — for no change at all. */
+  it('does not invalidate the derived index when the bytes are unchanged', async () => {
+    const idx = new WorkspaceIndex();
+    const src = 'locals {\n  a = 1\n}\n';
+    await idx.updateFile('/w/main.tf', src);
+    const gen = idx.generation();
+
+    await idx.updateFile('/w/main.tf', src);
+    expect(idx.generation()).toBe(gen);
+
+    // a real edit still invalidates
+    await idx.updateFile('/w/main.tf', 'locals {\n  a = 2\n}\n');
+    expect(idx.generation()).toBeGreaterThan(gen);
+  });
+
+  it('still reflects a change that only differs in whitespace', async () => {
+    const idx = new WorkspaceIndex();
+    await idx.updateFile('/w/main.tf', 'locals {\n  a = 1\n}\n');
+    await idx.updateFile('/w/main.tf', 'locals {\n\n  a = 1\n}\n');
+    expect(idx.localsOf('/w')[0]!.attr.span.start.row).toBe(2);
+  });
+});
+
 describe('build resilience', () => {
   it('skips a file that vanished between the listing and the read', async () => {
     // readFile rejects with FileNotFound when a file vanishes between

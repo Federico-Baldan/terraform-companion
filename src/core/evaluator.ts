@@ -59,14 +59,59 @@ export interface TfvarsValue {
 interface EvalState {
   cache: Map<string, Value>;
   inProgress: Set<string>;
+  /** shared element budget for one resolve — see MAX_VALUE_ELEMENTS */
+  elements: { left: number };
+  /** How many times a budget gave up during this resolve.
+   *
+   *  "Too big to evaluate" and "cannot be evaluated" both come back as
+   *  `undefined`, but they warrant opposite answers: a caller deciding whether
+   *  a destructive refactor is safe reads an unreachable value as "nothing to
+   *  object to", and must read an unmeasured one as "cannot certify". Counted
+   *  rather than a flag so a caller can tell whether a *particular* subtree
+   *  gave up, not merely whether anything did. */
+  spends: number;
 }
+
+/** Elements one resolve may materialise.
+ *
+ *  The memo makes a value a DAG — `a = [local.b, local.b]` holds one array
+ *  twice — which is what lets the renderer's char budget bound the work. But
+ *  `concat` *copies*: its result is a new array as long as the sum of its
+ *  inputs, so `a26 = concat(local.a25, local.a25)` really is 2^26 elements.
+ *  Twenty-six of those lines measured 7.4s of frozen extension host and 2.6GB
+ *  of heap, to render the same 100k characters the budget already caps — and
+ *  two lines further it threw `RangeError: Invalid array length`. */
+const MAX_VALUE_ELEMENTS = 100_000;
+
+/** Charges the shared element budget. False once it is spent, which callers
+ *  turn into ⟨unknown⟩ — the same answer MAX_VALUE_CHARS already gives. */
+function chargeElements(scope: EvalScope, n: number): boolean {
+  const state = scope.state;
+  if (!state) return n <= MAX_VALUE_ELEMENTS;
+  if (n > state.elements.left) {
+    // deliberately does NOT zero the remaining budget: draining it here made
+    // one oversized value poison every later sibling in the same resolve, so an
+    // adjacent list that was perfectly measurable came back ⟨unknown⟩ too
+    state.spends++;
+    return false;
+  }
+  state.elements.left -= n;
+  return true;
+}
+
+/** Reference hops one resolve may take. `inProgress` already stops a cycle, but
+ *  it only bounds an honest chain at "distinct references in the module", and
+ *  each hop costs four real JS frames — a generated `c0 = local.c1 … c1999 =
+ *  local.c2000` ladder overflowed the stack, and the RangeError escaped
+ *  `provideHover` and took the hover down entirely. Far past any real chain. */
+const MAX_REF_HOPS = 256;
 
 export interface EvalScope {
   index: WorkspaceIndex;
   moduleDir: string;
   /** Per-directory lookup, not one map — climbing from submodule to caller
    *  needs the caller's own tfvars. */
-  tfvarsOf?: (moduleDir: string) => Map<string, TfvarsValue>;
+  tfvarsOf?: (moduleDir: string) => ReadonlyMap<string, TfvarsValue>;
   /** module dir → the single call site to resolve through, ignoring the others */
   pinnedSites?: Map<string, ModuleCallSite>;
   used?: EvalUsage;
@@ -154,7 +199,14 @@ function renderInto(
 ): void {
   if (budget.left <= 0) return;
   const emit = (s: string): void => {
-    out.push(s);
+    // Clip the leaf rather than only charging for it. `format` and `join` build
+    // a single string that can be megabytes on its own, and pushing it whole
+    // made the budget a *reporter* of the overrun — render() appended its `…`
+    // to the 10MB it had already emitted. The full length is still charged, so
+    // the truncation marker is appended exactly as before, and the first
+    // MAX_VALUE_CHARS are preserved, which renderTagged's divergence comparison
+    // depends on.
+    out.push(s.length > budget.left ? s.slice(0, Math.max(budget.left, 0)) : s);
     budget.left -= s.length;
   };
   // '\0' is renderTagged's type separator: it cannot occur in HCL text, so a
@@ -198,7 +250,13 @@ function renderBudgeted(v: Value, tagged: boolean): string {
   const budget = { left: MAX_VALUE_CHARS };
   renderInto(v, out, budget, 0, tagged);
   const text = out.join('');
-  return budget.left <= 0 ? text + TRUNCATED : text;
+  if (budget.left > 0) return text;
+  // The overflow is the exact number of characters charged past the cap. A
+  // tagged render needs it: `emit` now clips, so two values sharing a
+  // MAX_VALUE_CHARS prefix but differing in length produce identical text, and
+  // the divergence check would call two genuinely different instance values
+  // equal — then show one instance's value as if every instance agreed.
+  return tagged ? `${text}${TRUNCATED}\0#${MAX_VALUE_CHARS - budget.left}` : `${text}${TRUNCATED}`;
 }
 
 function render(v: Value): string {
@@ -239,7 +297,12 @@ function named(n: Node): Node[] {
 
 /** go-cty's format verb: `%` [flags] [width] [.precision] [`[n]`] verb.
  *  `%%` is matched separately as the escape. */
-const FORMAT_VERB = /%(%|(?:([-+ #0]*)(\d+)?(?:\.(\d+))?(?:\[(\d+)\])?([a-zA-Z])))/g;
+/** The width is `[1-9]\d*`, not `\d*`: `[-+ #0]*` and `\d+` both match `0`, so
+ *  a `%` followed by a long run of zeros and no verb letter made the engine try
+ *  every flags/width split — 40k zeros measured 2.7s, per hover. A width never
+ *  starts with `0` in go-cty's grammar (that spelling is the zero-pad flag), so
+ *  removing the overlap costs nothing: `%08d` still reads flags `0`, width `8`. */
+const FORMAT_VERB = /%(%|(?:([-+ #0]*)([1-9]\d*)?(?:\.(\d+))?(?:\[(\d+)\])?([a-zA-Z])))/g;
 
 /** Verbs reproducible byte for byte from an already-resolved value's text. */
 const PLAIN_VERBS = new Set(['s', 'v', 'd', 'q']);
@@ -282,10 +345,16 @@ function formatString(template: string, args: Value[]): string | undefined {
     // %d errors unless the argument is a whole number
     if (verb === 'd' && !/^-?\d+$/.test(text)) return undefined;
     out += verb === 'q' ? JSON.stringify(text) : text;
+    // Same bail the interpolation path takes, and for the same reason: format
+    // multiplies rather than adds, so `f24 = format("%s%s", local.f23,
+    // local.f23)` is 25 lines of HCL and 167M characters. Unbounded, the string
+    // was built in full and then flattened three more times by the hover
+    // renderer — 27 lines measured 3.6s and 1.2GB.
+    if (out.length > MAX_VALUE_CHARS) return undefined;
   }
   const tail = template.slice(cursor);
   if (tail.includes('%')) return undefined;
-  return out + tail;
+  return out.length + tail.length > MAX_VALUE_CHARS ? undefined : out + tail;
 }
 
 /** Lexicographic by code point, which is the order UTF-8 bytes sort in — what
@@ -300,14 +369,22 @@ function compareCodePoints(a: string, b: string): number {
   return ax.length - bx.length;
 }
 
-function callFunction(name: string, args: Value[]): Value {
+function callFunction(name: string, args: Value[], scope: EvalScope): Value {
   switch (name) {
     case 'join': {
       const [sep, list] = args;
       const delim = asString(sep);
       if (delim === undefined || !Array.isArray(list)) return undefined;
       const items = list.map(asString);
-      return items.every((i) => i !== undefined) ? items.join(delim) : undefined;
+      if (!items.every((i) => i !== undefined)) return undefined;
+      // measured before joining: `join("", local.b20)` over a concat-doubled
+      // list produced 10MB from 25 lines of HCL, and the renderer's budget
+      // cannot undo a string that already exists
+      let total = delim.length * Math.max(items.length - 1, 0);
+      for (const s of items) total += s.length;
+      if (total <= MAX_VALUE_CHARS) return items.join(delim);
+      if (scope.state) scope.state.spends++;
+      return undefined;
     }
     case 'format': {
       const [fmt, ...rest] = args;
@@ -320,7 +397,12 @@ function callFunction(name: string, args: Value[]): Value {
       return asString(args[0])?.toUpperCase();
     case 'concat': {
       if (!args.every(Array.isArray)) return undefined;
-      return (args as Value[][]).flat();
+      const lists = args as Value[][];
+      let total = 0;
+      for (const l of lists) total += l.length;
+      // flat() allocates a genuinely new array, so this is the one place a value
+      // stops being a DAG and starts doubling for real
+      return chargeElements(scope, total) ? lists.flat() : undefined;
     }
     case 'toset': {
       const list = args[0];
@@ -414,10 +496,14 @@ function evalNode(node: Node, scope: EvalScope, depth: number): Value {
       }
       return out;
     }
-    case 'tuple':
-      return named(node)
+    case 'tuple': {
+      // charged too, so a hand-written or generated 200k-element literal is
+      // covered by the same budget as concat
+      const items = named(node)
         .filter((c) => c.type === 'expression')
         .map((c) => evalNode(c, scope, depth));
+      return chargeElements(scope, items.length) ? items : undefined;
+    }
     case 'object': {
       const out: ObjValue = new Map();
       for (const elem of named(node)) {
@@ -431,7 +517,7 @@ function evalNode(node: Node, scope: EvalScope, depth: number): Value {
         if (name === undefined) continue;
         out.set(name, evalNode(value, scope, depth));
       }
-      return out;
+      return chargeElements(scope, out.size) ? out : undefined;
     }
     case 'function_call': {
       const name = named(node).find((c) => c.type === 'identifier')?.text ?? '';
@@ -441,7 +527,7 @@ function evalNode(node: Node, scope: EvalScope, depth: number): Value {
             .filter((c) => c.type === 'expression')
             .map((c) => evalNode(c, scope, depth))
         : [];
-      return callFunction(name, args);
+      return callFunction(name, args, scope);
     }
     default:
       return undefined;
@@ -463,8 +549,15 @@ function resolveRefValue(parts: string[], scope: EvalScope, depth: number): Valu
     // a reference that is already being resolved is a cycle, whatever its
     // shape: a local reading itself, or two modules calling each other
     if (state.inProgress.has(key)) return undefined;
+    // inProgress is exactly the DFS ancestor set, so its size is the chain
+    // depth — and depth here is JS stack frames, four per hop. See MAX_REF_HOPS.
+    if (state.inProgress.size >= MAX_REF_HOPS) {
+      state.spends++;
+      return undefined;
+    }
     state.inProgress.add(key);
   }
+  const spendsBefore = state?.spends ?? 0;
   let value: Value;
   if (head === 'var') {
     value = resolveVar(name, scope, depth);
@@ -476,7 +569,12 @@ function resolveRefValue(parts: string[], scope: EvalScope, depth: number): Valu
   }
   if (state) {
     state.inProgress.delete(key);
-    state.cache.set(key, value);
+    // An `undefined` produced because *this* subtree ran out of budget is not
+    // an answer about this reference, and caching it would hand the same
+    // ⟨unknown⟩ to an unrelated lookup that would have resolved fine. Scoped to
+    // this key's own evaluation, so the memo still stops the fan-out blowup it
+    // exists for — only the chain that actually gave up goes uncached.
+    if (value !== undefined || state.spends === spendsBefore) state.cache.set(key, value);
   }
   return walkPath(value, path);
 }
@@ -527,6 +625,7 @@ function resolveVar(name: string, scope: EvalScope, depth: number): Value {
       .sort((a, b) => a.label.localeCompare(b.label));
     // no instance passes the var → every instance uses the default
     if (entries.every((e) => !e.attr)) return varDefault(name, scope, depth);
+    const spendsAtEntry = scope.state?.spends ?? 0;
     const passed = entries.map(({ site, attr, label }) => {
       const callerScope: EvalScope = { ...scope, moduleDir: site.callerDir };
       const fromCall = attr ? evalText(attr.valueText, callerScope, depth + 1) : undefined;
@@ -545,7 +644,13 @@ function resolveVar(name: string, scope: EvalScope, depth: number): Value {
     // refactor to be offered on a module that is passed numbers, which for_each
     // rejects
     const rendered = passed.map((p) => renderTagged(p.value));
-    if (rendered.every((r) => r === rendered[0])) {
+    // Sites share one EvalState, so a budget spent while evaluating an earlier
+    // site would make later ones give up too — and several ⟨unknown⟩s compare
+    // equal, which reads as agreement. Falling through to the divergence branch
+    // makes the caller re-resolve each site under its own fresh budget, which
+    // is the only way to find out what they actually pass.
+    const spentComparing = (scope.state?.spends ?? 0) > spendsAtEntry;
+    if (!spentComparing && rendered.every((r) => r === rendered[0])) {
       // one site is a real chain hop; several agreeing sites are siblings —
       // group them instead of reading as a chain
       if (passed.length === 1 && passed[0]) scope.used?.calls.add(passed[0].label);
@@ -589,7 +694,15 @@ function evalText(text: string, scope: EvalScope, depth: number): Value {
  *  alone so a re-resolve under different `pinnedSites` can't read values cached
  *  for a different call site. */
 function withState(scope: EvalScope): EvalScope {
-  return { ...scope, state: { cache: new Map(), inProgress: new Set() } };
+  return {
+    ...scope,
+    state: {
+      cache: new Map(),
+      inProgress: new Set(),
+      elements: { left: MAX_VALUE_ELEMENTS },
+      spends: 0,
+    },
+  };
 }
 
 export function resolveExpr(text: string, scope: EvalScope): string {
@@ -630,17 +743,22 @@ export function resolveRef(parts: string[], scope: EvalScope): string {
 export type ListShape =
   | { kind: 'strings'; values: string[] }
   | { kind: 'nonStrings' }
-  | { kind: 'unknown' };
+  /** `overBudget` separates "too big to evaluate" from "cannot be evaluated".
+   *  Both come back as no value, but they deserve opposite answers: an
+   *  unreachable list gives a caller nothing to object to, while an unmeasured
+   *  one must never be certified safe for a destructive rewrite. */
+  | { kind: 'unknown'; overBudget?: boolean };
 
 export function listShape(text: string, scope: EvalScope): ListShape {
-  const value = evalText(text, withState(scope), 0);
-  if (!Array.isArray(value)) return { kind: 'unknown' };
+  const scoped = withState(scope);
+  const value = evalText(text, scoped, 0);
+  const unknown: ListShape =
+    (scoped.state?.spends ?? 0) > 0 ? { kind: 'unknown', overBudget: true } : { kind: 'unknown' };
+  if (!Array.isArray(value)) return unknown;
   // an unresolved element says nothing; a resolved non-string says everything
   // — numbers count too, for_each rejects those
   if (value.some((v) => Array.isArray(v) || isObject(v) || v instanceof NonString)) {
     return { kind: 'nonStrings' };
   }
-  return value.every((v) => typeof v === 'string')
-    ? { kind: 'strings', values: value }
-    : { kind: 'unknown' };
+  return value.every((v) => typeof v === 'string') ? { kind: 'strings', values: value } : unknown;
 }

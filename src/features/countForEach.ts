@@ -104,14 +104,20 @@ function declaredNonStringElements(
 /** Judging a `var.*` list by its default is the wrong question — a tfvars
  *  file exists to override it, and duplicates there are what toset() collapses. */
 export interface TfvarsContext {
-  tfvarsOf: (moduleDir: string) => Map<string, TfvarsValue>;
+  tfvarsOf: (moduleDir: string) => ReadonlyMap<string, TfvarsValue>;
 }
 
 /** Non-string elements have no valid for_each key; a repeated value collapses
  *  via toset() into one instance, quietly building fewer resources than count. */
 function shapeUnusable(shape: ListShape): boolean {
   if (shape.kind === 'nonStrings') return true;
-  return shape.kind === 'strings' && new Set(shape.values).size !== shape.values.length;
+  // A list the evaluator gave up measuring is not a list we can certify. It is
+  // reported the same way as one it cannot reach, but the two need opposite
+  // answers here: `concat` doubling past the element budget is exactly how a
+  // list of thousands of identical strings arrives, and toset() would collapse
+  // it to one instance while count built them all.
+  if (shape.kind === 'unknown') return shape.overBudget === true;
+  return new Set(shape.values).size !== shape.values.length;
 }
 
 /** A list the evaluator can't reach concludes nothing here — the declared-type
@@ -165,9 +171,18 @@ function referencedOutsideBlock(
   }
   if (!index) return false;
   const moduleDir = index.moduleDirOf(file.path);
+  // Ask for the two-part address and narrow here. `refsTo` only uses its
+  // precomputed bucket when given exactly two parts, and a data source's
+  // address is three (`data.type.name`) — so this fell through to a scan of
+  // every reference in every indexed file, on the code-action path, which VS
+  // Code drives from cursor movement. Resources and modules were already
+  // bucketed; only data blocks went off the cliff.
   return index
-    .refsTo(addr)
-    .some((u) => u.file !== file.path && index.moduleDirOf(u.file) === moduleDir);
+    .refsTo(addr.slice(0, 2))
+    .some(
+      (u) =>
+        matches(u.ref.parts) && u.file !== file.path && index.moduleDirOf(u.file) === moduleDir,
+    );
 }
 
 export function detectCountLength(

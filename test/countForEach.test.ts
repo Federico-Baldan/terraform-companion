@@ -121,6 +121,38 @@ output "first" {
     expect(detectCountLength(alone.file('/m/main.tf')!, alone)[0]!.safeToRefactor).toBe(true);
   });
 
+  /** A data source's address is three parts (`data.type.name`), and `refsTo`
+   *  only serves its precomputed bucket for exactly two — so this path used to
+   *  fall through to a scan of every reference in every indexed file. Narrowing
+   *  the two-part bucket by hand has to give the same answer. */
+  it('marks unsafe when another file of the module references a data source', async () => {
+    const main = `data "aws_ami" "img" {
+  count = length(var.names)
+  owners = [var.names[count.index]]
+}
+`;
+    const files: Record<string, string> = {
+      '/d/main.tf': main,
+      '/d/outputs.tf': 'output "all" {\n  value = data.aws_ami.img[0].id\n}\n',
+    };
+    const index = await WorkspaceIndex.build({
+      listFiles: async () => Object.keys(files),
+      readFile: async (p) => files[p] ?? '',
+    });
+    expect(detectCountLength(index.file('/d/main.tf')!, index)[0]!.safeToRefactor).toBe(false);
+
+    // a different data source of the same type must not be mistaken for it
+    const other: Record<string, string> = {
+      '/d/main.tf': main,
+      '/d/outputs.tf': 'output "all" {\n  value = data.aws_ami.other[0].id\n}\n',
+    };
+    const clean = await WorkspaceIndex.build({
+      listFiles: async () => Object.keys(other),
+      readFile: async (p) => other[p] ?? '',
+    });
+    expect(detectCountLength(clean.file('/d/main.tf')!, clean)[0]!.safeToRefactor).toBe(true);
+  });
+
   it('excludes the file own stale index entry only when the path is normalized', async () => {
     // what the provider passes for a live buffer on Windows — un-normalized,
     // the file's own stale copy reads as external and hides the refactor
@@ -315,6 +347,39 @@ output "first" {
 `;
       const file = parseFile(normalizePath('/w/g.tf'), src);
       expect(detectCountLength(file, index)[0]!.safeToRefactor).toBe(false);
+    });
+
+    /** The evaluator bounds how many elements it will materialise, so a big
+     *  enough list comes back with no value — the same way an unreachable one
+     *  does. Those need opposite answers: unreachable concludes nothing, but
+     *  unmeasured must not be certified, or a list of thousands of identical
+     *  strings gets the destructive rewrite offered and toset() collapses it to
+     *  a single instance on the next apply. */
+    async function duplicateLadder(levels: number): Promise<boolean> {
+      const index = new WorkspaceIndex();
+      const lines = ['locals {', '  a0 = ["dup", "dup"]'];
+      for (let i = 1; i <= levels; i++) {
+        lines.push(`  a${i} = concat(local.a${i - 1}, local.a${i - 1})`);
+      }
+      lines.push(`  names = local.a${levels}`, '}', '');
+      await index.updateFile(normalizePath('/w/vars.tf'), lines.join('\n'));
+      const src = `resource "aws_instance" "web" {
+  count = length(local.names)
+  ami   = local.names[count.index]
+}
+`;
+      const file = parseFile(normalizePath('/w/big.tf'), src);
+      return detectCountLength(file, index)[0]!.safeToRefactor;
+    }
+
+    it('marks unsafe when a duplicate list is small enough to measure', async () => {
+      expect(await duplicateLadder(8)).toBe(false);
+    });
+
+    it('marks unsafe when a duplicate list is too big to measure', async () => {
+      // every element is "dup" here too — the only difference is that the
+      // evaluator gives up before it can say so
+      expect(await duplicateLadder(18)).toBe(false);
     });
 
     it('marks unsafe when the resolvable list holds objects', async () => {

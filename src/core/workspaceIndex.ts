@@ -93,20 +93,69 @@ export interface ModuleCallSite {
   block: TfBlock;
 }
 
-/** Per-directory lookups precomputed in one pass so the hot path doesn't
- *  rescan every file and block. Invalidated on any file change. */
+type ModuleCall = { file: string; callerDir: string; block: TfBlock; target?: string };
+
+/** Per-directory lookups precomputed so the hot path doesn't rescan every file
+ *  and block. Maintained incrementally: an edit retracts and re-adds only what
+ *  the edited file contributed. */
 interface DirIndex {
   variablesByDir: Map<string, Map<string, { file: string; block: TfBlock }>>;
   localsByDir: Map<string, { name: string; file: string; attr: TfAttr }[]>;
-  /** every module block, with its local source pre-resolved to a target dir */
-  moduleCalls: { file: string; callerDir: string; block: TfBlock; target?: string }[];
+  /** every module block, keyed by the file declaring it, with its local source
+   *  pre-resolved to a target dir. Keyed rather than flat so retracting one
+   *  file's calls is O(1); iteration order still matches `parsed`, since an
+   *  entry is written for every indexed .tf file and `Map.set` keeps a key's
+   *  position. */
+  moduleCallsByFile: Map<string, ModuleCall[]>;
+  /** `moduleCallsByFile` flattened, rebuilt on demand. Dropped whenever a file's
+   *  calls change; without it every `callSitesOf`/`modulesOf` re-flattened every
+   *  module call in the workspace, which the hover path does per module dir. */
+  flatCalls?: ModuleCall[];
   /** refs bucketed by their first two address parts — the alternative is a full
-   *  scan per local/counted block on every refresh. */
+   *  scan per local/counted block on every refresh.
+   *
+   *  Order within a bucket is unspecified: an incremental update appends the
+   *  edited file's refs rather than restoring them to that file's position in
+   *  `parsed`. Every consumer asks whether a matching ref exists, never which
+   *  came first; anything that starts caring must sort. */
   refsByAddress: Map<string, { file: string; ref: TfRef }[]>;
+}
+
+/** What one file contributes to the directory maps. `variable`, `locals` and
+ *  `module` are declarations only at the top level of a file: a provider schema
+ *  may define a nested block sharing one of those names, and reading it as a
+ *  declaration invented locals the unused-locals lint then reported. */
+function declarationsOf(f: ParsedFile): {
+  variables: { name: string; block: TfBlock }[];
+  locals: { name: string; file: string; attr: TfAttr }[];
+  calls: ModuleCall[];
+} {
+  const dir = dirOf(f.path);
+  const variables: { name: string; block: TfBlock }[] = [];
+  const locals: { name: string; file: string; attr: TfAttr }[] = [];
+  const calls: ModuleCall[] = [];
+  for (const b of f.blocks) {
+    if (b.kind === 'variable' && b.labels[0]) {
+      variables.push({ name: b.labels[0], block: b });
+    } else if (b.kind === 'locals') {
+      for (const attr of b.attrs) locals.push({ name: attr.name, file: f.path, attr });
+    } else if (b.kind === 'module') {
+      const source = attrOf(b, 'source');
+      const raw = source && stripQuotes(source.valueText);
+      const target = raw && isLocalSource(raw) ? resolveRel(dir, raw) : undefined;
+      calls.push({ file: f.path, callerDir: dir, block: b, target });
+    }
+  }
+  return { variables, locals, calls };
 }
 
 export class WorkspaceIndex {
   private parsed = new Map<string, ParsedFile>();
+  /** Indexed .tf paths grouped by directory, each list in `parsed` order.
+   *  Rebuilding one directory is what keeps a shadowed declaration correct —
+   *  two files in a directory can declare the same variable name, and dropping
+   *  the edited file's entry alone would lose the other's. */
+  private filesByDir = new Map<string, string[]>();
   private dirIndex?: DirIndex;
   private gen = 0;
 
@@ -120,11 +169,40 @@ export class WorkspaceIndex {
     onUnreadable?: (path: string, error: unknown) => void,
   ): Promise<WorkspaceIndex> {
     const index = new WorkspaceIndex();
-    for (const f of await host.listFiles()) {
-      try {
-        await index.updateFile(f, await host.readFile(f));
-      } catch (e) {
-        onUnreadable?.(f, e);
+    const files = await host.listFiles();
+    // Reads overlap; parses still do not. Serially, file n+1's read did not
+    // start until file n's read *and* parse had finished, so a 2000-file
+    // workspace was 2000 sequential round trips across the ext-host RPC
+    // boundary — 1-4s locally, 10-20s over Remote-SSH, WSL or a devcontainer —
+    // and activate() awaits this before a single provider registers.
+    //
+    // Batched rather than a worker pool so the index is built in listing order,
+    // byte for byte what the serial version produced: `files()` order feeds
+    // diagnostic and candidate ordering. The bound also keeps a huge workspace
+    // from opening a file descriptor per file.
+    const CONCURRENCY = 24;
+    for (let start = 0; start < files.length; start += CONCURRENCY) {
+      const batch = files.slice(start, start + CONCURRENCY);
+      const read = await Promise.all(
+        batch.map(async (path): Promise<{ path: string; text?: string; error?: unknown }> => {
+          try {
+            return { path, text: await host.readFile(path) };
+          } catch (error) {
+            return { path, error };
+          }
+        }),
+      );
+      for (const r of read) {
+        if (r.text === undefined) {
+          onUnreadable?.(r.path, r.error);
+          continue;
+        }
+        try {
+          await index.updateFile(r.path, r.text);
+        } catch (e) {
+          // a parse failure, kept distinct from the read failure above
+          onUnreadable?.(r.path, e);
+        }
       }
     }
     return index;
@@ -137,69 +215,139 @@ export class WorkspaceIndex {
   }
 
   async updateFile(path: string, source: string): Promise<void> {
-    this.parsed.set(norm(path), parseFile(norm(path), source));
-    this.dirIndex = undefined;
+    const p = norm(path);
+    // Identical bytes reach here constantly: a save makes the disk watcher
+    // re-read what the 500ms debounce already parsed from the buffer, typing a
+    // character and deleting it nets out to no change, and `terraform fmt
+    // -recursive` over an already-formatted tree reports every file as changed.
+    // The wasted parse is the smaller half — the invalidation below drops the
+    // derived index for the *whole workspace*, which the next lint then rebuilds
+    // from every block and ref in it.
+    const previous = this.parsed.get(p);
+    if (previous?.source === source) return;
+    const parsed = parseFile(p, source);
+    this.parsed.set(p, parsed);
+    if (!previous && p.endsWith('.tf')) {
+      const list = this.filesByDir.get(dirOf(p));
+      if (list) list.push(p);
+      else this.filesByDir.set(dirOf(p), [p]);
+    }
+    // Incremental, not a full drop. Nulling `dirIndex` meant the next lint
+    // rebuilt it from every block and every ref in the workspace — guaranteed
+    // on every debounced keystroke, since the unused-locals memo is keyed on
+    // the generation this bumps. On 2000 files that was ~10-30ms of blocked
+    // extension host and 3-5MB of garbage per pause, re-deriving data for 1999
+    // files that did not change.
+    //
+    // A .tfvars contributes nothing here (the build skips non-.tf files), so
+    // its content change needs no index work at all — only the generation bump,
+    // which the evaluator reads through `file()`.
+    if (this.dirIndex && p.endsWith('.tf')) {
+      if (previous) this.retractRefs(this.dirIndex, previous);
+      this.rebuildDir(this.dirIndex, dirOf(p));
+      this.addRefs(this.dirIndex, parsed);
+    }
     this.gen++;
   }
 
   removeFile(path: string): void {
-    this.parsed.delete(norm(path));
-    this.dirIndex = undefined;
+    const p = norm(path);
+    const previous = this.parsed.get(p);
+    // the sync layer calls this for paths that were never indexed (an excluded
+    // file, a directory); bumping the generation there invalidated every
+    // generation-keyed memo for nothing
+    if (!previous) return;
+    this.parsed.delete(p);
+    const dir = dirOf(p);
+    const list = this.filesByDir.get(dir);
+    if (list) {
+      const at = list.indexOf(p);
+      if (at >= 0) list.splice(at, 1);
+      if (list.length === 0) this.filesByDir.delete(dir);
+    }
+    if (this.dirIndex && p.endsWith('.tf')) {
+      this.retractRefs(this.dirIndex, previous);
+      this.dirIndex.moduleCallsByFile.delete(p);
+      this.dirIndex.flatCalls = undefined;
+      this.rebuildDir(this.dirIndex, dir);
+    }
     this.gen++;
+  }
+
+  /** Recompute one directory's declarations from the files still in it. */
+  private rebuildDir(idx: DirIndex, dir: string): void {
+    const variables = new Map<string, { file: string; block: TfBlock }>();
+    const locals: { name: string; file: string; attr: TfAttr }[] = [];
+    for (const path of this.filesByDir.get(dir) ?? []) {
+      const f = this.parsed.get(path);
+      if (!f) continue;
+      const decls = declarationsOf(f);
+      // last declaration wins, exactly as a full pass in this order would
+      for (const v of decls.variables) variables.set(v.name, { file: path, block: v.block });
+      locals.push(...decls.locals);
+      idx.moduleCallsByFile.set(path, decls.calls);
+      idx.flatCalls = undefined;
+    }
+    if (variables.size > 0) idx.variablesByDir.set(dir, variables);
+    else idx.variablesByDir.delete(dir);
+    if (locals.length > 0) idx.localsByDir.set(dir, locals);
+    else idx.localsByDir.delete(dir);
+  }
+
+  private addRefs(idx: DirIndex, f: ParsedFile): void {
+    for (const ref of f.refs) {
+      if (ref.parts.length < 2) continue;
+      const key = `${ref.parts[0]}.${ref.parts[1]}`;
+      const bucket = idx.refsByAddress.get(key);
+      if (bucket) bucket.push({ file: f.path, ref });
+      else idx.refsByAddress.set(key, [{ file: f.path, ref }]);
+    }
+  }
+
+  /** Drop a file's entries from the buckets it contributed to. The previous
+   *  `ParsedFile` is the record of which those were, so no separate bookkeeping
+   *  can drift out of sync with it. */
+  private retractRefs(idx: DirIndex, f: ParsedFile): void {
+    const keys = new Set<string>();
+    for (const ref of f.refs) {
+      if (ref.parts.length >= 2) keys.add(`${ref.parts[0]}.${ref.parts[1]}`);
+    }
+    for (const key of keys) {
+      const bucket = idx.refsByAddress.get(key);
+      if (!bucket) continue;
+      const kept = bucket.filter((e) => e.file !== f.path);
+      if (kept.length > 0) idx.refsByAddress.set(key, kept);
+      else idx.refsByAddress.delete(key);
+    }
   }
 
   private idx(): DirIndex {
     if (this.dirIndex) return this.dirIndex;
-    const variablesByDir = new Map<string, Map<string, { file: string; block: TfBlock }>>();
-    const localsByDir = new Map<string, { name: string; file: string; attr: TfAttr }[]>();
-    const moduleCalls: DirIndex['moduleCalls'] = [];
-    // `variable`, `locals` and `module` are declarations only at the top level
-    // of a file. A provider schema is free to define a nested block that
-    // happens to share one of those names, and reading it as a declaration
-    // invented locals that the unused-locals lint then reported.
-    const visit = (file: string, dir: string, blocks: TfBlock[], top: boolean) => {
-      for (const b of blocks) {
-        if (!top) {
-          visit(file, dir, b.blocks, false);
-          continue;
-        }
-        if (b.kind === 'variable' && b.labels[0]) {
-          let byName = variablesByDir.get(dir);
-          if (!byName) {
-            byName = new Map();
-            variablesByDir.set(dir, byName);
-          }
-          byName.set(b.labels[0], { file, block: b });
-        } else if (b.kind === 'locals') {
-          let locals = localsByDir.get(dir);
-          if (!locals) {
-            locals = [];
-            localsByDir.set(dir, locals);
-          }
-          for (const attr of b.attrs) locals.push({ name: attr.name, file, attr });
-        } else if (b.kind === 'module') {
-          const source = attrOf(b, 'source');
-          const raw = source && stripQuotes(source.valueText);
-          const target = raw && isLocalSource(raw) ? resolveRel(dir, raw) : undefined;
-          moduleCalls.push({ file, callerDir: dir, block: b, target });
-        }
-        visit(file, dir, b.blocks, false);
-      }
+    const built: DirIndex = {
+      variablesByDir: new Map(),
+      localsByDir: new Map(),
+      moduleCallsByFile: new Map(),
+      refsByAddress: new Map(),
     };
-    const refsByAddress = new Map<string, { file: string; ref: TfRef }[]>();
+    // moduleCallsByFile is seeded in `parsed` order here, and `Map.set` keeps a
+    // key's position afterwards, so later incremental writes never reorder it
     for (const f of this.parsed.values()) {
       if (!f.path.endsWith('.tf')) continue;
-      visit(f.path, dirOf(f.path), f.blocks, true);
-      for (const ref of f.refs) {
-        if (ref.parts.length < 2) continue;
-        const key = `${ref.parts[0]}.${ref.parts[1]}`;
-        const bucket = refsByAddress.get(key);
-        if (bucket) bucket.push({ file: f.path, ref });
-        else refsByAddress.set(key, [{ file: f.path, ref }]);
-      }
+      built.moduleCallsByFile.set(f.path, []);
+      this.addRefs(built, f);
     }
-    this.dirIndex = { variablesByDir, localsByDir, moduleCalls, refsByAddress };
-    return this.dirIndex;
+    for (const dir of this.filesByDir.keys()) this.rebuildDir(built, dir);
+    this.dirIndex = built;
+    return built;
+  }
+
+  private moduleCalls(): ModuleCall[] {
+    const idx = this.idx();
+    if (idx.flatCalls) return idx.flatCalls;
+    const out: ModuleCall[] = [];
+    for (const calls of idx.moduleCallsByFile.values()) out.push(...calls);
+    idx.flatCalls = out;
+    return out;
   }
 
   files(): ParsedFile[] {
@@ -272,7 +420,7 @@ export class WorkspaceIndex {
 
   /** Local module directories declared from files inside rootDir, recursively. */
   modulesOf(rootDir: string): string[] {
-    const { moduleCalls } = this.idx();
+    const moduleCalls = this.moduleCalls();
     const seen = new Set<string>();
     const queue = [norm(rootDir)];
     for (let dir = queue.shift(); dir !== undefined; dir = queue.shift()) {
@@ -289,14 +437,18 @@ export class WorkspaceIndex {
 
   /** Variables declared in .tf files of a module directory, with their defining file. */
   variablesOf(moduleDir: string): Map<string, { file: string; block: TfBlock }> {
-    return this.idx().variablesByDir.get(norm(moduleDir)) ?? new Map();
+    // copied on the way out, like refsTo: the derived index is now mutated in
+    // place rather than dropped on every change, so a caller mutating what it
+    // was handed corrupts a directory until something edits that same
+    // directory — the old full invalidation used to wipe the damage
+    return new Map(this.idx().variablesByDir.get(norm(moduleDir)) ?? []);
   }
 
   /** Module blocks whose local source resolves to moduleDir (the places that instantiate it). */
   callSitesOf(moduleDir: string): ModuleCallSite[] {
     const target = norm(moduleDir);
-    return this.idx()
-      .moduleCalls.filter((call) => call.target === target)
+    return this.moduleCalls()
+      .filter((call) => call.target === target)
       .map(({ file, callerDir, block }) => ({ file, callerDir, block }));
   }
 
@@ -310,6 +462,7 @@ export class WorkspaceIndex {
 
   /** All local definitions (locals-block attributes) in a module directory. */
   localsOf(moduleDir: string): { name: string; file: string; attr: TfAttr }[] {
-    return this.idx().localsByDir.get(norm(moduleDir)) ?? [];
+    // copied for the same reason as variablesOf
+    return [...(this.idx().localsByDir.get(norm(moduleDir)) ?? [])];
   }
 }

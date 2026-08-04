@@ -45,6 +45,9 @@ export class VersionLensProvider implements vscode.CodeLensProvider {
     }
     // a bump lens under .terraform/ edits a file the next init overwrites
     if (isExcludedTfPath(document.uri.fsPath)) return [];
+    // before the parse, not only after the fan-out: a superseded invocation
+    // used to pay a full tree-sitter parse of the whole document first
+    if (token.isCancellationRequested) return [];
     // parse the live buffer — the index is debounced and its spans may be
     // stale, which would anchor lenses on the wrong lines
     const file = parseFile(normalizePath(document.uri.fsPath), document.getText());

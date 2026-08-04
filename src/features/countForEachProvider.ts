@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import { featureEnabled } from '../config';
 import type { TfvarsValue } from '../core/evaluator';
+import type { ParsedFile } from '../core/model';
 import { parseFile } from '../core/parser';
 import { normalizePath, type WorkspaceIndex } from '../core/workspaceIndex';
 import { toRange } from '../vscodeUtils';
@@ -9,7 +10,7 @@ import { detectCountLength, rewriteToForEach } from './countForEach';
 /** Kept structural so the refactor does not depend on the hover feature. */
 export interface TfvarsSource {
   /** the tfvars in force for a module directory */
-  valuesFor(moduleDir: string): Map<string, TfvarsValue>;
+  valuesFor(moduleDir: string): ReadonlyMap<string, TfvarsValue>;
 }
 
 /** Multi-edit refactor: count = length(list) → for_each. Only the fix is
@@ -19,6 +20,33 @@ export function registerCountForEach(
   index: WorkspaceIndex,
   tfvars?: TfvarsSource,
 ): void {
+  /** The buffer's parse, memoised per revision.
+   *
+   *  VS Code asks every code-action provider on each selection change, so this
+   *  ran ~4x a second while the caret moved, and a 3000-line main.tf costs
+   *  10-25ms of tree-sitter plus a full walk allocating every block and ref.
+   *
+   *  Only the parse is cached. `detectCountLength` still re-runs, so the lazy
+   *  `safeToRefactor` analysis is recomputed rather than remembered — it also
+   *  depends on the active tfvars pin, which changes in `workspaceState`
+   *  without touching the index, and serving a stale verdict there would offer
+   *  a destructive rewrite the current pin does not justify. */
+  let parseCache: { key: string; file: ParsedFile | undefined } | undefined;
+  const parseCached = (doc: vscode.TextDocument, path: string): ParsedFile | undefined => {
+    const key = `${doc.uri.toString()}@${doc.version}`;
+    if (parseCache?.key === key) return parseCache.file;
+    let file: ParsedFile | undefined;
+    try {
+      file = parseFile(path, doc.getText());
+    } catch {
+      // unbounded CST recursion throws RangeError on a half-typed file. Cached
+      // like any other result, so it costs one parse and not one per cursor move.
+      file = undefined;
+    }
+    parseCache = { key, file };
+    return file;
+  };
+
   context.subscriptions.push(
     vscode.languages.registerCodeActionsProvider(
       // scheme 'file': the rewrite edits a real file, so skip read-only
@@ -38,7 +66,8 @@ export function registerCountForEach(
           const path = normalizePath(doc.uri.fsPath);
           if (!index.file(path)) return [];
           // the index is debounced, and stale spans would corrupt the rewrite
-          const file = parseFile(path, doc.getText());
+          const file = parseCached(doc, path);
+          if (!file) return [];
           const actions: vscode.CodeAction[] = [];
           for (const pattern of detectCountLength(file, index, {
             tfvarsOf: (dir) => tfvars?.valuesFor(dir) ?? new Map(),
