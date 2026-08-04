@@ -24,8 +24,12 @@ export interface TfRef {
 
 export interface ParsedFile {
   path: string;
+  /** the exact text this was parsed from, kept so the index can tell a real
+   *  edit from a re-read of identical bytes */
+  source: string;
   blocks: TfBlock[];
   refs: TfRef[];
+  /** materialised on first read, then cached — see `parseFile` */
   lines: string[];
 }
 

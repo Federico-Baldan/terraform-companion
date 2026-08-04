@@ -155,9 +155,16 @@ function toBlock(node: Node): TfBlock | undefined {
 /** Collect `variable_expr (get_attr)*` chains as references. Bare identifiers
  *  (object keys, attr names) are excluded — fewer than 2 parts. */
 function collectRefs(node: Node, refs: TfRef[]): void {
+  // Hoisted once per node. `namedChild(i)` marshals a node across the wasm
+  // boundary and is O(log n) by the library's own documentation, and this loop
+  // called it ~2k+1 times per node with k children — plus a second time for the
+  // same index on every reference — where `namedChildren` crosses once and
+  // memoises the array. This runs over every named node of every file, at
+  // startup and again on every debounced keystroke.
+  const children = node.namedChildren;
   let i = 0;
-  while (i < node.namedChildCount) {
-    const c = node.namedChild(i);
+  while (i < children.length) {
+    const c = children[i];
     if (!c) {
       i++;
       continue;
@@ -170,8 +177,8 @@ function collectRefs(node: Node, refs: TfRef[]): void {
       // stopping on it truncates the reference — `local /*c*/ .x` collected
       // nothing and the unused-locals lint then offered to delete a local that
       // is used, the expensive direction to be wrong in
-      while (node.namedChild(j)?.type === 'comment') j++;
-      let next = node.namedChild(j);
+      while (children[j]?.type === 'comment') j++;
+      let next = children[j];
       while (next?.type === 'get_attr') {
         // whitespace and comments are both legal around the dot — `local. name`
         // and `local. /*c*/ x` are each one clean get_attr, and a part that
@@ -179,8 +186,8 @@ function collectRefs(node: Node, refs: TfRef[]): void {
         parts.push(stripComments(next.text.replace(/^\s*\.\s*/, '')).trim());
         end = next.endPosition;
         j++;
-        while (node.namedChild(j)?.type === 'comment') j++;
-        next = node.namedChild(j);
+        while (children[j]?.type === 'comment') j++;
+        next = children[j];
       }
       if (parts.length >= 2) {
         refs.push({
@@ -260,5 +267,20 @@ export function parseFile(path: string, source: string): ParsedFile {
       tree.delete();
     }
   }
-  return { path, blocks, refs, lines: source.split(/\r?\n/) };
+  // Only the file currently being linted or hovered ever reads `lines`, and it
+  // reads one or two of them. Splitting eagerly kept one string per line of
+  // every indexed file alive for the whole session — on a 2000-file workspace
+  // that is ~160k live strings for data derivable in microseconds — and paid
+  // for it again on every debounced keystroke.
+  let lines: string[] | undefined;
+  return {
+    path,
+    source,
+    blocks,
+    refs,
+    get lines(): string[] {
+      lines ??= source.split(/\r?\n/);
+      return lines;
+    },
+  };
 }
