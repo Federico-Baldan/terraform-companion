@@ -1,7 +1,7 @@
-import { rm } from 'node:fs/promises';
 import * as vscode from 'vscode';
 import { cacheCleanerAutoDelete, cacheCleanerStaleDays, featureEnabled } from '../config';
 import {
+  deleteCachePayload,
   effectiveStaleDays,
   findStaleTerraformDirs,
   formatSize,
@@ -64,7 +64,7 @@ async function scan(log: (m: string) => void, cancelled: () => boolean): Promise
   for (const c of unique) log(`cacheCleaner: stale ${c.dir} (${formatSize(c.sizeBytes)})`);
   if (!cacheCleanerAutoDelete()) {
     const choice = await vscode.window.showWarningMessage(
-      `Terraform Companion: ${unique.length} .terraform folder${unique.length === 1 ? '' : 's'} with no activity for over ${effectiveStaleDays(staleDays)} days (${formatSize(total)}). Delete them? They are only caches: terraform init recreates them (the selected workspace resets to default, and a module initialised with -backend-config needs those flags again).`,
+      `Terraform Companion: ${unique.length} .terraform folder${unique.length === 1 ? '' : 's'} with no activity for over ${effectiveStaleDays(staleDays)} days (${formatSize(total)}). Delete the cached providers and modules? terraform init recreates them, and the selected workspace and backend config are kept.`,
       'Delete',
       'Ignore',
     );
@@ -82,16 +82,21 @@ async function scan(log: (m: string) => void, cancelled: () => boolean): Promise
       continue;
     }
     try {
-      await rm(c.dir, { recursive: true, force: true });
+      await deleteCachePayload(c.dir);
       deleted++;
       freed += c.sizeBytes;
-      log(`cacheCleaner: deleted ${c.dir}`);
+      log(`cacheCleaner: cleaned ${c.dir}`);
     } catch (e) {
-      log(`cacheCleaner: failed to delete ${c.dir}: ${e}`);
+      log(`cacheCleaner: failed to clean ${c.dir}: ${e}`);
     }
   }
   if (deleted === 0) return;
-  void vscode.window.showInformationMessage(
-    `Terraform Companion: deleted ${deleted} stale .terraform cache${deleted === 1 ? '' : 's'}, freed ${formatSize(freed)}. Those modules will need terraform init (and terraform workspace select, if they used workspaces) next time.`,
-  );
+  // caught, not voided: this fires after a walk that may have taken a while, so
+  // the window can be closing by now and a rejection would land on the
+  // extension host as an unhandled one
+  vscode.window
+    .showInformationMessage(
+      `Terraform Companion: cleaned ${deleted} stale .terraform cache${deleted === 1 ? '' : 's'}, freed ${formatSize(freed)}. Those modules will need terraform init next time.`,
+    )
+    .then(undefined, (e) => log(`cacheCleaner: notification failed: ${e}`));
 }

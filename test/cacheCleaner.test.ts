@@ -1,8 +1,19 @@
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
+import {
+  existsSync,
+  lutimesSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  utimesSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
+  deleteCachePayload,
   findStaleTerraformDirs,
   formatSize,
   isStillStale,
@@ -199,6 +210,133 @@ describe('cache cleaner', () => {
     expect(await findStaleTerraformDirs(root, 30, NOW)).toEqual([]);
   });
 
+  /** .terraform/environment holds the selected workspace and
+   *  .terraform/terraform.tfstate the resolved backend config. Both are a few
+   *  hundred bytes terraform init cannot reconstruct on its own: wiping them
+   *  silently moves a user off `prod` and back to `default`. */
+  it('deletes the cached payload but keeps workspace and backend metadata', async () => {
+    const cache = makeModule(root, 'meta', 60, 60);
+    mkdirSync(join(cache, 'modules'), { recursive: true });
+    writeFileSync(join(cache, 'modules', 'mod.json'), '{}');
+    writeFileSync(join(cache, 'environment'), 'prod');
+    writeFileSync(join(cache, 'terraform.tfstate'), '{"backend":{}}');
+
+    await deleteCachePayload(cache);
+
+    expect(existsSync(join(cache, 'providers'))).toBe(false);
+    expect(existsSync(join(cache, 'modules'))).toBe(false);
+    expect(readFileSync(join(cache, 'environment'), 'utf8')).toBe('prod');
+    expect(existsSync(join(cache, 'terraform.tfstate'))).toBe(true);
+  });
+
+  /** Deleting `.terraform` itself only ever unlinked a symlink. Descending to
+   *  `.terraform/providers` resolves *through* it, so a linked cache would have
+   *  had the real directory on the other side emptied — outside the workspace. */
+  it('never deletes through a .terraform that is a symlink', async () => {
+    const target = makeModule(outside, 'target', 60, 60);
+    const mod = join(root, 'mod');
+    mkdirSync(mod, { recursive: true });
+    symlinkSync(target, join(mod, '.terraform'));
+
+    await deleteCachePayload(join(mod, '.terraform'));
+
+    expect(existsSync(join(target, 'providers', 'bin'))).toBe(true);
+  });
+
+  it('does not count a symlinked payload it will not actually delete', async () => {
+    const shared = join(outside, 'shared');
+    mkdirSync(shared, { recursive: true });
+    writeFileSync(join(shared, 'big'), 'x'.repeat(50_000));
+    const mod = join(root, 'linked');
+    const cache = join(mod, '.terraform');
+    mkdirSync(cache, { recursive: true });
+    writeFileSync(join(mod, 'main.tf'), 'x = 1');
+    // a shared plugin cache: rm unlinks the link, so nothing here is reclaimed
+    symlinkSync(shared, join(cache, 'providers'));
+    touch(join(mod, 'main.tf'), 90);
+    // lutimes, not utimes: the latter follows the link and would age the target
+    // instead, leaving the link itself mtime-now and the module merely "active"
+    const old = new Date(NOW - 90 * DAY);
+    lutimesSync(join(cache, 'providers'), old, old);
+    touch(cache, 90);
+
+    expect(await findStaleTerraformDirs(root, 30, NOW)).toEqual([]);
+    expect(existsSync(join(shared, 'big'))).toBe(true);
+  });
+
+  /** Terraform <= 0.13 kept provider binaries in .terraform/plugins. Those are
+   *  exactly the caches old enough to trip a 30-day threshold. */
+  it('reclaims the pre-0.14 plugins layout', async () => {
+    const mod = join(root, 'legacy');
+    const cache = join(mod, '.terraform');
+    mkdirSync(join(cache, 'plugins', 'linux_amd64'), { recursive: true });
+    writeFileSync(join(cache, 'plugins', 'linux_amd64', 'bin'), 'x'.repeat(4096));
+    writeFileSync(join(mod, 'main.tf'), 'x = 1');
+    for (const p of [
+      join(cache, 'plugins', 'linux_amd64', 'bin'),
+      join(cache, 'plugins', 'linux_amd64'),
+      join(cache, 'plugins'),
+      join(mod, 'main.tf'),
+      cache,
+    ]) {
+      touch(p, 90);
+    }
+    const [found] = await findStaleTerraformDirs(root, 30, NOW);
+    expect(found?.dir).toBe(cache);
+
+    await deleteCachePayload(cache);
+    expect(existsSync(join(cache, 'plugins'))).toBe(false);
+  });
+
+  /** The size total is display-only and deliberately bounded, so it must not be
+   *  what decides whether a cache is reported at all. */
+  it('reports a cache whose payload sits below the size walk depth cap', async () => {
+    const mod = join(root, 'deep');
+    const cache = join(mod, '.terraform');
+    let dir = join(cache, 'modules');
+    for (let i = 0; i < 40; i++) dir = join(dir, `d${i}`);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 'bin'), 'x'.repeat(4096));
+    writeFileSync(join(mod, 'main.tf'), 'x = 1');
+    touch(join(mod, 'main.tf'), 90);
+    touch(join(cache, 'modules'), 90);
+    touch(cache, 90);
+
+    expect((await findStaleTerraformDirs(root, 30, NOW)).map((c) => c.dir)).toContain(cache);
+  });
+
+  it('refuses to touch anything not named .terraform', async () => {
+    const victim = join(root, 'important');
+    mkdirSync(join(victim, 'providers'), { recursive: true });
+    writeFileSync(join(victim, 'providers', 'keep'), 'x');
+    await deleteCachePayload(victim);
+    expect(existsSync(join(victim, 'providers', 'keep'))).toBe(true);
+  });
+
+  /** The deletion leaves .terraform standing, so a cache with nothing left to
+   *  reclaim must drop out of the results — otherwise the same folders are
+   *  reported, and prompted for, on every single launch. */
+  it('does not report a cache with no reclaimable payload', async () => {
+    const mod = join(root, 'metaonly');
+    mkdirSync(join(mod, '.terraform'), { recursive: true });
+    writeFileSync(join(mod, 'main.tf'), 'x = 1');
+    writeFileSync(join(mod, '.terraform', 'environment'), 'prod');
+    touch(join(mod, 'main.tf'), 90);
+    touch(join(mod, '.terraform', 'environment'), 90);
+    touch(join(mod, '.terraform'), 90);
+    expect(await findStaleTerraformDirs(root, 30, NOW)).toEqual([]);
+  });
+
+  it('sizes only the bytes it will actually reclaim', async () => {
+    const cache = makeModule(root, 'sized', 60, 60);
+    // metadata sits beside the payload and must not inflate the reported figure
+    writeFileSync(join(cache, 'environment'), 'x'.repeat(4096));
+    touch(join(cache, 'environment'), 60);
+    touch(cache, 60); // the write above bumped the cache dir's own mtime
+    const [found] = await findStaleTerraformDirs(root, 30, NOW);
+    expect(found!.sizeBytes).toBe(2048);
+  });
+
   it('only ever treats dirs literally named .terraform as cache', () => {
     expect(isTerraformCacheDir('/x/y/.terraform')).toBe(true);
     expect(isTerraformCacheDir('/x/y/.terraform-backup')).toBe(false);
@@ -213,13 +351,20 @@ describe('cache cleaner', () => {
 });
 
 describe('scan depth', () => {
-  /** Build a module `depth` directories below root and return its cache path. */
+  /** Build a module `depth` directories below root and return its cache path.
+   *  The cache carries a providers payload: an empty .terraform has nothing to
+   *  reclaim and is deliberately not reported. */
   function nest(depth: number, name: string): string {
     let dir = root;
     for (let i = 0; i < depth; i++) dir = join(dir, `d${i}`);
-    mkdirSync(join(dir, '.terraform'), { recursive: true });
+    mkdirSync(join(dir, '.terraform', 'providers'), { recursive: true });
+    writeFileSync(join(dir, '.terraform', 'providers', 'bin'), 'x'.repeat(2048));
     writeFileSync(join(dir, 'main.tf'), 'x = 1');
     touch(join(dir, 'main.tf'), 90);
+    // after the writes: creating an entry bumps its parent's mtime, and
+    // lastActivity reads .terraform's children as well as .terraform itself
+    touch(join(dir, '.terraform', 'providers', 'bin'), 90);
+    touch(join(dir, '.terraform', 'providers'), 90);
     touch(join(dir, '.terraform'), 90);
     return join(dir, name);
   }
