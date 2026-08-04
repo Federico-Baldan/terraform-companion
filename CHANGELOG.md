@@ -2,6 +2,13 @@
 
 Notable changes to Terraform Companion. Versions follow semver; dates are ISO (YYYY-MM-DD).
 
+## [1.1.8](https://github.com/Federico-Baldan/terraform-companion/compare/v1.1.7...v1.1.8) (2026-08-04)
+
+
+### Bug Fixes
+
+* cut extension-host CPU, RAM and I/O, and close two prod hazards ([#21](https://github.com/Federico-Baldan/terraform-companion/issues/21)) ([7960963](https://github.com/Federico-Baldan/terraform-companion/commit/7960963c80a0bbe3cb0642bb05d31a047710ef72))
+
 ## [1.1.7](https://github.com/Federico-Baldan/terraform-companion/compare/v1.1.6...v1.1.7) (2026-08-03)
 
 
