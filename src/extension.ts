@@ -2,7 +2,7 @@ import { join } from 'node:path';
 import * as vscode from 'vscode';
 import { versionLensCacheTtlHours } from './config';
 import { initParser } from './core/parser';
-import { WorkspaceIndex } from './core/workspaceIndex';
+import { normalizePath, WorkspaceIndex } from './core/workspaceIndex';
 import { registerCacheCleaner } from './features/cacheCleanerProvider';
 import { registerCountForEach } from './features/countForEachProvider';
 import { registerResolvedHover } from './features/resolvedHoverProvider';
@@ -12,6 +12,17 @@ import { registerLintPipeline } from './lintPipeline';
 import { buildLintRules } from './lintRules';
 import { type CacheEntry, pruneRegistryCache, RegistryClient } from './registry/client';
 import { vscodeHost } from './vscodeUtils';
+
+/** Whether a batch of changed paths reaches an editor the user can see. */
+function touchesVisibleEditor(changed: readonly string[]): boolean {
+  if (changed.length === 0) return false;
+  const visible = new Set(
+    vscode.window.visibleTextEditors
+      .filter((e) => e.document.uri.scheme === 'file')
+      .map((e) => normalizePath(e.document.uri.fsPath)),
+  );
+  return changed.some((p) => visible.has(normalizePath(p)));
+}
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   const output = vscode.window.createOutputChannel('Terraform Companion');
@@ -70,7 +81,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     index,
     (changed) => {
       pipeline.refreshPaths(changed);
-      versionLens.refresh();
+      // Only when something actually on screen changed. A CodeLens depends on
+      // its own document's text and on the registry cache, and VS Code already
+      // re-invokes the provider whenever the text changes — so firing this for
+      // an edit to an unrelated file just made *every* visible editor re-parse
+      // itself with tree-sitter. A 3000-line main.tf with no version blocks at
+      // all cost ~67ms of blocked extension host per typing pause, to produce
+      // zero lenses, once per visible editor.
+      if (touchesVisibleEditor(changed)) versionLens.refresh();
       activeTfvars.updateStatusBar();
     },
     log,
@@ -80,10 +98,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // clear its diagnostics right away, not leave them until the next keystroke
   context.subscriptions.push(
     vscode.workspace.onDidChangeConfiguration((e) => {
-      if (e.affectsConfiguration('tfCompanion')) {
-        pipeline.refreshAll();
-        versionLens.refresh();
-      }
+      // asked separately: the lint and the lens read disjoint settings, and
+      // re-linting every indexed file because a cache TTL moved is the
+      // expensive half
+      if (pipeline.affects(e)) pipeline.refreshAll();
+      if (e.affectsConfiguration('tfCompanion.versionLens')) versionLens.refresh();
     }),
   );
 

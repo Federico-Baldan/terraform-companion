@@ -273,7 +273,7 @@ export function readPins(stored: unknown, dirOf: (p: string) => string): Record<
 export interface HoverContext {
   index: WorkspaceIndex;
   /** the tfvars in force for a module directory (see EvalScope.tfvarsOf) */
-  tfvarsOf: (moduleDir: string) => Map<string, TfvarsValue>;
+  tfvarsOf: (moduleDir: string) => ReadonlyMap<string, TfvarsValue>;
   copyCommand: string;
 }
 

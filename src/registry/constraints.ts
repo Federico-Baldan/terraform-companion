@@ -40,7 +40,18 @@ export const CEILING_OPS = new Set(['<', '<=']);
 /** Terraform operator semantics, not semver's. */
 export function clauseAdmits(clause: ConstraintClause, version: string): boolean {
   const target = semver.coerce(version);
-  const bound = semver.coerce(clause.version);
+  return admitsParsed(clause, target, semver.coerce(clause.version));
+}
+
+/** The body of `clauseAdmits` with both sides already coerced. `latestAdmitted`
+ *  runs this once per published version — 499 of them for hashicorp/aws — and
+ *  re-coercing the clause's own bound inside that loop meant parsing the same
+ *  string hundreds of times per CodeLens pass. */
+function admitsParsed(
+  clause: ConstraintClause,
+  target: semver.SemVer | null,
+  bound: semver.SemVer | null,
+): boolean {
   if (!target || !bound) return true;
   const [t, b] = [target.version, bound.version];
   switch (clause.op) {
@@ -91,10 +102,26 @@ export function pivotClause(clauses: ConstraintClause[]): ConstraintClause | und
   return best ?? clauses[0];
 }
 
-/** Newest stable release the constraint's own ceilings admit. */
+/** Newest stable release the constraint's own ceilings admit.
+ *
+ *  One pass, coercing each version string once. The filter-then-`latestStable`
+ *  shape parsed every candidate three times over (once per clause inside
+ *  `clauseAdmits`, once in the filter, once again in `latestStable`) and
+ *  re-parsed each clause bound per candidate: 2,227 `semver.coerce` calls for a
+ *  single `hashicorp/aws` lens, repeated on every scroll and every keystroke. */
 export function latestAdmitted(versions: string[], constraint: string): string | undefined {
-  const clauses = parseConstraint(constraint);
-  return latestStable(versions.filter((v) => clauses.every((c) => clauseAdmits(c, v))));
+  const clauses = parseConstraint(constraint).map((c) => ({
+    clause: c,
+    bound: semver.coerce(c.version),
+  }));
+  let best: semver.SemVer | undefined;
+  for (const v of versions) {
+    const parsed = semver.coerce(v, { includePrerelease: true });
+    if (!parsed || parsed.prerelease.length > 0 || semver.prerelease(v)) continue;
+    if (!clauses.every(({ clause, bound }) => admitsParsed(clause, parsed, bound))) continue;
+    if (!best || semver.gt(parsed, best)) best = parsed;
+  }
+  return best?.version;
 }
 
 /** Counted at the coarsest unit that moved. */

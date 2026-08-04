@@ -51,16 +51,29 @@ export class LintPipeline {
     return fileFindings;
   }
 
+  private diagnosticsFor(file: ParsedFile): vscode.Diagnostic[] {
+    return this.computeFindings(file).map((f) => {
+      const diag = new vscode.Diagnostic(toRange(f.span), f.message, severityFor(f.code));
+      diag.source = 'tf-companion';
+      diag.code = f.code;
+      return diag;
+    });
+  }
+
   private publish(file: ParsedFile): void {
-    this.collection.set(
-      vscode.Uri.file(file.path),
-      this.computeFindings(file).map((f) => {
-        const diag = new vscode.Diagnostic(toRange(f.span), f.message, severityFor(f.code));
-        diag.source = 'tf-companion';
-        diag.code = f.code;
-        return diag;
-      }),
-    );
+    this.collection.set(vscode.Uri.file(file.path), this.diagnosticsFor(file));
+  }
+
+  /** Whether a settings change can alter any diagnostic this pipeline emits.
+   *
+   *  `affectsConfiguration('tfCompanion')` is true for every key in the
+   *  section, so dragging `cacheCleaner.staleDays` or `versionLens.
+   *  cacheTtlHours` in the Settings UI re-linted the entire workspace — one
+   *  `publish` per indexed file, each firing its own diagnostics-changed event
+   *  — for a value no rule reads. A section prefix already covers its children,
+   *  so `versionHygiene` catches `versionHygiene.variableDocs`. */
+  affects(e: vscode.ConfigurationChangeEvent): boolean {
+    return this.rules.some((rule) => e.affectsConfiguration(`tfCompanion.${rule.feature}`));
   }
 
   refreshAll(): void {
@@ -68,7 +81,17 @@ export class LintPipeline {
     // index-dependent rules (unused locals, cross-file count refs) can change
     // without the buffer changing, so the per-revision cache must not survive
     this.actionCache = undefined;
-    for (const file of this.index.files()) this.publish(file);
+    // one bulk set instead of one event per file: the Problems view and every
+    // editor's decoration layer react to each diagnostics-changed event, and a
+    // 2000-file workspace fired 2000 of them. Files with nothing to report get
+    // `undefined` rather than an empty array, so the collection stops holding
+    // an entry per indexed file.
+    const entries: [vscode.Uri, vscode.Diagnostic[] | undefined][] = [];
+    for (const file of this.index.files()) {
+      const diagnostics = this.diagnosticsFor(file);
+      entries.push([vscode.Uri.file(file.path), diagnostics.length > 0 ? diagnostics : undefined]);
+    }
+    this.collection.set(entries);
   }
 
   /** Re-lint only what an edit to `paths` can have changed. Nothing outside the
