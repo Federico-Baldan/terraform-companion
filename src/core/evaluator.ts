@@ -70,7 +70,38 @@ interface EvalState {
    *  rather than a flag so a caller can tell whether a *particular* subtree
    *  gave up, not merely whether anything did. */
   spends: number;
+  /** Live `evalNode` frames. See MAX_NEST. */
+  nest: number;
 }
+
+/** Structural nesting one *expression* may have.
+ *
+ *  `depth` counts reference hops, and every structural recursion inside
+ *  `evalNode` — tuple elements, object keys and values, interpolations,
+ *  function arguments, the single-child passthroughs — passed it down
+ *  unchanged, so `MAX_DEPTH` bounded nothing structural and a nested collection
+ *  literal recursed until V8 threw. Measured on this parser: one bracket costs
+ *  exactly 3 `evalNode` frames, `[[[…"x"…]]]` survives 200 levels and throws
+ *  `RangeError` at 600, and `provideHover` does not catch it — so one generated
+ *  `.tf` took the hover down for the whole document, the same escape
+ *  MAX_REF_HOPS closed for reference chains.
+ *
+ *  Reset per expression (a ref hop re-enters through `evalText` at 0) so it
+ *  bounds shape, not chain length: MAX_REF_HOPS already bounds the latter.
+ *  MAX_RENDER_DEPTH refuses to render past 64 levels anyway, so nothing
+ *  observable is lost below this. */
+const MAX_STRUCT_NEST = 64;
+
+/** Live `evalNode` frames across the whole resolve — the backstop the
+ *  per-expression cap cannot be: a chain of N hops each entered from M levels
+ *  deep costs N×M frames while both counters individually stay small.
+ *
+ *  Sized against measurement, not taste. A legitimate 250-hop chain peaks at
+ *  1003 frames, and MAX_REF_HOPS admits 256 of them, so anything at or below
+ *  ~1030 is shipped behaviour and must not change. `RangeError` lands near
+ *  1800. This sits between the two: it never fires on work the current release
+ *  already does, and it stops the stack short of the throw. */
+const MAX_NEST = 1400;
 
 /** Elements one resolve may materialise.
  *
@@ -421,116 +452,145 @@ function callFunction(name: string, args: Value[], scope: EvalScope): Value {
   }
 }
 
-function evalNode(node: Node, scope: EvalScope, depth: number): Value {
+/** Bounds recursion two ways, because one counter cannot do both. `struct` caps
+ *  the shape of a single expression and resets on every reference hop;
+ *  `state.nest` caps live frames across the whole resolve and only falls when a
+ *  frame returns, so it holds however the resolve got here — including across
+ *  hops, which re-enter without unwinding the stack. `depth` bounds neither: it
+ *  resets to 0 on the local branch and only some hops charge it.
+ *
+ *  Deliberately one function rather than a guard wrapping a worker: a wrapper
+ *  costs a second JS frame per level, which would halve the nesting the engine
+ *  tolerates and drag the ceiling below the 1003-frame chain the current
+ *  release already resolves. Every entry point installs a state; without one
+ *  this is the previous, `depth`-only behaviour. */
+function evalNode(node: Node, scope: EvalScope, depth: number, struct = 0): Value {
   if (depth > MAX_DEPTH) return undefined;
-  switch (node.type) {
-    case 'expression': {
-      const children = named(node);
-      const first = children[0];
-      if (first?.type === 'variable_expr') {
-        const parts = [first.text];
-        for (let i = 1; i < children.length; i++) {
-          const child = children[i];
-          if (child?.type !== 'get_attr') return undefined; // index/splat: give up
-          // whitespace is legal on both sides of the dot (see parser.ts)
-          parts.push(child.text.replace(/^\s*\.\s*/, ''));
-        }
-        return resolveRefValue(parts, scope, depth + 1);
-      }
-      return children.length === 1 && first ? evalNode(first, scope, depth) : undefined;
-    }
-    case 'literal_value':
-    case 'template_expr':
-    case 'collection_value': {
-      const children = named(node);
-      const sole = children.length === 1 ? children[0] : undefined;
-      return sole ? evalNode(sole, scope, depth) : undefined;
-    }
-    case 'numeric_lit':
-      return canonicalNumber(node.text);
-    case 'bool_lit':
-      return new NonString(node.text);
-    case 'null_lit':
-      return new NonString('null');
-    case 'string_lit':
-    case 'quoted_template': {
-      // whitespace is a grammar "extra", so it belongs to no named node — the
-      // gaps between children have to come from raw text, rebased to this
-      // node's start
-      const raw = node.text;
-      const base = node.startIndex;
-      const gap = (from: number, to: number) =>
-        to > from ? raw.slice(from - base, to - base) : '';
-      let out = '';
-      let cursor = node.startIndex;
-      for (const c of named(node)) {
-        switch (c.type) {
-          // quotes carry no text, but whitespace before the closing one does:
-          // "trail  " keeps its padding
-          case 'quoted_template_start':
-            break;
-          case 'quoted_template_end':
-            out += unescapeTemplateLiteral(gap(cursor, c.startIndex));
-            break;
-          case 'template_literal':
-            // decoded with the gap, so an escape cannot split across the seam
-            out += unescapeTemplateLiteral(gap(cursor, c.startIndex) + c.text);
-            break;
-          case 'template_interpolation': {
-            out += unescapeTemplateLiteral(gap(cursor, c.startIndex));
-            const inner = named(c).find((x) => x.type === 'expression');
-            out += inner ? render(evalNode(inner, scope, depth)) : UNKNOWN;
-            break;
-          }
-          // %{ if }/%{ for } branch on a condition we never evaluate and
-          // restructure the string instead of filling a slot — the whole
-          // string is unknown, not partial
-          default:
-            return undefined;
-        }
-        cursor = c.endIndex;
-        // bail on the way up, not at the end: each child is already capped, so
-        // stopping here bounds this node too instead of letting the product
-        // compound level by level
-        if (out.length > MAX_VALUE_CHARS) return undefined;
-      }
-      return out;
-    }
-    case 'tuple': {
-      // charged too, so a hand-written or generated 200k-element literal is
-      // covered by the same budget as concat
-      const items = named(node)
-        .filter((c) => c.type === 'expression')
-        .map((c) => evalNode(c, scope, depth));
-      return chargeElements(scope, items.length) ? items : undefined;
-    }
-    case 'object': {
-      const out: ObjValue = new Map();
-      for (const elem of named(node)) {
-        if (elem.type !== 'object_elem') continue;
-        const [key, value] = named(elem).filter((c) => c.type === 'expression');
-        if (!key || !value) continue;
-        // a bare key is literal: { env = 1 } has key "env" even if var.env exists
-        const name = /^[\w-]+$/.test(key.text.trim())
-          ? key.text.trim()
-          : asString(evalNode(key, scope, depth));
-        if (name === undefined) continue;
-        out.set(name, evalNode(value, scope, depth));
-      }
-      return chargeElements(scope, out.size) ? out : undefined;
-    }
-    case 'function_call': {
-      const name = named(node).find((c) => c.type === 'identifier')?.text ?? '';
-      const argsNode = named(node).find((c) => c.type === 'function_arguments');
-      const args = argsNode
-        ? named(argsNode)
-            .filter((c) => c.type === 'expression')
-            .map((c) => evalNode(c, scope, depth))
-        : [];
-      return callFunction(name, args, scope);
-    }
-    default:
+  const state = scope.state;
+  if (state) {
+    if (struct > MAX_STRUCT_NEST || state.nest >= MAX_NEST) {
+      // a budget giving up, not an absent value: `spends` is what stops a caller
+      // reading "too deep to evaluate" as "nothing here to object to" and
+      // certifying a destructive rewrite on it
+      state.spends++;
       return undefined;
+    }
+    state.nest++;
+  }
+  try {
+    switch (node.type) {
+      case 'expression': {
+        const children = named(node);
+        const first = children[0];
+        if (first?.type === 'variable_expr') {
+          const parts = [first.text];
+          for (let i = 1; i < children.length; i++) {
+            const child = children[i];
+            if (child?.type !== 'get_attr') return undefined; // index/splat: give up
+            // whitespace is legal on both sides of the dot (see parser.ts)
+            parts.push(child.text.replace(/^\s*\.\s*/, ''));
+          }
+          return resolveRefValue(parts, scope, depth + 1);
+        }
+        return children.length === 1 && first
+          ? evalNode(first, scope, depth, struct + 1)
+          : undefined;
+      }
+      case 'literal_value':
+      case 'template_expr':
+      case 'collection_value': {
+        const children = named(node);
+        const sole = children.length === 1 ? children[0] : undefined;
+        return sole ? evalNode(sole, scope, depth, struct + 1) : undefined;
+      }
+      case 'numeric_lit':
+        return canonicalNumber(node.text);
+      case 'bool_lit':
+        return new NonString(node.text);
+      case 'null_lit':
+        return new NonString('null');
+      case 'string_lit':
+      case 'quoted_template': {
+        // whitespace is a grammar "extra", so it belongs to no named node — the
+        // gaps between children have to come from raw text, rebased to this
+        // node's start
+        const raw = node.text;
+        const base = node.startIndex;
+        const gap = (from: number, to: number) =>
+          to > from ? raw.slice(from - base, to - base) : '';
+        let out = '';
+        let cursor = node.startIndex;
+        for (const c of named(node)) {
+          switch (c.type) {
+            // quotes carry no text, but whitespace before the closing one does:
+            // "trail  " keeps its padding
+            case 'quoted_template_start':
+              break;
+            case 'quoted_template_end':
+              out += unescapeTemplateLiteral(gap(cursor, c.startIndex));
+              break;
+            case 'template_literal':
+              // decoded with the gap, so an escape cannot split across the seam
+              out += unescapeTemplateLiteral(gap(cursor, c.startIndex) + c.text);
+              break;
+            case 'template_interpolation': {
+              out += unescapeTemplateLiteral(gap(cursor, c.startIndex));
+              const inner = named(c).find((x) => x.type === 'expression');
+              out += inner ? render(evalNode(inner, scope, depth, struct + 1)) : UNKNOWN;
+              break;
+            }
+            // %{ if }/%{ for } branch on a condition we never evaluate and
+            // restructure the string instead of filling a slot — the whole
+            // string is unknown, not partial
+            default:
+              return undefined;
+          }
+          cursor = c.endIndex;
+          // bail on the way up, not at the end: each child is already capped, so
+          // stopping here bounds this node too instead of letting the product
+          // compound level by level
+          if (out.length > MAX_VALUE_CHARS) return undefined;
+        }
+        return out;
+      }
+      case 'tuple': {
+        // charged too, so a hand-written or generated 200k-element literal is
+        // covered by the same budget as concat
+        const items = named(node)
+          .filter((c) => c.type === 'expression')
+          .map((c) => evalNode(c, scope, depth, struct + 1));
+        return chargeElements(scope, items.length) ? items : undefined;
+      }
+      case 'object': {
+        const out: ObjValue = new Map();
+        for (const elem of named(node)) {
+          if (elem.type !== 'object_elem') continue;
+          const [key, value] = named(elem).filter((c) => c.type === 'expression');
+          if (!key || !value) continue;
+          // a bare key is literal: { env = 1 } has key "env" even if var.env exists
+          const name = /^[\w-]+$/.test(key.text.trim())
+            ? key.text.trim()
+            : asString(evalNode(key, scope, depth, struct + 1));
+          if (name === undefined) continue;
+          out.set(name, evalNode(value, scope, depth, struct + 1));
+        }
+        return chargeElements(scope, out.size) ? out : undefined;
+      }
+      case 'function_call': {
+        const name = named(node).find((c) => c.type === 'identifier')?.text ?? '';
+        const argsNode = named(node).find((c) => c.type === 'function_arguments');
+        const args = argsNode
+          ? named(argsNode)
+              .filter((c) => c.type === 'expression')
+              .map((c) => evalNode(c, scope, depth, struct + 1))
+          : [];
+        return callFunction(name, args, scope);
+      }
+      default:
+        return undefined;
+    }
+  } finally {
+    if (state) state.nest--;
   }
 }
 
@@ -626,31 +686,44 @@ function resolveVar(name: string, scope: EvalScope, depth: number): Value {
     // no instance passes the var → every instance uses the default
     if (entries.every((e) => !e.attr)) return varDefault(name, scope, depth);
     const spendsAtEntry = scope.state?.spends ?? 0;
-    const passed = entries.map(({ site, attr, label }) => {
-      const callerScope: EvalScope = { ...scope, moduleDir: site.callerDir };
-      const fromCall = attr ? evalText(attr.valueText, callerScope, depth + 1) : undefined;
-      return {
-        label,
-        // an instance that omits the var falls back to the module's own
-        // default, and so does one that passes `null`: Terraform treats an
-        // explicit null input as "not set" precisely so a caller can opt back
-        // into the default
-        value: attr && !isNull(fromCall) ? fromCall : varDefault(name, scope, depth),
-      };
-    });
-    // compared by a type-tagged spelling, not the rendered one: `["8080"]` and
+    // Stops at the first disagreement rather than evaluating every instance and
+    // comparing afterwards. Only agreement needs the whole list; divergence is
+    // settled by two sites, and `divergedAt` below is built from `entries`,
+    // which costs no evaluation. The old shape evaluated and type-rendered all
+    // of them regardless — for a module called from 100 stacks each passing a
+    // distinct 90k-char value, that alone was ~9MB of throwaway strings and the
+    // bulk of a 20s frozen hover, before the caller re-resolved per site on top.
+    //
+    // Compared by a type-tagged spelling, not the rendered one: `["8080"]` and
     // `[8080]` render identically, and calling those instances "agreeing" hands
     // back one instance's type for all of them — enough for the count→for_each
     // refactor to be offered on a module that is passed numbers, which for_each
-    // rejects
-    const rendered = passed.map((p) => renderTagged(p.value));
+    // rejects.
+    const passed: { label: string; value: Value }[] = [];
+    let first: string | undefined;
+    let diverges = false;
+    for (const { site, attr, label } of entries) {
+      const callerScope: EvalScope = { ...scope, moduleDir: site.callerDir };
+      const fromCall = attr ? evalText(attr.valueText, callerScope, depth + 1) : undefined;
+      // an instance that omits the var falls back to the module's own default,
+      // and so does one that passes `null`: Terraform treats an explicit null
+      // input as "not set" precisely so a caller can opt back into the default
+      const value = attr && !isNull(fromCall) ? fromCall : varDefault(name, scope, depth);
+      passed.push({ label, value });
+      const tagged = renderTagged(value);
+      if (first === undefined) first = tagged;
+      else if (tagged !== first) {
+        diverges = true;
+        break;
+      }
+    }
     // Sites share one EvalState, so a budget spent while evaluating an earlier
     // site would make later ones give up too — and several ⟨unknown⟩s compare
     // equal, which reads as agreement. Falling through to the divergence branch
     // makes the caller re-resolve each site under its own fresh budget, which
     // is the only way to find out what they actually pass.
     const spentComparing = (scope.state?.spends ?? 0) > spendsAtEntry;
-    if (!spentComparing && rendered.every((r) => r === rendered[0])) {
+    if (!spentComparing && !diverges) {
       // one site is a real chain hop; several agreeing sites are siblings —
       // group them instead of reading as a chain
       if (passed.length === 1 && passed[0]) scope.used?.calls.add(passed[0].label);
@@ -701,6 +774,7 @@ function withState(scope: EvalScope): EvalScope {
       inProgress: new Set(),
       elements: { left: MAX_VALUE_ELEMENTS },
       spends: 0,
+      nest: 0,
     },
   };
 }

@@ -235,3 +235,27 @@ describe('a v-prefixed version is still a version', () => {
     expect(parseConstraint('v')).toEqual([]);
   });
 });
+
+/** The lens is a suggestion the user clicks to rewrite their own file, so an
+ *  offer pointing *below* what they already require is worse than no lens. The
+ *  helper above cannot catch this: it returns early on an undefined `installed`,
+ *  where `versionLensProvider` passes it straight to `lensText`. */
+describe('never offers a downgrade', () => {
+  it('says nothing when the constraint floor is above everything published', () => {
+    expect(lensText('>= 6.0', undefined, '5.98.0')).toBeUndefined();
+    expect(lensText('6.0.0', undefined, '5.98.0')).toBeUndefined();
+    expect(lensText('~> 6.0', undefined, '5.98.0')).toBeUndefined();
+    expect(lensText('>= 6.0, < 7.0', undefined, '5.98.0')).toBeUndefined();
+  });
+
+  it('says nothing for a prerelease pin newer than any stable', () => {
+    // latestAdmitted skips every prerelease, so `installed` is always undefined
+    // for a pinned beta — which used to render the newest stable as "available"
+    expect(lensText('6.0.0-beta1', undefined, '5.98.1')).toBeUndefined();
+  });
+
+  it('still reports a genuinely unmatchable constraint below the newest', () => {
+    // a yanked pin: 6.0.0 really is an upgrade, the constraint just admits nothing
+    expect(lensText('= 5.5.0', undefined, '6.0.0')).toContain('no published release');
+  });
+});

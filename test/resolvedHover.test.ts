@@ -592,3 +592,46 @@ resource "aws_x" "y" {
     expect(md).toContain('- module "b" (main.tf): `[a, b]` —');
   });
 });
+
+/** MAX_VALUE_CHARS bounds one value; nothing bounded how many were built. Each
+ *  per-instance row is an independent full resolve with its own fresh budget,
+ *  and the row count is whatever the config supplies — the number of call
+ *  sites. A shared module called from many stacks froze the hover for seconds
+ *  and built megabytes of markdown, all on the synchronous hover path. */
+describe('a module called from many stacks cannot freeze the hover', () => {
+  it('bounds both the work and the markdown', async () => {
+    const idx = new WorkspaceIndex();
+    await idx.updateFile(
+      '/w/mod/main.tf',
+      'variable "env" {}\nlocals {\n  tagged = "${var.env}-app"\n}\n',
+    );
+    const sites = 100;
+    for (let i = 0; i < sites; i++) {
+      await idx.updateFile(
+        `/w/envs/e${i}/main.tf`,
+        `module "m${i}" {\n  source = "../../mod"\n  env    = "${`v${i}`.repeat(20_000)}"\n}\n`,
+      );
+    }
+    const file = idx.file('/w/mod/main.tf');
+    expect(file).toBeDefined();
+    const ref = file?.refs.find((r) => r.parts[0] === 'var');
+    expect(ref).toBeDefined();
+
+    const started = Date.now();
+    const md = computeHover(file!, ref!.span.start, {
+      index: idx,
+      tfvarsOf: () => new Map(),
+      copyCommand: 'x.copy',
+    });
+    const elapsed = Date.now() - started;
+
+    expect(md).toBeDefined();
+    // it must still tell the truth about the instances it did not read
+    expect(md).toContain('more instance');
+    expect(md!.length).toBeLessThan(60_000);
+    // on this fixture: comfortably under the bound as it stands, 6.9s with the
+    // divergence short-circuit removed. Loose enough not to flake on a slow
+    // runner, tight enough that either cap regressing trips it.
+    expect(elapsed).toBeLessThan(2_500);
+  }, 120_000);
+});

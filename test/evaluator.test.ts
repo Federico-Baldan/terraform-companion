@@ -408,3 +408,34 @@ describe('a very long reference chain', () => {
     expect(resolveRef(['local', 'c0'], { index, moduleDir: '/shallow' })).toBe('leaf');
   });
 });
+
+/** Structural recursion used to pass `depth` down unchanged, so MAX_DEPTH
+ *  bounded reference hops and nothing else: a nested collection literal
+ *  recursed until V8 threw RangeError, and provideHover does not catch it, so
+ *  one generated .tf took the hover down for the whole document. */
+describe('nesting cannot overflow the stack', () => {
+  it.each([50, 200, 600, 1500, 3000])('survives %i levels of nesting', (levels) => {
+    const expr = `${'['.repeat(levels)}"x"${']'.repeat(levels)}`;
+    expect(() => resolveExpr(expr, scope)).not.toThrow();
+  });
+
+  it('survives deep nesting reached through a reference', async () => {
+    const index = new WorkspaceIndex();
+    const deep = `${'['.repeat(400)}"x"${']'.repeat(400)}`;
+    await index.updateFile('/deep/l.tf', `locals {\n  a = ${deep}\n  b = local.a\n}\n`);
+    const s: EvalScope = { index, moduleDir: '/deep', tfvarsOf: tfvarsIn('/deep', {}) };
+    expect(() => resolveRef(['local', 'b'], s)).not.toThrow();
+  });
+
+  /** The cap must not clip shapes the current release resolves: a 26-level
+   *  concat ladder peaks at 84 live frames, a 250-hop chain at 1003. */
+  it('still resolves a long reference chain', async () => {
+    const index = new WorkspaceIndex();
+    const lines = ['locals {', '  c0 = "x"'];
+    for (let i = 1; i <= 250; i++) lines.push(`  c${i} = "\${local.c${i - 1}}"`);
+    lines.push('}');
+    await index.updateFile('/chain/l.tf', lines.join('\n'));
+    const s: EvalScope = { index, moduleDir: '/chain', tfvarsOf: tfvarsIn('/chain', {}) };
+    expect(resolveRef(['local', 'c250'], s)).toBe('x');
+  });
+});

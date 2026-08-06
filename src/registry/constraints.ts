@@ -144,9 +144,17 @@ export function lensText(
   const floor = semver.coerce(pivotClause(clauses)?.version ?? constraint);
   const top = semver.coerce(newest);
   if (!floor || !top) return undefined;
+  // Before anything else, and in particular before the "matches nothing" line
+  // below: the lens is a click-to-rewrite offer, so it must never point *under*
+  // what the file already requires. `installed` is undefined whenever the
+  // constraint admits nothing published — which includes every constraint
+  // written ahead of a release (`>= 6.0` while 5.98.0 is newest) and every
+  // prerelease pin, since `latestAdmitted` skips prereleases wholesale. Those
+  // used to render the newest *older* stable as "available", and clicking it
+  // rewrote `~> 6.0` down to `~> 5.98` — a silent major downgrade.
+  if (!semver.gt(top.version, floor.version)) return undefined;
   const got = installed === undefined ? undefined : semver.coerce(installed);
   if (!got) return `→ ${newest} available (your constraint matches no published release)`;
-  if (!semver.gt(top.version, floor.version)) return undefined;
   if (semver.eq(got.version, top.version)) {
     return `→ ${newest} is the newest (already allowed)`;
   }

@@ -1,6 +1,6 @@
 import type { Dirent } from 'node:fs';
-import { lstat, readdir, rm } from 'node:fs/promises';
-import { basename, join } from 'node:path';
+import { lstat, readdir, realpath, rm } from 'node:fs/promises';
+import { basename, isAbsolute, join, relative, sep } from 'node:path';
 
 export interface StaleCache {
   dir: string;
@@ -64,13 +64,28 @@ function staleCutoff(staleDays: number, now: number): number {
  *  whole directory used to reclaim them. */
 export const CACHE_SUBDIRS = ['providers', 'plugins', 'modules'] as const;
 
+/** Ceiling on the entries one cache's size walk will stat. A git-sourced module
+ *  checkout is a full clone, so `.terraform/modules` routinely holds several
+ *  `.git` trees with 100k+ loose objects between them — each one an awaited
+ *  lstat on the extension host's libuv threadpool, which is shared with every
+ *  other extension in the process. The whole total exists only to render a size
+ *  in a notification, so it is not worth an unbounded walk: past the budget the
+ *  figure is an undercount, which `formatSize` already tolerates. */
+const MAX_SIZE_ENTRIES = 50_000;
+
 /** Bounded and cancellable: this recurses into a module checkout, which for a
- *  git-sourced module is a full clone (its .git and every loose object with it),
- *  and the total exists only to render a size in a notification. Without the
- *  depth cap a pathological tree raises RangeError, which aborts the whole
- *  folder's scan up in the provider. */
-async function dirSize(dir: string, depth = 0, cancelled?: () => boolean): Promise<number> {
-  if (depth > MAX_DEPTH || cancelled?.()) return 0;
+ *  git-sourced module is a full clone, and the total exists only to render a
+ *  size in a notification. Without the depth cap a pathological tree raises
+ *  RangeError, which aborts the whole folder's scan up in the provider. */
+async function dirSize(
+  dir: string,
+  depth = 0,
+  cancelled?: () => boolean,
+  /** Shared across the subdirectories of one cache, so a huge `modules` cannot
+   *  starve `providers` of its own budget — the total is what is capped. */
+  budget: { left: number } = { left: MAX_SIZE_ENTRIES },
+): Promise<number> {
+  if (depth > MAX_DEPTH || budget.left <= 0 || cancelled?.()) return 0;
   let total = 0;
   let entries: Dirent[];
   try {
@@ -79,14 +94,22 @@ async function dirSize(dir: string, depth = 0, cancelled?: () => boolean): Promi
     return 0;
   }
   for (const de of entries) {
-    if (cancelled?.()) return total;
+    if (cancelled?.() || budget.left <= 0) return total;
     const p = join(dir, de.name);
     try {
       // Dirent carries the type, so directories cost no stat; a file still does,
       // since only stat knows its size. isDirectory() is false for a
       // symlink-to-directory exactly as lstat's was, so links stay uncounted
       // and unfollowed.
-      total += de.isDirectory() ? await dirSize(p, depth + 1, cancelled) : (await lstat(p)).size;
+      if (de.isDirectory()) {
+        // the walk that finds caches skips these; the walk that sizes one did
+        // not, so a module checkout's own .git was stat'd object by object
+        if (SKIP.has(de.name)) continue;
+        total += await dirSize(p, depth + 1, cancelled, budget);
+      } else {
+        budget.left--;
+        total += (await lstat(p)).size;
+      }
     } catch {
       // ignore unreadable entries
     }
@@ -103,11 +126,12 @@ async function dirSize(dir: string, depth = 0, cancelled?: () => boolean): Promi
  *  were not. It also dragged an unrelated tree into the scan's I/O. */
 async function cacheSize(tfDir: string, cancelled?: () => boolean): Promise<number> {
   let total = 0;
+  const budget = { left: MAX_SIZE_ENTRIES };
   for (const sub of CACHE_SUBDIRS) {
     const p = join(tfDir, sub);
     try {
       const st = await lstat(p);
-      total += st.isDirectory() ? await dirSize(p, 0, cancelled) : st.size;
+      total += st.isDirectory() ? await dirSize(p, 0, cancelled, budget) : st.size;
     } catch {
       // absent or unreadable — nothing to count
     }
@@ -291,29 +315,138 @@ export function isTerraformCacheDir(dir: string): boolean {
   return basename(dir) === '.terraform';
 }
 
+/** Whether `child` is `parent` or sits underneath it. Both sides must already be
+ *  symlink-resolved — this is a string containment test, so a link or a `..` in
+ *  either path makes the answer meaningless. */
+function isInside(parent: string, child: string): boolean {
+  const rel = relative(parent, child);
+  return rel === '' || (!rel.startsWith(`..${sep}`) && rel !== '..' && !isAbsolute(rel));
+}
+
+/** Terraform's platform directories under the pre-0.14 `.terraform/plugins`. */
+const LEGACY_PLATFORM_DIR =
+  /^(?:darwin|freebsd|linux|openbsd|solaris|windows)_(?:386|amd64|arm|arm64)$/;
+
+/** Terraform 0.12 and earlier documented `.terraform/plugins/<os>_<arch>/` as a
+ *  plugin *search path*: an in-house provider with no registry source address
+ *  was installed by dropping its binary there by hand, and no `terraform init`
+ *  can bring that back — the repo it was built from may not even exist any more.
+ *  Those are also exactly the caches old enough to trip a 30-day threshold, so
+ *  the feature aims straight at them.
+ *
+ *  Terraform writes `lock.json` beside the plugins it installed itself, so its
+ *  presence is what separates a cache it can rebuild from a hand-built install
+ *  it cannot. Absent, we leave the platform directory alone and reclaim nothing:
+ *  a few hundred MB of disk is worth less than one irreplaceable binary. The
+ *  0.13 nested layout (`plugins/<host>/<ns>/<name>/...`) is unambiguously
+ *  registry-managed and stays fully reclaimable. */
+async function reclaimablePluginEntries(pluginsDir: string): Promise<string[]> {
+  let entries: Dirent[];
+  try {
+    entries = await readdir(pluginsDir, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+  const out: string[] = [];
+  for (const de of entries) {
+    if (de.isDirectory() && LEGACY_PLATFORM_DIR.test(de.name)) {
+      try {
+        await lstat(join(pluginsDir, de.name, 'lock.json'));
+      } catch {
+        continue; // no lock.json: assume hand-placed, keep it
+      }
+    }
+    out.push(de.name);
+  }
+  return out;
+}
+
+/** What `deleteCachePayload` did. A bare `void` made a refusal — including the
+ *  symlink guard firing, the one case the guard exists for — indistinguishable
+ *  from success at the call site, which then counted the bytes as freed and
+ *  logged a clean. */
+export type CleanResult = { ok: true } | { ok: false; reason: string };
+
 /** Remove the reclaimable parts of a cache, leaving `.terraform` itself and the
  *  metadata beside it in place. Deleting the directory wholesale also took
  *  `environment` and `terraform.tfstate` with it, which silently reset the
  *  user's selected workspace and lost a `-backend-config` module's settings —
- *  for no space, since the bytes are all in the two subdirectories below.
+ *  for no space, since the bytes are all in the subdirectories below.
  *
- *  Refuses anything not named `.terraform`, and anything that is not a real
- *  directory. That second guard is load-bearing: deleting `.terraform` itself
- *  only ever unlinked a symlink, but descending to `.terraform/providers`
- *  resolves *through* the link, so a linked cache would have had the real
- *  directory on the other side emptied — outside the workspace. A name check
- *  alone cannot establish that, since the name is all a symlink shares. */
-export async function deleteCachePayload(tfDir: string): Promise<void> {
-  if (!isTerraformCacheDir(tfDir)) return;
+ *  Every path is resolved and proven to land inside `workspaceRoot` first.
+ *  `rm` resolves symlinks in *parent* components (verified: an `rm` of
+ *  `<root>/mod/.terraform/providers` with `.terraform` a link deletes the
+ *  target's `providers` outside the tree), so the name check and the `lstat`
+ *  alone left a window — anything replacing `.terraform` with a symlink between
+ *  the two, a `direnv` hook or a `make init` doing `rm -rf .terraform && ln -s`,
+ *  redirected a recursive delete out of the workspace. Resolving first collapses
+ *  that window and makes the escape unrepresentable rather than merely unlikely. */
+export async function deleteCachePayload(
+  tfDir: string,
+  workspaceRoot: string,
+): Promise<CleanResult> {
+  if (!isAbsolute(tfDir) || !isTerraformCacheDir(tfDir)) {
+    return { ok: false, reason: 'not an absolute .terraform path' };
+  }
   try {
-    if (!(await lstat(tfDir)).isDirectory()) return;
+    // a symlinked .terraform reclaims nothing (rm unlinks the link) while
+    // pointing the delete somewhere else entirely, so it is refused outright
+    if (!(await lstat(tfDir)).isDirectory()) {
+      return { ok: false, reason: 'not a real directory' };
+    }
   } catch {
-    return; // gone between the scan and here
+    return { ok: false, reason: 'gone between the scan and the delete' };
   }
+
+  let realDir: string;
+  let realRoot: string;
+  try {
+    realDir = await realpath(tfDir);
+    realRoot = await realpath(workspaceRoot);
+  } catch {
+    return { ok: false, reason: 'gone between the scan and the delete' };
+  }
+  if (!isTerraformCacheDir(realDir)) {
+    return { ok: false, reason: `resolves to ${realDir}, which is not a .terraform dir` };
+  }
+  if (!isInside(realRoot, realDir)) {
+    return { ok: false, reason: `resolves to ${realDir}, outside the workspace` };
+  }
+
+  const failures: string[] = [];
   for (const sub of CACHE_SUBDIRS) {
-    // force: a cache with only some of the subdirectories is normal. A symlink
-    // *inside* a real .terraform is unlinked by rm, not followed, so it needs
-    // no guard of its own.
-    await rm(join(tfDir, sub), { recursive: true, force: true });
+    const target = join(realDir, sub);
+    let st: Awaited<ReturnType<typeof lstat>>;
+    try {
+      st = await lstat(target);
+    } catch {
+      continue; // a cache with only some of the subdirectories is normal
+    }
+    // rm unlinks a symlinked subdir rather than following it, so it reclaims
+    // nothing and only discards a deliberate shared-mirror setup, which
+    // terraform init then replaces with a fresh full download. cacheSize and
+    // hasCachePayload already skip these for the same reason.
+    if (!st.isDirectory()) continue;
+
+    const names =
+      sub === 'plugins' ? await reclaimablePluginEntries(target) : [null as string | null];
+    for (const name of names) {
+      const victim = name === null ? target : join(target, name);
+      try {
+        // maxRetries defaults to 0, so the single most common cause of a failed
+        // rm -rf — antivirus or the search indexer briefly holding a provider
+        // .exe open on Windows — aborted the clean outright. Each subdir is
+        // caught on its own too: an unwritable `providers` used to throw
+        // straight out of the loop, so `modules` was never even attempted and
+        // the half-deleted provider tree left `terraform init` failing with
+        // "could not find executable file" instead of re-downloading.
+        await rm(victim, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+      } catch (e) {
+        failures.push(`${name === null ? sub : `${sub}/${name}`}: ${e}`);
+      }
+    }
   }
+  return failures.length === 0
+    ? { ok: true }
+    : { ok: false, reason: `partially cleaned — ${failures.join('; ')}` };
 }

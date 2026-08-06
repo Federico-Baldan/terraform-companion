@@ -262,3 +262,27 @@ describe('declarations are top-level only', () => {
     expect(idx.localsOf('/n2').map((l) => l.name)).toEqual(['x']);
   });
 });
+
+/** The announce a re-index triggers re-lints the whole module directory and
+ *  refreshes the CodeLens (which re-parses the document with no memo), so the
+ *  sync layer needs to know when nothing actually changed. Identical bytes
+ *  arrive constantly: opening a file, saving one the buffer debounce already
+ *  parsed, or typing a character and deleting it. */
+describe('updateFile reports whether the index really changed', () => {
+  it('is false for identical bytes and true for a real edit', async () => {
+    const index = new WorkspaceIndex();
+    const src = 'locals {\n  a = 1\n}\n';
+    expect(await index.updateFile('/r/main.tf', src)).toBe(true);
+    expect(await index.updateFile('/r/main.tf', src)).toBe(false);
+    expect(await index.updateFile('/r/main.tf', 'locals {\n  a = 2\n}\n')).toBe(true);
+  });
+
+  it('does not bump the generation when nothing changed', async () => {
+    const index = new WorkspaceIndex();
+    const src = 'locals {\n  a = 1\n}\n';
+    await index.updateFile('/g/main.tf', src);
+    const gen = index.generation();
+    expect(await index.updateFile('/g/main.tf', src)).toBe(false);
+    expect(index.generation()).toBe(gen);
+  });
+});

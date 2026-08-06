@@ -4,6 +4,12 @@ import type { WorkspaceIndex } from '../core/workspaceIndex';
 
 /** Locals never referenced as local.<name> in any .tf file of their module. */
 export function detectUnusedLocals(index: WorkspaceIndex, moduleDir: string): LintFinding[] {
+  // This rule reads an absent reference as proof of disuse, and a file that
+  // needed error recovery reports fewer references than its text holds — so
+  // while any sibling is mid-edit, every local it alone uses reads as unused.
+  // Saying nothing until the module parses beats a warning that is wrong for as
+  // long as the user keeps typing.
+  if (index.moduleHasParseError(moduleDir)) return [];
   const findings: LintFinding[] = [];
   for (const def of index.localsOf(moduleDir)) {
     const uses = index.refsTo(['local', def.name]).filter(

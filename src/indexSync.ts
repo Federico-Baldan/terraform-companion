@@ -1,7 +1,7 @@
 import * as vscode from 'vscode';
 import { TrackedDirs } from './core/trackedDirs';
 import { normalizePath, type WorkspaceIndex } from './core/workspaceIndex';
-import { isExcludedTfPath, isTfPath, TF_GLOB } from './vscodeUtils';
+import { isExcludedTfPath, isTfPath, TF_EXCLUDE, TF_GLOB } from './vscodeUtils';
 
 const DEBOUNCE_MS = 500;
 /** How long a burst of index changes is allowed to gather before consumers are
@@ -86,23 +86,38 @@ export function registerIndexSync(
         // without a depth bound, so deeply nested HCL — a half-typed file with
         // runaway brackets is enough — raises RangeError, and it would do so on
         // every keystroke while the file stayed open.
+        let changed: boolean;
         try {
-          await index.updateFile(path, doc.getText());
+          changed = await index.updateFile(path, doc.getText());
         } catch (e) {
           log?.(`Not indexed (parse failed): ${path}: ${e}`);
           return;
         }
-        announce([path]);
+        // Identical bytes are the common case here, not the exception: opening
+        // a file, and typing a character then deleting it, both land on text the
+        // index already holds. Announcing anyway re-lints every file in the
+        // module directory and refreshes the CodeLens, which re-parses the whole
+        // document with no memo — a full round of work to reproduce output that
+        // cannot have changed.
+        if (changed) announce([path]);
       }, DEBOUNCE_MS),
     );
   };
 
   /** Re-read a created/changed file from disk. Guards: the exclusion filter, an
    *  open dirty buffer (newer than disk, and the editor path owns it), and a
-   *  file gone between the event and the read. */
-  const refreshFromDisk = async (uri: vscode.Uri) => {
+   *  file gone between the event and the read.
+   *
+   *  `ignoreDirtyOf` is the document being disposed on a close: it can still be
+   *  listed in `textDocuments`, and letting its own dirty state veto the read is
+   *  exactly backwards — its text is the text being discarded. */
+  const refreshFromDisk = async (uri: vscode.Uri, ignoreDirtyOf?: vscode.TextDocument) => {
     if (isExcludedTfPath(uri.fsPath)) return;
-    if (vscode.workspace.textDocuments.some((d) => d.isDirty && d.uri.fsPath === uri.fsPath)) {
+    if (
+      vscode.workspace.textDocuments.some(
+        (d) => d !== ignoreDirtyOf && d.isDirty && d.uri.fsPath === uri.fsPath,
+      )
+    ) {
       return;
     }
     tracked.add(uri.fsPath);
@@ -112,13 +127,68 @@ export function registerIndexSync(
       // A delete can land mid-read: the bytes still arrive, and writing them
       // would put the file back into the index after removeFile took it out.
       if (epoch.get(uri.fsPath) !== token) return;
-      await index.updateFile(uri.fsPath, text);
-      announce([uri.fsPath]);
+      // a save makes this re-read what the 500ms buffer debounce already
+      // parsed, so without the guard every save costs two full refresh rounds
+      if (await index.updateFile(uri.fsPath, text)) announce([uri.fsPath]);
     } catch (e) {
       // unreadable or deleted right after the event — but a parse failure lands
       // here too, and reading that as a missing file hid it completely
       log?.(`Not indexed (unreadable, deleted, or parse failed): ${uri.fsPath}: ${e}`);
     }
+  };
+
+  /** Forget everything under a directory: armed timers, in-flight reads, and
+   *  indexed files. Shared by the folder-delete watcher and workspace-folder
+   *  removal, which differ only in how they learn the directory is gone — the
+   *  sweeps themselves have to be identical, since either one leaving a timer
+   *  armed puts a file straight back into the index after it was retracted. */
+  const dropUnder = (dirPath: string): void => {
+    const prefix = `${normalizePath(dirPath)}/`;
+    for (const [key, timer] of timers) {
+      if (normalizePath(key).startsWith(prefix)) {
+        clearTimeout(timer);
+        timers.delete(key);
+      }
+    }
+    for (const key of [...epoch.keys()]) {
+      if (normalizePath(key).startsWith(prefix)) supersede(key);
+    }
+    const gone = index.pathsUnder(dirPath);
+    if (gone.length === 0) return;
+    for (const p of gone) index.removeFile(p);
+    // routed through the same announce as every other retraction, so the lint
+    // pipeline drops their diagnostics instead of leaving them in the Problems
+    // panel for files that are no longer part of the workspace
+    announce(gone);
+  };
+
+  /** Index the .tf files a newly added workspace folder already contains. */
+  const indexFolder = async (folder: vscode.WorkspaceFolder): Promise<void> => {
+    let uris: vscode.Uri[];
+    try {
+      uris = await vscode.workspace.findFiles(
+        new vscode.RelativePattern(folder, TF_GLOB),
+        TF_EXCLUDE,
+      );
+    } catch (e) {
+      log?.(`Not indexed (scan failed): ${folder.uri.fsPath}: ${e}`);
+      return;
+    }
+    const added: string[] = [];
+    for (const uri of uris) {
+      if (isExcludedTfPath(uri.fsPath)) continue;
+      tracked.add(uri.fsPath);
+      const token = supersede(uri.fsPath);
+      try {
+        const text = new TextDecoder().decode(await vscode.workspace.fs.readFile(uri));
+        // the folder can be removed again while this scan is still running
+        if (epoch.get(uri.fsPath) !== token) continue;
+        if (await index.updateFile(uri.fsPath, text)) added.push(uri.fsPath);
+      } catch (e) {
+        log?.(`Not indexed (unreadable or parse failed): ${uri.fsPath}: ${e}`);
+      }
+    }
+    if (added.length > 0) announce(added);
   };
 
   const watcher = vscode.workspace.createFileSystemWatcher(TF_GLOB);
@@ -140,22 +210,9 @@ export function registerIndexSync(
       // nothing indexed, so the three sweeps found nothing and cost seconds of
       // blocked extension host per operation. This is the O(1) way to ask.
       if (!tracked.mayContain(uri.fsPath)) return;
-      const prefix = `${normalizePath(uri.fsPath)}/`;
-      // Both must run even when nothing under the folder is indexed yet: an
-      // armed timer or an in-flight read would put a file back after the removal.
-      for (const [key, timer] of timers) {
-        if (normalizePath(key).startsWith(prefix)) {
-          clearTimeout(timer);
-          timers.delete(key);
-        }
-      }
-      for (const key of [...epoch.keys()]) {
-        if (normalizePath(key).startsWith(prefix)) supersede(key);
-      }
-      const gone = index.pathsUnder(uri.fsPath);
-      if (gone.length === 0) return;
-      for (const p of gone) index.removeFile(p);
-      announce(gone);
+      // The sweeps must run even when nothing under the folder is indexed yet:
+      // an armed timer or an in-flight read would put a file back after removal.
+      dropUnder(uri.fsPath);
     }),
   );
   context.subscriptions.push(
@@ -170,8 +227,57 @@ export function registerIndexSync(
         pendingChanged.clear();
       },
     },
-    vscode.workspace.onDidChangeTextDocument((e) => scheduleRefresh(e.document)),
+    // VS Code fires this with an empty change list for metadata-only events —
+    // a dirty-state transition, an EOL/encoding/language-id change. The text is
+    // identical by definition, so scheduling would only re-arm the debounce
+    // (delaying a genuine pending edit) to end in a no-op re-index.
+    vscode.workspace.onDidChangeTextDocument((e) => {
+      if (e.contentChanges.length === 0) return;
+      scheduleRefresh(e.document);
+    }),
     vscode.workspace.onDidOpenTextDocument((d) => scheduleRefresh(d)),
+    // The debounce above pushes *dirty* buffer text into the index, so closing a
+    // file without saving leaves the index — and every diagnostic, hover and
+    // refactor-safety answer derived from it — on text that exists nowhere. The
+    // file on disk never changed, so no watcher event ever corrects it and it
+    // stays wrong for the rest of the session.
+    //
+    // Re-read unconditionally rather than only when the buffer was dirty: the
+    // document is being disposed here, so its own `isDirty` is not something to
+    // rely on, and a close is a rare user action whose read costs one `false`
+    // from `updateFile` when the text already matched. Per the API docs this
+    // also fires on a language-id change, where the document is not really
+    // closing — reverting to disk is still correct there, and the matching open
+    // event re-indexes the buffer.
+    vscode.workspace.onDidCloseTextDocument((doc) => {
+      if (doc.uri.scheme !== 'file') return;
+      const path = doc.uri.fsPath;
+      if (!isTfPath(path) || isExcludedTfPath(path)) return;
+      if (!vscode.workspace.getWorkspaceFolder(doc.uri)) return;
+      // an armed timer still holds the text that is being discarded
+      const pending = timers.get(path);
+      if (pending) {
+        clearTimeout(pending);
+        timers.delete(path);
+      }
+      void refreshFromDisk(doc.uri, doc);
+    }),
+    // Removing a folder from a multi-root workspace fires no filesystem event —
+    // the files are still on disk — so nothing else ever retracted them. The
+    // index kept every ParsedFile (its full source text with it), the Problems
+    // panel kept diagnostics for files no longer in the workspace, and the next
+    // settings change re-published them. Adding a folder is the mirror image:
+    // the watchers cover it, but no create event fires for files already there,
+    // so they stayed unindexed until opened one at a time — which silently
+    // skews unused-local lints and module-call resolution in the meantime.
+    //
+    // Only the multi-root case needs handling: per the API docs this event does
+    // not fire when the *first* folder is added or removed, because the
+    // extension host is restarted instead.
+    vscode.workspace.onDidChangeWorkspaceFolders((e) => {
+      for (const folder of e.removed) dropUnder(folder.uri.fsPath);
+      for (const folder of e.added) void indexFolder(folder);
+    }),
     watcher,
     watcher.onDidCreate((uri) => void refreshFromDisk(uri)),
     // git pull, terraform fmt in a terminal, codegen: none of these pass through

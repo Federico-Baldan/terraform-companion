@@ -171,6 +171,14 @@ function referencedOutsideBlock(
   }
   if (!index) return false;
   const moduleDir = index.moduleDirOf(file.path);
+  // Scanning ahead can only withhold the fix, not wrongly offer it — and a
+  // sibling that does not currently parse makes "nothing references this"
+  // unknowable rather than false. Without this, an unterminated string in
+  // `outputs.tf` (open, mid-edit, never saved) erases its `aws_instance.srv[0]`
+  // reference from the index, the rewrite is offered and taken, and the moment
+  // the typo is fixed the config breaks with "Invalid index" in a different
+  // file, well past the undo horizon.
+  if (index.moduleHasParseError(moduleDir)) return true;
   // Ask for the two-part address and narrow here. `refsTo` only uses its
   // precomputed bucket when given exactly two parts, and a data source's
   // address is three (`data.type.name`) — so this fell through to a scan of

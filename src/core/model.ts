@@ -29,6 +29,11 @@ export interface ParsedFile {
   source: string;
   blocks: TfBlock[];
   refs: TfRef[];
+  /** tree-sitter had to error-recover, so `refs` is a floor rather than the
+   *  whole truth — a half-typed file parses to *fewer* references than it
+   *  really has. Anything treating an absent reference as permission (the
+   *  count→for_each rewrite, the unused-local lint) must consult this first. */
+  hasError: boolean;
   /** materialised on first read, then cached — see `parseFile` */
   lines: string[];
 }

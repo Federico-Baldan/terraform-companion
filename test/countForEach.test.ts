@@ -782,3 +782,53 @@ describe('a comment does not hide the element access behind it', () => {
     expect(patterns[0]!.safeToRefactor).toBe(true);
   });
 });
+
+/** The rewrite is destructive and its only cross-file guard is "does anything
+ *  else reference this resource". A sibling that does not currently parse
+ *  answers "no" — tree-sitter recovers by dropping what it could not read — so
+ *  a half-typed outputs.tf silently authorised a rewrite that breaks the config
+ *  as soon as the typo is fixed, in a different file, past the undo horizon. */
+describe('a sibling that does not parse cannot unlock the rewrite', () => {
+  const main = `resource "aws_instance" "web" {
+  count = length(var.names)
+  name  = var.names[count.index]
+}
+`;
+
+  async function build(files: Record<string, string>) {
+    return WorkspaceIndex.build({
+      listFiles: async () => Object.keys(files),
+      readFile: async (p) => files[p] ?? '',
+    });
+  }
+
+  it('withholds while a sibling is mid-edit, and offers again once it parses', async () => {
+    // the reference is really there, but the unterminated string above it means
+    // tree-sitter never reports it
+    const broken = await build({
+      '/b/main.tf': main,
+      '/b/outputs.tf':
+        'output "a" {\n  value = "oops\n}\noutput "ids" {\n  value = aws_instance.web[0].id\n}\n',
+    });
+    expect(broken.file('/b/outputs.tf')?.hasError).toBe(true);
+    expect(broken.refsTo(['aws_instance', 'web'])).toHaveLength(0);
+    expect(detectCountLength(broken.file('/b/main.tf')!, broken)[0]!.safeToRefactor).toBe(false);
+
+    // the same sibling, typo fixed: the reference is visible and it stays unsafe
+    const fixed = await build({
+      '/b/main.tf': main,
+      '/b/outputs.tf': 'output "ids" {\n  value = aws_instance.web[0].id\n}\n',
+    });
+    expect(fixed.file('/b/outputs.tf')?.hasError).toBe(false);
+    expect(detectCountLength(fixed.file('/b/main.tf')!, fixed)[0]!.safeToRefactor).toBe(false);
+  });
+
+  it('still offers the fix when every file in the module parses', async () => {
+    const clean = await build({
+      '/c/main.tf': main,
+      '/c/outputs.tf': 'output "unrelated" {\n  value = "x"\n}\n',
+    });
+    expect(clean.file('/c/main.tf')?.hasError).toBe(false);
+    expect(detectCountLength(clean.file('/c/main.tf')!, clean)[0]!.safeToRefactor).toBe(true);
+  });
+});

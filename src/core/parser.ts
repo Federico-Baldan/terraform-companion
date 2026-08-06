@@ -234,6 +234,12 @@ export function parseFile(path: string, source: string): ParsedFile {
   const tree = parser.parse(source);
   const blocks: TfBlock[] = [];
   const refs: TfRef[] = [];
+  // Whether tree-sitter had to recover. `collectRefs` can only report what it
+  // managed to parse, so a file mid-edit yields *fewer* refs than the text
+  // really contains — and "no references" is exactly what unlocks the
+  // destructive count→for_each rewrite. Recorded so a caller can tell "nothing
+  // references this" from "I could not read what references this".
+  let hasError = true;
   if (tree) {
     // same finally as withExpressionNode: the walks below are the only thing
     // between allocation and delete, and a throw there would strand the tree
@@ -263,6 +269,7 @@ export function parseFile(path: string, source: string): ParsedFile {
         }
       }
       collectRefs(tree.rootNode, refs);
+      hasError = tree.rootNode.hasError;
     } finally {
       tree.delete();
     }
@@ -278,6 +285,7 @@ export function parseFile(path: string, source: string): ParsedFile {
     source,
     blocks,
     refs,
+    hasError,
     get lines(): string[] {
       lines ??= source.split(/\r?\n/);
       return lines;

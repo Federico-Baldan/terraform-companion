@@ -97,7 +97,20 @@ export class ExternalTfvars {
       this.watch(path);
       return undefined;
     }
-    const parsed = parseFile(normalizePath(path), text);
+    let parsed: ParsedFile;
+    try {
+      // inside the try, and remembered on failure, for the same reason the read
+      // above is: `parseFile` throws — RangeError on a deeply nested literal,
+      // and outright if the parser is not initialised — and a throw here used to
+      // escape before either cache was written. Every later hover then re-read
+      // the whole file from disk, synchronously, and threw again: a permanently
+      // dead hover on top of exactly the syscall storm `missing` exists to stop.
+      parsed = parseFile(normalizePath(path), text);
+    } catch {
+      this.missing.set(path, Date.now());
+      this.watch(path);
+      return undefined;
+    }
     this.cache.set(path, parsed);
     // it was remembered as missing and is readable again: same staleness
     // problem as in has()

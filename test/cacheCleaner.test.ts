@@ -1,4 +1,5 @@
 import {
+  chmodSync,
   existsSync,
   lutimesSync,
   mkdirSync,
@@ -221,7 +222,7 @@ describe('cache cleaner', () => {
     writeFileSync(join(cache, 'environment'), 'prod');
     writeFileSync(join(cache, 'terraform.tfstate'), '{"backend":{}}');
 
-    await deleteCachePayload(cache);
+    expect(await deleteCachePayload(cache, root)).toEqual({ ok: true });
 
     expect(existsSync(join(cache, 'providers'))).toBe(false);
     expect(existsSync(join(cache, 'modules'))).toBe(false);
@@ -238,9 +239,54 @@ describe('cache cleaner', () => {
     mkdirSync(mod, { recursive: true });
     symlinkSync(target, join(mod, '.terraform'));
 
-    await deleteCachePayload(join(mod, '.terraform'));
+    const result = await deleteCachePayload(join(mod, '.terraform'), root);
 
+    expect(result.ok).toBe(false);
     expect(existsSync(join(target, 'providers', 'bin'))).toBe(true);
+  });
+
+  /** `rm` resolves symlinks in *parent* components — only the final one is
+   *  lstat-protected — so the name check plus an `lstat` left a window: anything
+   *  swapping `.terraform` for a symlink between the two (a direnv hook, a
+   *  `make init` doing `rm -rf .terraform && ln -s`) redirected the recursive
+   *  delete out of the workspace entirely. */
+  it('refuses a .terraform that resolves outside the workspace root', async () => {
+    const target = makeModule(outside, 'linked', 60, 60);
+    const mod = join(root, 'mod');
+    mkdirSync(mod, { recursive: true });
+    symlinkSync(target, join(mod, '.terraform'));
+
+    const result = await deleteCachePayload(join(mod, '.terraform'), root);
+
+    expect(result).toEqual({
+      ok: false,
+      reason: expect.stringContaining('not a real directory'),
+    });
+    expect(existsSync(join(target, 'providers', 'bin'))).toBe(true);
+  });
+
+  /** The containment proof must survive the guard passing: a real .terraform at
+   *  scan time whose *parent* is a link out of the tree still has to be caught,
+   *  since that is what `rm` would follow. */
+  it('refuses when a parent component links outside the workspace', async () => {
+    const realMod = join(outside, 'real');
+    const cache = join(realMod, '.terraform');
+    mkdirSync(join(cache, 'providers'), { recursive: true });
+    writeFileSync(join(cache, 'providers', 'bin'), 'precious');
+    // root/link -> outside/real, so root/link/.terraform is a genuine directory
+    symlinkSync(realMod, join(root, 'link'));
+
+    const result = await deleteCachePayload(join(root, 'link', '.terraform'), root);
+
+    expect(result.ok).toBe(false);
+    expect(existsSync(join(cache, 'providers', 'bin'))).toBe(true);
+  });
+
+  it('reports a refusal rather than looking like a successful clean', async () => {
+    const victim = join(root, 'notacache');
+    mkdirSync(victim, { recursive: true });
+    const result = await deleteCachePayload(victim, root);
+    expect(result).toEqual({ ok: false, reason: expect.stringContaining('.terraform') });
   });
 
   it('does not count a symlinked payload it will not actually delete', async () => {
@@ -271,6 +317,8 @@ describe('cache cleaner', () => {
     const cache = join(mod, '.terraform');
     mkdirSync(join(cache, 'plugins', 'linux_amd64'), { recursive: true });
     writeFileSync(join(cache, 'plugins', 'linux_amd64', 'bin'), 'x'.repeat(4096));
+    // terraform writes this beside the plugins it installed itself
+    writeFileSync(join(cache, 'plugins', 'linux_amd64', 'lock.json'), '{}');
     writeFileSync(join(mod, 'main.tf'), 'x = 1');
     for (const p of [
       join(cache, 'plugins', 'linux_amd64', 'bin'),
@@ -284,8 +332,40 @@ describe('cache cleaner', () => {
     const [found] = await findStaleTerraformDirs(root, 30, NOW);
     expect(found?.dir).toBe(cache);
 
-    await deleteCachePayload(cache);
-    expect(existsSync(join(cache, 'plugins'))).toBe(false);
+    expect(await deleteCachePayload(cache, root)).toEqual({ ok: true });
+    expect(existsSync(join(cache, 'plugins', 'linux_amd64'))).toBe(false);
+  });
+
+  /** Terraform 0.12 documented .terraform/plugins/<os>_<arch>/ as a plugin
+   *  *search path*: an in-house provider with no registry source address was
+   *  installed by dropping the binary there by hand. No terraform init brings
+   *  that back, and those are exactly the caches old enough to trip the
+   *  threshold. Absent terraform's own lock.json, the directory is left alone. */
+  it('keeps a hand-installed plugin binary that terraform init cannot refetch', async () => {
+    const mod = join(root, 'inhouse');
+    const cache = join(mod, '.terraform');
+    const platform = join(cache, 'plugins', 'linux_amd64');
+    mkdirSync(platform, { recursive: true });
+    writeFileSync(join(platform, 'terraform-provider-acme_v0.4.2'), 'ELF');
+    mkdirSync(join(cache, 'providers'), { recursive: true });
+    writeFileSync(join(cache, 'providers', 'bin'), 'refetchable');
+
+    expect(await deleteCachePayload(cache, root)).toEqual({ ok: true });
+
+    expect(existsSync(join(platform, 'terraform-provider-acme_v0.4.2'))).toBe(true);
+    // the registry-managed half is still reclaimed
+    expect(existsSync(join(cache, 'providers'))).toBe(false);
+  });
+
+  /** The 0.13 nested layout is unambiguously registry-managed. */
+  it('reclaims the nested registry plugins layout without a lock.json', async () => {
+    const cache = join(root, 'nested', '.terraform');
+    const nested = join(cache, 'plugins', 'registry.terraform.io', 'hashicorp', 'aws');
+    mkdirSync(nested, { recursive: true });
+    writeFileSync(join(nested, 'bin'), 'x');
+
+    expect(await deleteCachePayload(cache, root)).toEqual({ ok: true });
+    expect(existsSync(join(cache, 'plugins', 'registry.terraform.io'))).toBe(false);
   });
 
   /** The size total is display-only and deliberately bounded, so it must not be
@@ -309,8 +389,32 @@ describe('cache cleaner', () => {
     const victim = join(root, 'important');
     mkdirSync(join(victim, 'providers'), { recursive: true });
     writeFileSync(join(victim, 'providers', 'keep'), 'x');
-    await deleteCachePayload(victim);
+    expect((await deleteCachePayload(victim, root)).ok).toBe(false);
     expect(existsSync(join(victim, 'providers', 'keep'))).toBe(true);
+  });
+
+  /** An unwritable subdir used to throw straight out of the delete loop, so
+   *  `modules` was never attempted and the half-deleted provider tree left
+   *  terraform init failing with "could not find executable file" instead of
+   *  simply re-downloading. */
+  it('still cleans the remaining subdirs when one of them fails', async () => {
+    const cache = join(root, 'partial', '.terraform');
+    mkdirSync(join(cache, 'providers', 'locked', 'inner'), { recursive: true });
+    writeFileSync(join(cache, 'providers', 'locked', 'inner', 'bin'), 'x');
+    mkdirSync(join(cache, 'modules'), { recursive: true });
+    writeFileSync(join(cache, 'modules', 'mod.json'), '{}');
+    chmodSync(join(cache, 'providers', 'locked'), 0o500);
+
+    try {
+      const result = await deleteCachePayload(cache, root);
+      expect(result.ok).toBe(false);
+      // the failure is named rather than swallowed
+      expect(result.ok === false && result.reason).toContain('providers');
+      // and the subdir after the failure was still attempted
+      expect(existsSync(join(cache, 'modules'))).toBe(false);
+    } finally {
+      chmodSync(join(cache, 'providers', 'locked'), 0o700);
+    }
   });
 
   /** The deletion leaves .terraform standing, so a cache with nothing left to

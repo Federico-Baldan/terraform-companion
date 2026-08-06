@@ -118,7 +118,26 @@ interface DirIndex {
    *  edited file's refs rather than restoring them to that file's position in
    *  `parsed`. Every consumer asks whether a matching ref exists, never which
    *  came first; anything that starts caring must sort. */
-  refsByAddress: Map<string, { file: string; ref: TfRef }[]>;
+  refsByAddress: Map<string, RefBucket>;
+}
+
+/** One address's references, grouped by the file that holds them.
+ *
+ *  Keyed by file for the same reason `moduleCallsByFile` is: retracting an
+ *  edited file's entries is a `delete`, not a filter-and-reallocate of the whole
+ *  bucket. Buckets are workspace-wide and keyed on only the first two address
+ *  parts, so shared addresses collapse into one huge list — `each.value`,
+ *  `count.index`, `var.tags`, and every data source of a provider type share a
+ *  key. Rebuilding a 25k-entry array on every debounced keystroke, in a file
+ *  that may not even mention the address, measured ~5x the cost of parsing the
+ *  edited file, and it grew with the workspace while the edit stayed the size
+ *  it was.
+ *
+ *  `flat` mirrors `flatCalls`: the flattened form, rebuilt on demand and
+ *  dropped on any write, so the read path stays one array. */
+interface RefBucket {
+  byFile: Map<string, TfRef[]>;
+  flat?: { file: string; ref: TfRef }[];
 }
 
 /** What one file contributes to the directory maps. `variable`, `locals` and
@@ -214,7 +233,12 @@ export class WorkspaceIndex {
     return this.gen;
   }
 
-  async updateFile(path: string, source: string): Promise<void> {
+  /** True when the index actually changed. Identical bytes return false so the
+   *  sync layer can skip the announce: the wasted parse was never the expensive
+   *  half — the announce re-lints the whole module directory and refreshes the
+   *  CodeLens, which re-parses the document again with no memo, all to
+   *  reproduce byte-identical output. */
+  async updateFile(path: string, source: string): Promise<boolean> {
     const p = norm(path);
     // Identical bytes reach here constantly: a save makes the disk watcher
     // re-read what the 500ms debounce already parsed from the buffer, typing a
@@ -224,7 +248,7 @@ export class WorkspaceIndex {
     // derived index for the *whole workspace*, which the next lint then rebuilds
     // from every block and ref in it.
     const previous = this.parsed.get(p);
-    if (previous?.source === source) return;
+    if (previous?.source === source) return false;
     const parsed = parseFile(p, source);
     this.parsed.set(p, parsed);
     if (!previous && p.endsWith('.tf')) {
@@ -248,6 +272,7 @@ export class WorkspaceIndex {
       this.addRefs(this.dirIndex, parsed);
     }
     this.gen++;
+    return true;
   }
 
   removeFile(path: string): void {
@@ -295,12 +320,23 @@ export class WorkspaceIndex {
   }
 
   private addRefs(idx: DirIndex, f: ParsedFile): void {
+    // grouped first so each address is written once, not once per reference
+    const byKey = new Map<string, TfRef[]>();
     for (const ref of f.refs) {
       if (ref.parts.length < 2) continue;
       const key = `${ref.parts[0]}.${ref.parts[1]}`;
+      const list = byKey.get(key);
+      if (list) list.push(ref);
+      else byKey.set(key, [ref]);
+    }
+    for (const [key, refs] of byKey) {
       const bucket = idx.refsByAddress.get(key);
-      if (bucket) bucket.push({ file: f.path, ref });
-      else idx.refsByAddress.set(key, [{ file: f.path, ref }]);
+      if (bucket) {
+        bucket.byFile.set(f.path, refs);
+        bucket.flat = undefined;
+      } else {
+        idx.refsByAddress.set(key, { byFile: new Map([[f.path, refs]]) });
+      }
     }
   }
 
@@ -315,9 +351,9 @@ export class WorkspaceIndex {
     for (const key of keys) {
       const bucket = idx.refsByAddress.get(key);
       if (!bucket) continue;
-      const kept = bucket.filter((e) => e.file !== f.path);
-      if (kept.length > 0) idx.refsByAddress.set(key, kept);
-      else idx.refsByAddress.delete(key);
+      if (!bucket.byFile.delete(f.path)) continue;
+      if (bucket.byFile.size === 0) idx.refsByAddress.delete(key);
+      else bucket.flat = undefined;
     }
   }
 
@@ -362,6 +398,19 @@ export class WorkspaceIndex {
     return dirOf(file);
   }
 
+  /** Whether any indexed file in this directory needed error recovery to parse.
+   *
+   *  `refs` is a floor, not the whole truth, whenever that happened: a file
+   *  mid-edit yields *fewer* references than its text really contains. Anything
+   *  that reads an absent reference as permission — the count→for_each rewrite
+   *  above all — has to withhold instead, or an unterminated string two lines
+   *  up in a sibling silently authorises a rewrite that breaks the config the
+   *  moment the sibling parses again. */
+  moduleHasParseError(moduleDir: string): boolean {
+    const files = this.filesByDir.get(norm(moduleDir));
+    return files?.some((p) => this.parsed.get(p)?.hasError) ?? false;
+  }
+
   /** Indexed paths under a directory — VS Code fires one event for a folder
    *  delete, not per-file, so the sync layer asks what it covered. */
   pathsUnder(dirPath: string): string[] {
@@ -389,7 +438,16 @@ export class WorkspaceIndex {
     // copied on the way out — the scan branch below returns a fresh array, so
     // callers that sort/splice can't reach back into the index
     if (parts.length === 2) {
-      return [...(this.idx().refsByAddress.get(`${parts[0]}.${parts[1]}`) ?? [])];
+      const bucket = this.idx().refsByAddress.get(`${parts[0]}.${parts[1]}`);
+      if (!bucket) return [];
+      if (!bucket.flat) {
+        const flat: { file: string; ref: TfRef }[] = [];
+        for (const [file, refs] of bucket.byFile) {
+          for (const ref of refs) flat.push({ file, ref });
+        }
+        bucket.flat = flat;
+      }
+      return [...bucket.flat];
     }
     const out: { file: string; ref: TfRef }[] = [];
     for (const f of this.parsed.values()) {

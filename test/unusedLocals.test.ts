@@ -71,3 +71,27 @@ describe('a reference with a comment inside the traversal', () => {
     index.removeFile(path);
   });
 });
+
+/** The rule reads an absent reference as proof of disuse, but tree-sitter drops
+ *  what it cannot parse — so a sibling mid-edit made every local it alone uses
+ *  report as unused, for as long as the user kept typing. */
+describe('a sibling that does not parse cannot make a local look unused', () => {
+  it('stays quiet while the module is mid-edit, and reports again once it parses', async () => {
+    const locals = 'locals {\n  region = "eu-west-1"\n}\n';
+    const build = (use: string) =>
+      WorkspaceIndex.build({
+        listFiles: async () => ['/u/locals.tf', '/u/use.tf'],
+        readFile: async (p) => (p === '/u/locals.tf' ? locals : use),
+      });
+
+    // local.region really is used, but the unterminated string hides it
+    const broken = await build('output "a" {\n  value = "oops\n}\nx = local.region\n');
+    expect(broken.file('/u/use.tf')?.hasError).toBe(true);
+    expect(detectUnusedLocals(broken, '/u')).toEqual([]);
+
+    // genuinely unused, in a module that parses: still reported
+    const clean = await build('output "a" {\n  value = "fine"\n}\n');
+    expect(clean.file('/u/use.tf')?.hasError).toBe(false);
+    expect(detectUnusedLocals(clean, '/u').map((f) => f.code)).toEqual(['locals.unused']);
+  });
+});

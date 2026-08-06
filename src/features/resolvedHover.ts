@@ -279,6 +279,28 @@ export interface HoverContext {
 
 /** The full hover pipeline, VS Code-free: ref-or-definition under the cursor →
  *  resolve through the var→local chain → markdown body. */
+/** Module instances re-resolved for the per-instance rows.
+ *
+ *  MAX_VALUE_CHARS bounds *one* value; nothing bounded how many of them get
+ *  built. Each row is an independent full resolve carrying its own fresh
+ *  budget, and the row count is whatever the user's config supplies — the
+ *  number of places a module is called. A shared module called from many stacks
+ *  each passing a distinct value measured 766ms of frozen extension host at 200
+ *  sites, and 20s / 18MB of markdown at 100 sites × 90k-char values, all of it
+ *  on the synchronous hover path. This is the same class 369bd03 closed for a
+ *  single value, left open for the list of them. */
+const MAX_CONFLICT_SITES = 8;
+
+/** Total characters the per-instance row list may render, measured as the rows
+ *  are built rather than after: the point is not to allocate the megabytes in
+ *  the first place. */
+const MAX_CONFLICT_CHARS = 20_000;
+
+/** Value characters one per-instance row may show. The budget above cannot bound
+ *  a list whose *first* entry already exceeds it, and a row exists to let a
+ *  reader tell instances apart, not to print a 90k-char value at each of them. */
+const MAX_ROW_VALUE_CHARS = 2_000;
+
 export function computeHover(file: ParsedFile, pos: Pos, ctx: HoverContext): string | undefined {
   const ref = file.refs.find(
     (r) => (r.parts[0] === 'var' || r.parts[0] === 'local') && spanContains(r.span, pos),
@@ -301,8 +323,11 @@ export function computeHover(file: ParsedFile, pos: Pos, ctx: HoverContext): str
   // per site (not just the diverged var) shows "app-dev" for
   // local.name = "app-${var.env}" instead of the bare "dev"
   const diverged = used.divergedAt;
+  let omitted = 0;
   if (diverged) {
-    const rows = diverged.sites.map((site, i) => ({
+    const sampled = diverged.sites.slice(0, MAX_CONFLICT_SITES);
+    omitted = diverged.sites.length - sampled.length;
+    const rows = sampled.map((site, i) => ({
       label: diverged.labels[i] ?? '?',
       value: resolveRefShaped(target, {
         ...scope,
@@ -310,7 +335,10 @@ export function computeHover(file: ParsedFile, pos: Pos, ctx: HoverContext): str
         pinnedSites: new Map([...(scope.pinnedSites ?? []), [diverged.moduleDir, site]]),
       }),
     }));
-    if (new Set(rows.map((r) => r.value.text)).size > 1) {
+    if (omitted > 0 || new Set(rows.map((r) => r.value.text)).size > 1) {
+      // With instances left unread we cannot claim they agree, so the collapse
+      // below is not available: listing what was measured is honest, naming one
+      // value for all of them would not be.
       for (const row of rows) used.conflicts.set(row.label, row.value);
     } else if (rows[0]) {
       // divergent var never reaches this value (cancels out, or feeds a branch
@@ -330,6 +358,7 @@ export function computeHover(file: ParsedFile, pos: Pos, ctx: HoverContext): str
     used,
     tfvarsNames: inForce,
     copyCommand: ctx.copyCommand,
+    conflictsOmitted: omitted,
   });
 }
 
@@ -345,6 +374,8 @@ export interface HoverParts {
   /** basenames of the tfvars files in force for this module, if any */
   tfvarsNames?: string[];
   copyCommand: string;
+  /** instances past MAX_CONFLICT_SITES that were never resolved */
+  conflictsOmitted?: number;
 }
 
 /** Markdown body of the resolved-value hover: value, real provenance, copy link.
@@ -356,6 +387,7 @@ export function hoverMarkdown({
   used,
   tfvarsNames,
   copyCommand,
+  conflictsOmitted = 0,
 }: HoverParts): string {
   // a block label is whatever the parser accepted between the quotes, and this
   // hover renders trusted, so the name needs the same escaping as every other
@@ -375,12 +407,34 @@ export function hoverMarkdown({
     // per row, because that is the case where one instance fits a limit and
     // another doesn't — a single count for "the" value would be the same lie
     // about which one won that the rows exist to avoid
-    const rows = [...used.conflicts].map(([label, v]) => {
+    const rows: string[] = [];
+    let spent = 0;
+    let dropped = conflictsOmitted;
+    for (const [label, v] of used.conflicts) {
       const count = charNote(v.text, v.shape);
       const shown = count === undefined ? '' : ` (${count})`;
-      return `- ${escapeMd(label)}: ${inlineCode(v.text)}${shown} — ${copyLink(v.text)}`;
-    });
-    return `**${name}** differs per module instance:\n\n${rows.join('\n')}`;
+      // One row is a per-instance summary, not the value itself: at full length
+      // a single 90k-char instance rendered ~120k of markdown on its own, since
+      // `copyLink` percent-encodes a JSON string and runs 2-3x its input. The
+      // copy link goes with the truncation rather than following it — copying a
+      // clipped value would put text on the clipboard that is not what the
+      // instance holds, and `charNote` already reports the real size.
+      const clipped = v.text.length > MAX_ROW_VALUE_CHARS;
+      const body = clipped ? `${v.text.slice(0, MAX_ROW_VALUE_CHARS)}…` : v.text;
+      const copy = clipped ? '' : ` — ${copyLink(v.text)}`;
+      const row = `- ${escapeMd(label)}: ${inlineCode(body)}${shown}${copy}`;
+      // measured as they are built: `copyLink` alone is 2-3x the value it
+      // encodes, so rendering every row and trimming afterwards still pays the
+      // whole allocation the cap exists to avoid
+      if (spent + row.length > MAX_CONFLICT_CHARS && rows.length > 0) {
+        dropped += used.conflicts.size - rows.length;
+        break;
+      }
+      rows.push(row);
+      spent += row.length;
+    }
+    const more = dropped > 0 ? `\n- …and ${dropped} more instance${dropped === 1 ? '' : 's'}` : '';
+    return `**${name}** differs per module instance:\n\n${rows.join('\n')}${more}`;
   }
 
   const origins: string[] = [];
