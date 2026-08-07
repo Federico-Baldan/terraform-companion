@@ -2,6 +2,14 @@
 
 Notable changes to Terraform Companion. Versions follow semver; dates are ISO (YYYY-MM-DD).
 
+## [1.1.9](https://github.com/Federico-Baldan/terraform-companion/compare/v1.1.8...v1.1.9) (2026-08-07)
+
+
+### Bug Fixes
+
+* close a delete escape, a destructive refactor, and a parser crash ([139f674](https://github.com/Federico-Baldan/terraform-companion/commit/139f6745f62ecdd3e5ace483360a8883dbdc5b9e))
+* close data-loss, crash and freeze paths, and cut per-edit CPU ([1fba66d](https://github.com/Federico-Baldan/terraform-companion/commit/1fba66dad3fd9756a361d3130df4d761b1f6b6b1))
+
 ## [1.1.8](https://github.com/Federico-Baldan/terraform-companion/compare/v1.1.7...v1.1.8) (2026-08-04)
 
 
