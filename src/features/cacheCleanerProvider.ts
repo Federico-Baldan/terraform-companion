@@ -118,6 +118,7 @@ async function scan(
 
   let freed = 0;
   let deleted = 0;
+  let failed = 0;
   for (const c of unique) {
     if (cancelled()) return;
     if (!isTerraformCacheDir(c.dir)) continue; // hard guard: only .terraform dirs
@@ -133,15 +134,38 @@ async function scan(
       // the guard doing its job was no record at all
       const result = await deleteCachePayload(c.dir, c.root);
       if (!result.ok) {
+        failed++;
         log(`cacheCleaner: left ${c.dir} alone: ${result.reason}`);
+        continue;
+      }
+      // A delete that removed nothing is not a clean. `rm --force` succeeds on
+      // an absent path and the plugins guard can decline every entry, so an
+      // already-empty cache and one nothing may reclaim both came back ok —
+      // and both were counted as freed bytes. Two windows on the same repo
+      // double-counted the same cache this way.
+      if (result.removed === 0) {
+        log(`cacheCleaner: nothing reclaimable in ${c.dir}`);
         continue;
       }
       deleted++;
       freed += c.sizeBytes;
       log(`cacheCleaner: cleaned ${c.dir}`);
     } catch (e) {
+      failed++;
       log(`cacheCleaner: failed to clean ${c.dir}: ${e}`);
     }
+  }
+  // A partial delete is the case that matters: `rm -rf` removes files until it
+  // hits EACCES, and the half-populated provider tree left behind makes
+  // `terraform init` fail with "could not find executable file" instead of
+  // re-downloading. Reporting only to the output channel meant the user clicked
+  // Delete on a destructive prompt and got no feedback at all.
+  if (failed > 0) {
+    vscode.window
+      .showWarningMessage(
+        `Terraform Companion: ${failed} .terraform cache${failed === 1 ? '' : 's'} could not be cleaned${deleted > 0 ? ` (${deleted} succeeded)` : ''}. See the Terraform Companion output channel for details.`,
+      )
+      .then(undefined, (e) => log(`cacheCleaner: notification failed: ${e}`));
   }
   if (deleted === 0) return;
   // caught, not voided: this fires after a walk that may have taken a while, so

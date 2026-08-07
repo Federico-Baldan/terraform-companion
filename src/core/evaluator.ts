@@ -70,6 +70,18 @@ interface EvalState {
    *  rather than a flag so a caller can tell whether a *particular* subtree
    *  gave up, not merely whether anything did. */
   spends: number;
+  /** Whether *any* budget gave up during this resolve, including the give-ups
+   *  that deliberately do not touch `spends`.
+   *
+   *  Kept apart from the counter because the two feed different decisions.
+   *  `spends` also gates the memo (line ~660: a budget-limited `undefined` is
+   *  context-dependent, so it must not be cached under a context-free key), and
+   *  charging the depth and size give-ups there turned their results
+   *  uncacheable — which made a 6-module chain re-evaluate exponentially and
+   *  overflow the stack. `gaveUp` records the same fact for the safety question
+   *  without touching caching, so `listShape` can still refuse to certify a
+   *  destructive rewrite on a value nobody actually measured. */
+  gaveUp: boolean;
   /** Live `evalNode` frames. See MAX_NEST. */
   nest: number;
 }
@@ -224,12 +236,23 @@ const MAX_RENDER_DEPTH = 64;
 function renderInto(
   v: Value,
   out: string[],
-  budget: { left: number },
+  budget: { left: number; clipped: boolean },
   depth: number,
   tagged: boolean,
 ): void {
-  if (budget.left <= 0) return;
+  // reached with something to render and no room for any of it
+  if (budget.left <= 0) {
+    budget.clipped = true;
+    return;
+  }
   const emit = (s: string): void => {
+    // Recorded rather than inferred from the remainder. An exhausted budget
+    // lands on exactly 0 as often as it goes negative, and the early returns
+    // above drop content without charging at all — so "was anything actually
+    // cut" is not answerable from `left` alone, and reading it that way both
+    // marked complete values as truncated and let genuinely clipped ones
+    // through unmarked.
+    if (s.length > budget.left) budget.clipped = true;
     // Clip the leaf rather than only charging for it. `format` and `join` build
     // a single string that can be megabytes on its own, and pushing it whole
     // made the budget a *reporter* of the overrun — render() appended its `…`
@@ -249,7 +272,10 @@ function renderInto(
   if (Array.isArray(v)) {
     emit('[');
     for (const [i, item] of v.entries()) {
-      if (budget.left <= 0) break;
+      if (budget.left <= 0) {
+        budget.clipped = true;
+        break;
+      }
       if (i > 0) emit(', ');
       renderInto(item, out, budget, depth + 1, tagged);
     }
@@ -260,7 +286,10 @@ function renderInto(
     emit('{');
     let first = true;
     for (const [k, val] of v) {
-      if (budget.left <= 0) break;
+      if (budget.left <= 0) {
+        budget.clipped = true;
+        break;
+      }
       if (!first) emit(', ');
       first = false;
       emit(`${k} = `);
@@ -278,10 +307,10 @@ function renderInto(
 
 function renderBudgeted(v: Value, tagged: boolean): string {
   const out: string[] = [];
-  const budget = { left: MAX_VALUE_CHARS };
+  const budget = { left: MAX_VALUE_CHARS, clipped: false };
   renderInto(v, out, budget, 0, tagged);
   const text = out.join('');
-  if (budget.left > 0) return text;
+  if (!budget.clipped) return text;
   // The overflow is the exact number of characters charged past the cap. A
   // tagged render needs it: `emit` now clips, so two values sharing a
   // MAX_VALUE_CHARS prefix but differing in length produce identical text, and
@@ -339,8 +368,13 @@ const FORMAT_VERB = /%(%|(?:([-+ #0]*)([1-9]\d*)?(?:\.(\d+))?(?:\[(\d+)\])?([a-z
 const PLAIN_VERBS = new Set(['s', 'v', 'd', 'q']);
 
 /** Terraform's `format`: matches go-cty exactly or bails. go-cty errors on
- *  unknown verbs, so passing one through would be wrong. */
-function formatString(template: string, args: Value[]): string | undefined {
+ *  unknown verbs, so passing one through would be wrong.
+ *
+ *  `scope` is taken only to charge the size budget, exactly as the `join` case
+ *  does: giving up because the result got too big has to be distinguishable
+ *  from "this expression means nothing", or a caller reads the silence as
+ *  permission — see `spends` on EvalState. */
+function formatString(template: string, args: Value[], scope?: EvalScope): string | undefined {
   let out = '';
   let cursor = 0;
   // explicit [n] also moves the implicit counter (Go behavior): "%[2]s %s"
@@ -381,11 +415,18 @@ function formatString(template: string, args: Value[]): string | undefined {
     // local.f23)` is 25 lines of HCL and 167M characters. Unbounded, the string
     // was built in full and then flattened three more times by the hover
     // renderer — 27 lines measured 3.6s and 1.2GB.
-    if (out.length > MAX_VALUE_CHARS) return undefined;
+    if (out.length > MAX_VALUE_CHARS) {
+      if (scope?.state) scope.state.gaveUp = true;
+      return undefined;
+    }
   }
   const tail = template.slice(cursor);
   if (tail.includes('%')) return undefined;
-  return out.length + tail.length > MAX_VALUE_CHARS ? undefined : out + tail;
+  if (out.length + tail.length > MAX_VALUE_CHARS) {
+    if (scope?.state) scope.state.gaveUp = true;
+    return undefined;
+  }
+  return out + tail;
 }
 
 /** Lexicographic by code point, which is the order UTF-8 bytes sort in — what
@@ -420,7 +461,7 @@ function callFunction(name: string, args: Value[], scope: EvalScope): Value {
     case 'format': {
       const [fmt, ...rest] = args;
       const template = asString(fmt);
-      return template === undefined ? undefined : formatString(template, rest);
+      return template === undefined ? undefined : formatString(template, rest, scope);
     }
     case 'lower':
       return asString(args[0])?.toLowerCase();
@@ -465,8 +506,16 @@ function callFunction(name: string, args: Value[], scope: EvalScope): Value {
  *  release already resolves. Every entry point installs a state; without one
  *  this is the previous, `depth`-only behaviour. */
 function evalNode(node: Node, scope: EvalScope, depth: number, struct = 0): Value {
-  if (depth > MAX_DEPTH) return undefined;
   const state = scope.state;
+  // charged like every other give-up below. This test used to sit *above*
+  // `state`, so it could never charge — and an unmeasured value then reported
+  // as plain `unknown` rather than `overBudget`, which is exactly the
+  // difference `shapeUnusable` reads to decide whether the destructive
+  // count→for_each rewrite is allowed. ~5 module hops is enough to reach it.
+  if (depth > MAX_DEPTH) {
+    if (state) state.gaveUp = true;
+    return undefined;
+  }
   if (state) {
     if (struct > MAX_STRUCT_NEST || state.nest >= MAX_NEST) {
       // a budget giving up, not an absent value: `spends` is what stops a caller
@@ -519,6 +568,31 @@ function evalNode(node: Node, scope: EvalScope, depth: number, struct = 0): Valu
         const gap = (from: number, to: number) =>
           to > from ? raw.slice(from - base, to - base) : '';
         let out = '';
+        /** Index in `out` where the current trailing run of *literal* template
+         *  text starts. A strip marker consumes literal whitespace only — never
+         *  whitespace that came out of an interpolated value — so stripping has
+         *  to know where the last value ended and the literal resumed. */
+        let literalFrom = 0;
+        /** A closing `~` strips the whitespace *after* the sequence, which lives
+         *  in the next literal, so it is applied on the way into that one. */
+        let stripNextLeading = false;
+        const addLiteral = (text: string): void => {
+          let lit = text;
+          if (stripNextLeading) {
+            lit = lit.replace(/^\s+/, '');
+            stripNextLeading = false;
+          }
+          out += lit;
+        };
+        const addValue = (text: string): void => {
+          out += text;
+          literalFrom = out.length;
+        };
+        const stripTrailingLiteral = (): void => {
+          let end = out.length;
+          while (end > literalFrom && /\s/.test(out.charAt(end - 1))) end--;
+          out = out.slice(0, end);
+        };
         let cursor = node.startIndex;
         for (const c of named(node)) {
           switch (c.type) {
@@ -527,16 +601,24 @@ function evalNode(node: Node, scope: EvalScope, depth: number, struct = 0): Valu
             case 'quoted_template_start':
               break;
             case 'quoted_template_end':
-              out += unescapeTemplateLiteral(gap(cursor, c.startIndex));
+              addLiteral(unescapeTemplateLiteral(gap(cursor, c.startIndex)));
               break;
             case 'template_literal':
               // decoded with the gap, so an escape cannot split across the seam
-              out += unescapeTemplateLiteral(gap(cursor, c.startIndex) + c.text);
+              addLiteral(unescapeTemplateLiteral(gap(cursor, c.startIndex) + c.text));
               break;
             case 'template_interpolation': {
-              out += unescapeTemplateLiteral(gap(cursor, c.startIndex));
+              addLiteral(unescapeTemplateLiteral(gap(cursor, c.startIndex)));
+              // Strip markers: `${~ x}` consumes the literal whitespace before
+              // the sequence, `${x ~}` the literal whitespace after it. Ignoring
+              // them produced a confidently *wrong* string rather than an
+              // unknown one — "a   ${~var.env}" rendered "a   dev" where
+              // Terraform gives "adev". The marker is part of the delimiter, so
+              // it is adjacent to the braces and readable straight off the text.
+              if (c.text.startsWith('${~')) stripTrailingLiteral();
               const inner = named(c).find((x) => x.type === 'expression');
-              out += inner ? render(evalNode(inner, scope, depth, struct + 1)) : UNKNOWN;
+              addValue(inner ? render(evalNode(inner, scope, depth, struct + 1)) : UNKNOWN);
+              if (c.text.endsWith('~}')) stripNextLeading = true;
               break;
             }
             // %{ if }/%{ for } branch on a condition we never evaluate and
@@ -549,7 +631,13 @@ function evalNode(node: Node, scope: EvalScope, depth: number, struct = 0): Valu
           // bail on the way up, not at the end: each child is already capped, so
           // stopping here bounds this node too instead of letting the product
           // compound level by level
-          if (out.length > MAX_VALUE_CHARS) return undefined;
+          if (out.length > MAX_VALUE_CHARS) {
+            // recorded: interpolation doubling is how a list of thousands of
+            // identical strings arrives, and an unrecorded give-up here reads as
+            // "nothing to object to" at the count→for_each guard
+            if (state) state.gaveUp = true;
+            return undefined;
+          }
         }
         return out;
       }
@@ -774,6 +862,7 @@ function withState(scope: EvalScope): EvalScope {
       inProgress: new Set(),
       elements: { left: MAX_VALUE_ELEMENTS },
       spends: 0,
+      gaveUp: false,
       nest: 0,
     },
   };
@@ -826,8 +915,13 @@ export type ListShape =
 export function listShape(text: string, scope: EvalScope): ListShape {
   const scoped = withState(scope);
   const value = evalText(text, scoped, 0);
+  // `gaveUp` covers the give-ups that must not disturb the memo (depth, and the
+  // string/format size caps); `spends` covers the rest. Either one means this
+  // list was never measured, which is the answer a destructive rewrite needs.
   const unknown: ListShape =
-    (scoped.state?.spends ?? 0) > 0 ? { kind: 'unknown', overBudget: true } : { kind: 'unknown' };
+    (scoped.state?.spends ?? 0) > 0 || scoped.state?.gaveUp === true
+      ? { kind: 'unknown', overBudget: true }
+      : { kind: 'unknown' };
   if (!Array.isArray(value)) return unknown;
   // an unresolved element says nothing; a resolved non-string says everything
   // — numbers count too, for_each rejects those

@@ -4,15 +4,20 @@ const BASE = 'https://registry.terraform.io/v1';
  *  registry-slug charset, but per-segment encoding stops anything slipping
  *  past from smuggling a `..` or `?query` into the path. Slashes survive,
  *  since they're structure. */
-function encodePathSegments(source: string): string {
+function encodePathSegments(source: string): string | undefined {
   // encoding alone cannot stop a dot segment: `.` and `..` are unreserved, so
   // encodeURIComponent returns them unchanged and the URL parser then resolves
   // them away, aiming the request at a path the file never named. Reject
   // rather than encode.
+  //
+  // Returned rather than thrown: this is called outside the promise chain, so a
+  // throw escaped synchronously instead of rejecting — through the lens
+  // provider's `worker` that became a rejected `Promise.all` and a rejected
+  // `provideCodeLenses`, breaking the class's "never throws" contract. Both
+  // callers already validate `source` first, so this is the defense-in-depth
+  // layer, and it must not fail open on contract.
   const segments = source.split('/');
-  if (segments.some((s) => s === '.' || s === '..')) {
-    throw new Error(`refusing to build a registry path from "${source}"`);
-  }
+  if (segments.some((s) => s === '.' || s === '..')) return undefined;
   return segments.map(encodeURIComponent).join('/');
 }
 
@@ -138,17 +143,21 @@ export class RegistryClient {
 
   providerVersions(source: string): Promise<string[] | undefined> {
     const full = source.includes('/') ? source : `hashicorp/${source}`;
+    const path = encodePathSegments(full);
+    if (path === undefined) return Promise.resolve(undefined);
     return this.cached<ProviderVersionsResponse>(
       `provider:${full}`,
-      `${BASE}/providers/${encodePathSegments(full)}/versions`,
+      `${BASE}/providers/${path}/versions`,
       (json) => versionStrings(json.versions),
     );
   }
 
   moduleVersions(source: string): Promise<string[] | undefined> {
+    const path = encodePathSegments(source);
+    if (path === undefined) return Promise.resolve(undefined);
     return this.cached<ModuleVersionsResponse>(
       `module:${source}`,
-      `${BASE}/modules/${encodePathSegments(source)}/versions`,
+      `${BASE}/modules/${path}/versions`,
       (json) => versionStrings(json.modules?.[0]?.versions),
     );
   }

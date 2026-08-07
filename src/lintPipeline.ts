@@ -60,10 +60,6 @@ export class LintPipeline {
     });
   }
 
-  private publish(file: ParsedFile): void {
-    this.collection.set(vscode.Uri.file(file.path), this.diagnosticsFor(file));
-  }
-
   /** Whether a settings change can alter any diagnostic this pipeline emits.
    *
    *  `affectsConfiguration('tfCompanion')` is true for every key in the
@@ -104,8 +100,24 @@ export class LintPipeline {
       paths,
       this.rules.some((rule) => rule.scope === 'module' && featureEnabled(rule.feature)),
     );
-    for (const path of plan.drop) this.collection.delete(vscode.Uri.file(path));
-    for (const file of plan.publish) this.publish(file);
+    // One bulk set, for exactly the reason refreshAll uses one. Publishing per
+    // file fired a diagnostics-changed event each, and `unusedLocals` is
+    // module-scoped and on by default — so a single keystroke re-published
+    // every .tf in the module directory, one event apiece. Clean files get
+    // `undefined` rather than `[]`, so the collection stops holding an entry
+    // per file, which is what `refreshAll` is careful about too.
+    //
+    // `plan.drop` and `plan.publish` cannot name the same uri (drop is exactly
+    // the paths the index no longer has, publish comes from the index), so the
+    // documented merging of duplicate tuples cannot turn a replace into an
+    // append here.
+    const entries: [vscode.Uri, vscode.Diagnostic[] | undefined][] = [];
+    for (const path of plan.drop) entries.push([vscode.Uri.file(path), undefined]);
+    for (const file of plan.publish) {
+      const diagnostics = this.diagnosticsFor(file);
+      entries.push([vscode.Uri.file(file.path), diagnostics.length > 0 ? diagnostics : undefined]);
+    }
+    if (entries.length > 0) this.collection.set(entries);
   }
 
   /** Findings for the live buffer: a fix applied through the debounced index's
@@ -114,9 +126,20 @@ export class LintPipeline {
   private liveFindings(document: vscode.TextDocument): LintFinding[] {
     const key = `${document.uri.toString()}@${document.version}`;
     if (this.actionCache?.key === key) return this.actionCache.findings;
-    const findings = this.computeFindings(
-      parseFile(normalizePath(document.uri.fsPath), document.getText()),
-    );
+    // The parser recurses over the CST without a depth bound, so deeply nested
+    // HCL raises RangeError. This is a CodeActionProvider callback, which VS
+    // Code drives from cursor movement, so an uncaught throw here repeats on
+    // every keystroke in such a buffer. The two sibling providers already wrap
+    // this exact call for this exact reason; this one did not.
+    let findings: LintFinding[];
+    try {
+      findings = this.computeFindings(
+        parseFile(normalizePath(document.uri.fsPath), document.getText()),
+      );
+    } catch (e) {
+      this.log?.(`Live findings failed on ${document.uri.fsPath}: ${e}`);
+      findings = [];
+    }
     this.actionCache = { key, findings };
     return findings;
   }

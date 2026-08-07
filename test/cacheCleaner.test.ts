@@ -222,7 +222,8 @@ describe('cache cleaner', () => {
     writeFileSync(join(cache, 'environment'), 'prod');
     writeFileSync(join(cache, 'terraform.tfstate'), '{"backend":{}}');
 
-    expect(await deleteCachePayload(cache, root)).toEqual({ ok: true });
+    // providers + modules; the metadata files beside them are left in place
+    expect(await deleteCachePayload(cache, root)).toEqual({ ok: true, removed: 2 });
 
     expect(existsSync(join(cache, 'providers'))).toBe(false);
     expect(existsSync(join(cache, 'modules'))).toBe(false);
@@ -332,7 +333,8 @@ describe('cache cleaner', () => {
     const [found] = await findStaleTerraformDirs(root, 30, NOW);
     expect(found?.dir).toBe(cache);
 
-    expect(await deleteCachePayload(cache, root)).toEqual({ ok: true });
+    // one entry removed: plugins/linux_amd64
+    expect(await deleteCachePayload(cache, root)).toEqual({ ok: true, removed: 1 });
     expect(existsSync(join(cache, 'plugins', 'linux_amd64'))).toBe(false);
   });
 
@@ -350,7 +352,9 @@ describe('cache cleaner', () => {
     mkdirSync(join(cache, 'providers'), { recursive: true });
     writeFileSync(join(cache, 'providers', 'bin'), 'refetchable');
 
-    expect(await deleteCachePayload(cache, root)).toEqual({ ok: true });
+    // only `providers` is reclaimed — the hand-placed platform dir is declined,
+    // so it must not be counted as something this delete removed
+    expect(await deleteCachePayload(cache, root)).toEqual({ ok: true, removed: 1 });
 
     expect(existsSync(join(platform, 'terraform-provider-acme_v0.4.2'))).toBe(true);
     // the registry-managed half is still reclaimed
@@ -364,7 +368,7 @@ describe('cache cleaner', () => {
     mkdirSync(nested, { recursive: true });
     writeFileSync(join(nested, 'bin'), 'x');
 
-    expect(await deleteCachePayload(cache, root)).toEqual({ ok: true });
+    expect(await deleteCachePayload(cache, root)).toEqual({ ok: true, removed: 1 });
     expect(existsSync(join(cache, 'plugins', 'registry.terraform.io'))).toBe(false);
   });
 

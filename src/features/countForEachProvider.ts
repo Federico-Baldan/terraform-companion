@@ -53,7 +53,7 @@ export function registerCountForEach(
       // virtual docs (git diff views)
       [{ scheme: 'file', pattern: '**/*.tf' }],
       {
-        provideCodeActions(doc, range, ctx) {
+        provideCodeActions(doc, range, ctx, token) {
           // the setting gates the whole feature — the diagnostic is filtered in
           // the lint pipeline, but this refactor is a separate provider, so the
           // RefactorRewrite action would keep showing in the light-bulb menu
@@ -68,6 +68,12 @@ export function registerCountForEach(
           // the index is debounced, and stale spans would corrupt the rewrite
           const file = parseCached(doc, path);
           if (!file) return [];
+          // VS Code re-requests code actions on every selection change and
+          // cancels the previous request. Without this the abandoned request
+          // still ran the cross-file `safeToRefactor` analysis to completion —
+          // ~100x the detection cost by its own comment, recursing through
+          // every module call site — on the extension host.
+          if (token.isCancellationRequested) return [];
           const actions: vscode.CodeAction[] = [];
           for (const pattern of detectCountLength(file, index, {
             tfvarsOf: (dir) => tfvars?.valuesFor(dir) ?? new Map(),
@@ -79,6 +85,9 @@ export function registerCountForEach(
             // than the one under the caret — the laziness the detector went to
             // trouble for, spent by its only caller.
             if (!range.intersection(toRange(pattern.countAttr.span))) continue;
+            // re-checked right before the expensive half, not just at entry:
+            // the caret can move again while an earlier pattern is analysed
+            if (token.isCancellationRequested) return [];
             if (!pattern.safeToRefactor) continue;
             const action = new vscode.CodeAction(
               'Refactor: count → for_each',

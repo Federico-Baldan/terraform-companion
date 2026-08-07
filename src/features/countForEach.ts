@@ -53,6 +53,53 @@ const ELEMENT_ACCESS = /^\s*(?:\.\s*[\w-]|\[)/;
 
 /** Blank remainders continue onto the next line — HCL lets the accessor sit
  *  there. Scanning ahead can only withhold the fix, not wrongly offer it. */
+/** Functions whose first argument must be a collection, so an element passed
+ *  there is itself a map or list — which `for_each` rejects at plan time.
+ *
+ *  A whitelist of *dangerous* callees rather than a blanket "any function
+ *  argument": the callee is what carries the evidence. `upper(x)` proves the
+ *  element is a string and stays refactorable; `lookup(x, …)` proves it is a
+ *  map and must not be. Treating both the same withheld correct refactors. */
+const COLLECTION_ARG_FUNCS = new Set([
+  'lookup',
+  'merge',
+  'keys',
+  'values',
+  'element',
+  'flatten',
+  'concat',
+  'coalescelist',
+  'compact',
+  'distinct',
+  'reverse',
+  'sort',
+  'slice',
+  'chunklist',
+  'setunion',
+  'setintersection',
+  'setsubtract',
+  'transpose',
+  'zipmap',
+  'sum',
+  'one',
+]);
+
+/** Callee name when the element sits directly in that function's first
+ *  argument slot — there is no accessor to find in that position, so the
+ *  accessor scan below cannot see the shape at all. */
+const COLLECTION_CALL = /([\w-]+)\s*\($/;
+
+function usedAsCollectionArgument(file: ParsedFile, uses: Span[]): boolean {
+  return uses.some((use) => {
+    let before = stripComments((file.lines[use.start.row] ?? '').slice(0, use.start.column));
+    for (let row = use.start.row; before.trim() === '' && row > 0; ) {
+      before = stripComments(file.lines[--row] ?? '');
+    }
+    const callee = COLLECTION_CALL.exec(before.trimEnd())?.[1];
+    return callee !== undefined && COLLECTION_ARG_FUNCS.has(callee);
+  });
+}
+
 function usedAsObject(file: ParsedFile, uses: Span[]): boolean {
   return uses.some((use) => {
     // comments skip like blanks — a comment between the element and its
@@ -62,7 +109,9 @@ function usedAsObject(file: ParsedFile, uses: Span[]): boolean {
     for (let row = use.end.row; rest.trim() === '' && row + 1 < file.lines.length; ) {
       rest = stripComments(file.lines[++row] ?? '');
     }
-    return ELEMENT_ACCESS.test(rest);
+    // an accessor can sit past the closing paren of a grouping — one paren was
+    // enough to defeat this scan: `(\n  var.people[count.index]\n).name`
+    return ELEMENT_ACCESS.test(rest) || ELEMENT_ACCESS.test(rest.replace(/^\s*\)+/, ''));
   });
 }
 
@@ -99,6 +148,22 @@ function declaredNonStringElements(
   const type = variable && attrOf(variable.block, 'type');
   if (!type) return false; // undeclared: Terraform treats it as `any`
   return !STRING_COLLECTION.test(type.valueText.replace(/\s+/g, ' ').trim());
+}
+
+/** true when the list's declared type proves its elements are strings — the one
+ *  case where handing an element to a function says nothing about its shape. */
+function declaredStringElements(
+  rawRef: string[],
+  file: ParsedFile,
+  index: WorkspaceIndex | undefined,
+): boolean {
+  if (!index) return false;
+  const listRef = aliasTarget(rawRef, file, index);
+  if (listRef[0] !== 'var' || !listRef[1]) return false;
+  const variable = index.variablesOf(index.moduleDirOf(file.path)).get(listRef[1]);
+  const type = variable && attrOf(variable.block, 'type');
+  if (!type) return false;
+  return STRING_COLLECTION.test(type.valueText.replace(/\s+/g, ' ').trim());
 }
 
 /** Judging a `var.*` list by its default is the wrong question — a tfvars
@@ -246,9 +311,25 @@ export function detectCountLength(
                 !indexUses.some((use) => spanContains(use, ref.span.start)),
             );
             safety =
+              // The buffer being rewritten, not just its indexed copy. The
+              // module-level guard inside referencedOutsideBlock only consults
+              // the index, which is debounced and up to 500ms stale — so an
+              // unterminated string typed anywhere in *this* file made
+              // tree-sitter error-recover and drop the very
+              // `aws_instance.srv[0]` reference that must withhold the fix,
+              // while the index still held the clean copy and answered "no
+              // parse error". The rewrite then landed on a file whose remaining
+              // references it could not see.
+              !file.hasError &&
               !orphanedIndexUse &&
               !referencedOutsideBlock(file, currentBlock, index) &&
               !usedAsObject(file, indexUses) &&
+              // a collection-consuming callee only condemns an element whose
+              // type is not already proven to be a string
+              !(
+                usedAsCollectionArgument(file, indexUses) &&
+                !declaredStringElements(listRef, file, index)
+              ) &&
               !declaredNonStringElements(listRef, file, index) &&
               !resolvedListUnusable(refText, file, index, tfvars);
           }

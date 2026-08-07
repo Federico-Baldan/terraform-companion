@@ -15,7 +15,14 @@ export function parseConstraint(text: string): ConstraintClause[] {
     // optional in go-version's own regexp, so `~> v5.0` is a constraint people
     // really write; dropping the clause made it admit everything, which is the
     // one way to be wrong that the lens then acts on.
-    const m = part.match(/^(~>|>=|<=|!=|[=<>])?\s*v?(\d.*)$/);
+    // `\d.*` swallowed everything to the end of the clause, so a missing comma
+    // — `">= 1.0 < 2.0"` — produced the single clause `{op:'>=', version:'1.0 <
+    // 2.0'}`. The bound still coerced to 1.0.0, but `~>`'s segment count read
+    // the junk as segments and the bump rewrote the text without reporting the
+    // ceiling it dropped. Capturing only the version-shaped prefix keeps the
+    // clause (dropping it would admit everything, which is the one way to be
+    // wrong the lens acts on) while making `version` clean.
+    const m = part.match(/^(~>|>=|<=|!=|[=<>])?\s*v?(\d+(?:\.\d+)*(?:-[\w.]+)?(?:\+[\w.]+)?)/);
     if (!m) continue;
     clauses.push({ op: m[1] ?? '=', version: (m[2] ?? '').trim() });
   }
@@ -40,7 +47,17 @@ export const CEILING_OPS = new Set(['<', '<=']);
 /** Terraform operator semantics, not semver's. */
 export function clauseAdmits(clause: ConstraintClause, version: string): boolean {
   const target = semver.coerce(version);
-  return admitsParsed(clause, target, semver.coerce(clause.version));
+  return admitsParsed(clause, target, coerceBound(clause.version));
+}
+
+/** A clause bound keeps its prerelease.
+ *
+ *  Plain `coerce` strips it, so `= 6.0.0-beta1` became `= 6.0.0` and matched the
+ *  GA release the pin deliberately excludes — the lens then measured the
+ *  distance from a version the user is not on. It only looked correct while the
+ *  GA of that number was unpublished, which is exactly when nobody notices. */
+function coerceBound(version: string): semver.SemVer | null {
+  return semver.coerce(version, { includePrerelease: true });
 }
 
 /** The body of `clauseAdmits` with both sides already coerced. `latestAdmitted`
@@ -92,7 +109,7 @@ export function pivotClause(clauses: ConstraintClause[]): ConstraintClause | und
   let bestVersion: string | undefined;
   for (const clause of clauses) {
     if (!LOWER_BOUND_OPS.has(clause.op)) continue;
-    const coerced = semver.coerce(clause.version);
+    const coerced = coerceBound(clause.version);
     if (!coerced) continue;
     if (!bestVersion || semver.gt(coerced.version, bestVersion)) {
       best = clause;
@@ -112,7 +129,7 @@ export function pivotClause(clauses: ConstraintClause[]): ConstraintClause | und
 export function latestAdmitted(versions: string[], constraint: string): string | undefined {
   const clauses = parseConstraint(constraint).map((c) => ({
     clause: c,
-    bound: semver.coerce(c.version),
+    bound: coerceBound(c.version),
   }));
   let best: semver.SemVer | undefined;
   for (const v of versions) {

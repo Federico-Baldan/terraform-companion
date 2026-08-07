@@ -11,7 +11,7 @@ import { registerIndexSync } from './indexSync';
 import { registerLintPipeline } from './lintPipeline';
 import { buildLintRules } from './lintRules';
 import { type CacheEntry, pruneRegistryCache, RegistryClient } from './registry/client';
-import { vscodeHost } from './vscodeUtils';
+import { TF_GLOB, vscodeHost } from './vscodeUtils';
 
 /** Whether a batch of changed paths reaches an editor the user can see. */
 function touchesVisibleEditor(changed: readonly string[]): boolean {
@@ -38,6 +38,24 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     log(`Parser init failed: ${e}`);
     return;
   }
+
+  // The watcher has to exist *before* the initial scan, not after it. `build`
+  // is 1-4s locally and 10-20s over Remote-SSH, WSL or a devcontainer by its
+  // own measurement, and registerIndexSync only creates its watchers once that
+  // has resolved — so a `git pull`, `terraform init` or codegen run landing in
+  // that window produced no event at all and was never reconciled. A new .tf
+  // stayed unindexed (false unused-local warnings, unresolved module calls) and
+  // a deleted one kept its ParsedFile and its diagnostics for the whole
+  // session. Buffered here and replayed once the real handlers are wired.
+  const pendingEvents: { uri: vscode.Uri; deleted: boolean }[] = [];
+  const startupWatcher = vscode.workspace.createFileSystemWatcher(TF_GLOB);
+  const startupSubs = [
+    startupWatcher,
+    startupWatcher.onDidCreate((uri) => pendingEvents.push({ uri, deleted: false })),
+    startupWatcher.onDidChange((uri) => pendingEvents.push({ uri, deleted: false })),
+    startupWatcher.onDidDelete((uri) => pendingEvents.push({ uri, deleted: true })),
+  ];
+  context.subscriptions.push(...startupSubs);
 
   const index = await WorkspaceIndex.build(vscodeHost(), (path, e) =>
     log(`Not indexed (unreadable or deleted during the scan): ${path}: ${e}`),
@@ -76,6 +94,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   registerCountForEach(context, index, activeTfvars);
   registerCacheCleaner(context, log);
 
+  // stop buffering before the real watchers take over, so an event landing now
+  // is handled once rather than both queued and delivered
+  for (const s of startupSubs) s.dispose();
+
   registerIndexSync(
     context,
     index,
@@ -92,6 +114,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       activeTfvars.updateStatusBar();
     },
     log,
+    pendingEvents,
   );
 
   // settings changes must take effect without an edit: disabling a rule has to

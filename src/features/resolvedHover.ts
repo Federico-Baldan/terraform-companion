@@ -7,7 +7,7 @@ import {
   UNKNOWN,
   type ValueShape,
 } from '../core/evaluator';
-import { spanContains } from '../core/hcl';
+import { spanContainsExclusiveEnd } from '../core/hcl';
 import type { ParsedFile, Pos } from '../core/model';
 import { baseName } from '../core/paths';
 import type { WorkspaceIndex } from '../core/workspaceIndex';
@@ -24,7 +24,9 @@ export function definitionAt(file: ParsedFile, pos: Pos): DefinitionHit | undefi
     if (block.kind === 'locals') {
       for (const attr of block.attrs) {
         const { row, column } = attr.span.start;
-        if (pos.row === row && pos.column >= column && pos.column <= column + attr.name.length) {
+        // `<`, not `<=`: the column just past the name is the whitespace or `=`
+        // that follows it, not part of the name
+        if (pos.row === row && pos.column >= column && pos.column < column + attr.name.length) {
           return { kind: 'local', name: attr.name };
         }
       }
@@ -303,7 +305,10 @@ const MAX_ROW_VALUE_CHARS = 2_000;
 
 export function computeHover(file: ParsedFile, pos: Pos, ctx: HoverContext): string | undefined {
   const ref = file.refs.find(
-    (r) => (r.parts[0] === 'var' || r.parts[0] === 'local') && spanContains(r.span, pos),
+    // exclusive end: a reference is a token, so the column just past it belongs
+    // to whatever follows — the `}` of "${var.env}", or the trailing space
+    (r) =>
+      (r.parts[0] === 'var' || r.parts[0] === 'local') && spanContainsExclusiveEnd(r.span, pos),
   );
   // keep the whole reference, path included — truncating local.cfg.db.host to
   // local.cfg would report the enclosing object instead of the field

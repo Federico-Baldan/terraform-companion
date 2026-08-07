@@ -1,4 +1,4 @@
-import { copyFileSync, mkdirSync } from 'node:fs';
+import { copyFileSync, mkdirSync, rmSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { dirname, join } from 'node:path';
 import { build, context } from 'esbuild';
@@ -20,6 +20,11 @@ const options = {
   sourcemap: true,
   logLevel: 'info',
 };
+
+// dist/ is not in .vscodeignore, so anything stale left there ships inside the
+// VSIX. A wasm file renamed by a dependency bump, or a scratch copy from a
+// manual test, survives every later build otherwise: rebuild it from empty.
+rmSync('dist', { recursive: true, force: true });
 
 // web-tree-sitter runtime wasm + terraform grammar wasm must sit next to the bundle
 mkdirSync('dist', { recursive: true });

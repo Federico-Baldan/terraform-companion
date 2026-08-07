@@ -14,6 +14,19 @@ export function spanContains(span: Span, pos: Pos): boolean {
   return true;
 }
 
+/** `spanContains` with the end treated as exclusive, which is how tree-sitter
+ *  reports it.
+ *
+ *  For a block the inclusive end is what you want — the closing brace is part
+ *  of the block. For a *token* it is one column too generous: `var.a` spanning
+ *  columns 6-11 occupies 6-10, so the inclusive test also claimed column 11 —
+ *  the `}` in `"${var.env}"`, or the space after the reference — and the hover
+ *  popped one character past its target. */
+export function spanContainsExclusiveEnd(span: Span, pos: Pos): boolean {
+  if (!spanContains(span, pos)) return false;
+  return !(pos.row === span.end.row && pos.column === span.end.column);
+}
+
 export function attrOf(block: TfBlock, name: string): TfBlock['attrs'][number] | undefined {
   return block.attrs.find((a) => a.name === name);
 }

@@ -20,15 +20,36 @@ export function registerIndexSync(
    *  those reach instead of the whole workspace */
   onChanged: (changed: string[]) => void,
   log?: (m: string) => void,
+  /** Filesystem events that landed while the initial index was still being
+   *  built, replayed once the watchers below are wired. See `activate`. */
+  initialEvents: readonly { uri: vscode.Uri; deleted: boolean }[] = [],
 ): void {
+  /** Both maps below are keyed by the *normalized* spelling of a path.
+   *
+   *  VS Code hands out `fsPath` with backslashes on Windows, while
+   *  `index.pathsUnder()` returns normalized keys. Keying on the raw path made
+   *  every lookup that crosses the two spellings miss: the nested-delete sweep
+   *  could not find the timers it exists to cancel, so an armed debounce put a
+   *  deleted file straight back into the index, and `supersede` wrote a second,
+   *  unrelated epoch entry that guarded nothing. */
   const timers = new Map<string, ReturnType<typeof setTimeout>>();
   /** Bumped when a path's content is superseded. A disk read started before the
    *  bump compares its token after the await and drops its result. */
   const epoch = new Map<string, number>();
   const supersede = (path: string): number => {
-    const next = (epoch.get(path) ?? 0) + 1;
-    epoch.set(path, next);
+    const key = normalizePath(path);
+    const next = (epoch.get(key) ?? 0) + 1;
+    epoch.set(key, next);
     return next;
+  };
+  const tokenOf = (path: string): number | undefined => epoch.get(normalizePath(path));
+  const clearTimerFor = (path: string): void => {
+    const key = normalizePath(path);
+    const pending = timers.get(key);
+    if (pending) {
+      clearTimeout(pending);
+      timers.delete(key);
+    }
   };
   /** Ancestors of every path the three maps above can hold. Seeded from the
    *  initial scan, then extended as timers arm and disk reads start, so it
@@ -52,7 +73,15 @@ export function registerIndexSync(
    *  where the buffer debounce and the disk watcher both report the same path. */
   const pendingChanged = new Set<string>();
   let flushTimer: ReturnType<typeof setTimeout> | undefined;
+  /** Clearing the timers on dispose is not enough on its own. A disk read that
+   *  started before the teardown resolves after it, and `announce` would then
+   *  arm a *fresh* coalesce timer — `flushTimer` having just been cleared is
+   *  precisely what makes it look idle — which fires onChanged into a disposed
+   *  DiagnosticCollection. `set` on one throws, and nothing awaits a timer
+   *  callback, so it surfaces as an unhandled extension-host error. */
+  let disposed = false;
   const announce = (paths: readonly string[]): void => {
+    if (disposed) return;
     for (const p of paths) pendingChanged.add(p);
     if (flushTimer || pendingChanged.size === 0) return;
     flushTimer = setTimeout(() => {
@@ -73,12 +102,11 @@ export function registerIndexSync(
     // a .tf opened from outside the workspace must not join (and stay in) the index
     if (!vscode.workspace.getWorkspaceFolder(doc.uri)) return;
     tracked.add(path);
-    const pending = timers.get(path);
-    if (pending) clearTimeout(pending);
+    clearTimerFor(path);
     timers.set(
-      path,
+      normalizePath(path),
       setTimeout(async () => {
-        timers.delete(path);
+        timers.delete(normalizePath(path));
         // the buffer is newer: an in-flight disk read must not land on top of it
         supersede(path);
         // Nothing awaits this callback, so a throw here lands on the extension
@@ -112,7 +140,7 @@ export function registerIndexSync(
    *  listed in `textDocuments`, and letting its own dirty state veto the read is
    *  exactly backwards — its text is the text being discarded. */
   const refreshFromDisk = async (uri: vscode.Uri, ignoreDirtyOf?: vscode.TextDocument) => {
-    if (isExcludedTfPath(uri.fsPath)) return;
+    if (disposed || isExcludedTfPath(uri.fsPath)) return;
     if (
       vscode.workspace.textDocuments.some(
         (d) => d !== ignoreDirtyOf && d.isDirty && d.uri.fsPath === uri.fsPath,
@@ -126,7 +154,7 @@ export function registerIndexSync(
       const text = new TextDecoder().decode(await vscode.workspace.fs.readFile(uri));
       // A delete can land mid-read: the bytes still arrive, and writing them
       // would put the file back into the index after removeFile took it out.
-      if (epoch.get(uri.fsPath) !== token) return;
+      if (disposed || tokenOf(uri.fsPath) !== token) return;
       // a save makes this re-read what the 500ms buffer debounce already
       // parsed, so without the guard every save costs two full refresh rounds
       if (await index.updateFile(uri.fsPath, text)) announce([uri.fsPath]);
@@ -145,13 +173,13 @@ export function registerIndexSync(
   const dropUnder = (dirPath: string): void => {
     const prefix = `${normalizePath(dirPath)}/`;
     for (const [key, timer] of timers) {
-      if (normalizePath(key).startsWith(prefix)) {
+      if (key.startsWith(prefix)) {
         clearTimeout(timer);
         timers.delete(key);
       }
     }
     for (const key of [...epoch.keys()]) {
-      if (normalizePath(key).startsWith(prefix)) supersede(key);
+      if (key.startsWith(prefix)) supersede(key);
     }
     const gone = index.pathsUnder(dirPath);
     if (gone.length === 0) return;
@@ -174,15 +202,28 @@ export function registerIndexSync(
       log?.(`Not indexed (scan failed): ${folder.uri.fsPath}: ${e}`);
       return;
     }
-    const added: string[] = [];
+    if (disposed) return;
+    // Every token is taken up front, before the first await — not one per
+    // iteration inside it. `dropUnder` can only supersede a path that already
+    // has an `epoch` entry, so taking them lazily left every file the loop had
+    // not reached yet with nothing to supersede: removing the folder mid-scan
+    // retracted only the part already indexed, and the scan then walked on and
+    // re-inserted the rest. Those files stayed indexed for the whole session,
+    // with diagnostics, for a folder no longer in the workspace.
+    const tokens = new Map<string, number>();
     for (const uri of uris) {
       if (isExcludedTfPath(uri.fsPath)) continue;
       tracked.add(uri.fsPath);
-      const token = supersede(uri.fsPath);
+      tokens.set(uri.fsPath, supersede(uri.fsPath));
+    }
+    const added: string[] = [];
+    for (const uri of uris) {
+      const token = tokens.get(uri.fsPath);
+      if (token === undefined) continue;
       try {
         const text = new TextDecoder().decode(await vscode.workspace.fs.readFile(uri));
         // the folder can be removed again while this scan is still running
-        if (epoch.get(uri.fsPath) !== token) continue;
+        if (disposed || tokenOf(uri.fsPath) !== token) continue;
         if (await index.updateFile(uri.fsPath, text)) added.push(uri.fsPath);
       } catch (e) {
         log?.(`Not indexed (unreadable or parse failed): ${uri.fsPath}: ${e}`);
@@ -218,6 +259,7 @@ export function registerIndexSync(
   context.subscriptions.push(
     {
       dispose: () => {
+        disposed = true;
         for (const t of timers.values()) clearTimeout(t);
         timers.clear();
         // a flush after deactivation would touch a disposed diagnostic
@@ -255,11 +297,7 @@ export function registerIndexSync(
       if (!isTfPath(path) || isExcludedTfPath(path)) return;
       if (!vscode.workspace.getWorkspaceFolder(doc.uri)) return;
       // an armed timer still holds the text that is being discarded
-      const pending = timers.get(path);
-      if (pending) {
-        clearTimeout(pending);
-        timers.delete(path);
-      }
+      clearTimerFor(path);
       void refreshFromDisk(doc.uri, doc);
     }),
     // Removing a folder from a multi-root workspace fires no filesystem event —
@@ -283,17 +321,22 @@ export function registerIndexSync(
     // git pull, terraform fmt in a terminal, codegen: none of these pass through
     // onDidChangeTextDocument, so unopened files would keep their old content
     watcher.onDidChange((uri) => void refreshFromDisk(uri)),
-    watcher.onDidDelete((uri) => {
+    watcher.onDidDelete((uri) => handleDelete(uri)),
+  );
+
+  for (const e of initialEvents) {
+    if (e.deleted) handleDelete(e.uri);
+    else void refreshFromDisk(e.uri);
+  }
+
+  function handleDelete(uri: vscode.Uri): void {
+    {
       // same exclusion as the create side: never indexed, so the removal is a
       // no-op and the refresh it triggers is waste
       if (isExcludedTfPath(uri.fsPath)) return;
       // An edit inside the debounce window leaves a timer armed with the
       // buffer's text; firing it after removeFile puts the file straight back.
-      const pending = timers.get(uri.fsPath);
-      if (pending) {
-        clearTimeout(pending);
-        timers.delete(uri.fsPath);
-      }
+      clearTimerFor(uri.fsPath);
       // and invalidate any disk read still in flight, for the same reason
       supersede(uri.fsPath);
       // This glob also matches a *directory* named like a .tf file — legal, if
@@ -308,16 +351,12 @@ export function registerIndexSync(
       // passes over the index.
       const nested = tracked.mayContain(uri.fsPath) ? index.pathsUnder(uri.fsPath) : [];
       for (const p of nested) {
-        const t = timers.get(p);
-        if (t) {
-          clearTimeout(t);
-          timers.delete(p);
-        }
+        clearTimerFor(p);
         supersede(p);
       }
       index.removeFile(uri.fsPath);
       for (const p of nested) index.removeFile(p);
       announce([uri.fsPath, ...nested]);
-    }),
-  );
+    }
+  }
 }

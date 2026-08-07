@@ -32,10 +32,17 @@ function unboundedFinding(version: TfAttr, what: 'provider' | 'module'): LintFin
 
 export function detectVersionHygiene(file: ParsedFile, opts: HygieneOptions): LintFinding[] {
   const findings: LintFinding[] = [];
-  walkBlocks(file.blocks, (block) => {
+  // `module` and `variable` are declarations only at the top level of a file —
+  // `workspaceIndex.declarationsOf` states the same rule and guards for it.
+  // Walking nested blocks made any provider-nested block that happens to carry
+  // one of those names a declaration: `resource "azuredevops_variable_group"`
+  // holds real `variable { … }` blocks, and each one was flagged as an
+  // undocumented Terraform variable. The `"?"` in the message was the tell —
+  // nested blocks have no labels.
+  for (const block of file.blocks) {
     if (block.kind === 'module') {
       const source = attrOf(block, 'source');
-      if (!source || !isRegistryModuleSource(stripQuotes(source.valueText))) return;
+      if (!source || !isRegistryModuleSource(stripQuotes(source.valueText))) continue;
       const version = attrOf(block, 'version');
       if (!version) {
         findings.push({
@@ -43,14 +50,9 @@ export function detectVersionHygiene(file: ParsedFile, opts: HygieneOptions): Li
           message: `Module "${block.labels[0] ?? '?'}" has no version: environments can silently drift apart.`,
           span: source.span,
         });
-        return;
+        continue;
       }
       const unbounded = unboundedFinding(version, 'module');
-      if (unbounded) findings.push(unbounded);
-    } else if (block.kind === 'provider_requirement') {
-      const version = attrOf(block, 'version');
-      if (!version) return;
-      const unbounded = unboundedFinding(version, 'provider');
       if (unbounded) findings.push(unbounded);
     } else if (block.kind === 'variable' && opts.variableDocs) {
       const missing = ['description', 'type'].filter((name) => !attrOf(block, name));
@@ -68,6 +70,16 @@ export function detectVersionHygiene(file: ParsedFile, opts: HygieneOptions): Li
         });
       }
     }
+  }
+  // `provider_requirement` is the one kind that legitimately lives nested: the
+  // parser synthesises it under `terraform { required_providers { … } }`, so it
+  // still needs the recursive walk.
+  walkBlocks(file.blocks, (block) => {
+    if (block.kind !== 'provider_requirement') return;
+    const version = attrOf(block, 'version');
+    if (!version) return;
+    const unbounded = unboundedFinding(version, 'provider');
+    if (unbounded) findings.push(unbounded);
   });
   return findings;
 }

@@ -66,13 +66,14 @@ function toAttr(node: Node): TfAttr | undefined {
  *  become synthetic blocks kind:"provider_requirement", labels:[entry name].
  *  The legacy string form `aws = ">= 5.0"` becomes the same block with only a
  *  version attribute (Terraform implies source hashicorp/<name>). */
-function providerRequirements(attr: Node): TfBlock | undefined {
+function providerRequirements(attr: Node, ctx: WalkCtx): TfBlock | undefined {
   const name = attr.namedChild(0);
   const value = attr.namedChildren.find((c) => c !== null && c.type === 'expression');
   if (!name || !value) return undefined;
-  const object = firstDescendant(value, 'object');
+  const object = firstDescendant(value, 'object', ctx);
   if (!object) {
-    const str = firstDescendant(value, 'string_lit') ?? firstDescendant(value, 'quoted_template');
+    const str =
+      firstDescendant(value, 'string_lit', ctx) ?? firstDescendant(value, 'quoted_template', ctx);
     if (!str) return undefined;
     return {
       kind: 'provider_requirement',
@@ -105,17 +106,52 @@ function providerRequirements(attr: Node): TfBlock | undefined {
   };
 }
 
-function firstDescendant(node: Node, type: string): Node | undefined {
+/** Hard cap on how deep the CST walks below may recurse.
+ *
+ *  tree-sitter produces a CST as deep as the source nests, and these walks are
+ *  plain recursion, so deeply nested HCL — thousands of nested brackets, a
+ *  half-typed file with runaway braces, a generated .tfvars — overflowed the JS
+ *  stack and threw RangeError straight out of `parseFile`. Only three of its
+ *  six call sites wrapped that; the rest handed the extension host an unhandled
+ *  rejection, and the index silently dropped the file either way.
+ *
+ *  Bounding it here makes the failure representable rather than fatal: the walk
+ *  stops and the file is reported with `hasError`, which every consumer already
+ *  reads as "what I can see is a floor, not the whole truth" — so the
+ *  count→for_each rewrite and the unused-local lint withhold instead of acting
+ *  on a truncated view.
+ *
+ *  500 is far past any hand-written Terraform and well below the ~2000-3000
+ *  frames where the stack actually gives out — measured, and it varies with
+ *  what else is on the stack, so VS Code's deeper provider stacks trip lower
+ *  than a test runner does. */
+const MAX_CST_DEPTH = 500;
+
+/** Shared across one file's walks: records that a cap fired, so `parseFile` can
+ *  report the result as incomplete instead of as a clean read. */
+interface WalkCtx {
+  truncated: boolean;
+}
+
+function firstDescendant(node: Node, type: string, ctx: WalkCtx, depth = 0): Node | undefined {
   if (node.type === type) return node;
+  if (depth >= MAX_CST_DEPTH) {
+    ctx.truncated = true;
+    return undefined;
+  }
   for (const c of node.namedChildren) {
     if (!c) continue;
-    const found = firstDescendant(c, type);
+    const found = firstDescendant(c, type, ctx, depth + 1);
     if (found) return found;
   }
   return undefined;
 }
 
-function toBlock(node: Node): TfBlock | undefined {
+function toBlock(node: Node, ctx: WalkCtx, depth = 0): TfBlock | undefined {
+  if (depth >= MAX_CST_DEPTH) {
+    ctx.truncated = true;
+    return undefined;
+  }
   const kindNode = node.namedChild(0);
   if (kindNode?.type !== 'identifier') return undefined;
   const kind = kindNode.text;
@@ -133,11 +169,11 @@ function toBlock(node: Node): TfBlock | undefined {
         const attr = toAttr(c);
         if (attr) attrs.push(attr);
         if (kind === 'required_providers') {
-          const req = providerRequirements(c);
+          const req = providerRequirements(c, ctx);
           if (req) blocks.push(req);
         }
       } else if (c.type === 'block') {
-        const b = toBlock(c);
+        const b = toBlock(c, ctx, depth + 1);
         if (b) blocks.push(b);
       }
     }
@@ -154,7 +190,11 @@ function toBlock(node: Node): TfBlock | undefined {
 
 /** Collect `variable_expr (get_attr)*` chains as references. Bare identifiers
  *  (object keys, attr names) are excluded — fewer than 2 parts. */
-function collectRefs(node: Node, refs: TfRef[]): void {
+function collectRefs(node: Node, refs: TfRef[], ctx: WalkCtx, depth = 0): void {
+  if (depth >= MAX_CST_DEPTH) {
+    ctx.truncated = true;
+    return;
+  }
   // Hoisted once per node. `namedChild(i)` marshals a node across the wasm
   // boundary and is O(log n) by the library's own documentation, and this loop
   // called it ~2k+1 times per node with k children — plus a second time for the
@@ -200,7 +240,7 @@ function collectRefs(node: Node, refs: TfRef[]): void {
       }
       i = j;
     } else {
-      collectRefs(c, refs);
+      collectRefs(c, refs, ctx, depth + 1);
       i++;
     }
   }
@@ -240,6 +280,7 @@ export function parseFile(path: string, source: string): ParsedFile {
   // destructive count→for_each rewrite. Recorded so a caller can tell "nothing
   // references this" from "I could not read what references this".
   let hasError = true;
+  const ctx: WalkCtx = { truncated: false };
   if (tree) {
     // same finally as withExpressionNode: the walks below are the only thing
     // between allocation and delete, and a throw there would strand the tree
@@ -250,7 +291,7 @@ export function parseFile(path: string, source: string): ParsedFile {
         for (const c of bodyNode.namedChildren) {
           if (!c) continue;
           if (c.type === 'block') {
-            const b = toBlock(c);
+            const b = toBlock(c, ctx);
             if (b) blocks.push(b);
           } else if (c.type === 'attribute') {
             // top-level attribute (tfvars files)
@@ -268,8 +309,10 @@ export function parseFile(path: string, source: string): ParsedFile {
           }
         }
       }
-      collectRefs(tree.rootNode, refs);
-      hasError = tree.rootNode.hasError;
+      collectRefs(tree.rootNode, refs, ctx);
+      // a truncated walk is reported exactly like error recovery: in both cases
+      // `blocks` and `refs` are a floor rather than the whole file
+      hasError = tree.rootNode.hasError || ctx.truncated;
     } finally {
       tree.delete();
     }

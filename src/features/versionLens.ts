@@ -4,6 +4,7 @@ import {
   CEILING_OPS,
   type ConstraintClause,
   clauseAdmits,
+  LOWER_BOUND_OPS,
   parseConstraint,
   pivotClause,
 } from '../registry/constraints';
@@ -116,7 +117,16 @@ function partitionClauses(
   const ceilings: ConstraintClause[] = [];
   const dropped: ConstraintClause[] = [];
   for (const clause of clauses) {
-    if (clause === pivot) continue; // replaced by `latest`
+    if (clause === pivot) {
+      // The pivot is replaced by `latest`, which is only "raising this clause"
+      // when it actually is a lower bound. With no lower bound written at all,
+      // `pivotClause` falls back to `clauses[0]` — so whichever ceiling or `!=`
+      // happened to be typed first was rewritten away and never reported. The
+      // same edit then carried two different explanations depending on the
+      // order the user wrote the clauses in.
+      if (!LOWER_BOUND_OPS.has(clause.op)) dropped.push(clause);
+      continue;
+    }
     if (CEILING_OPS.has(clause.op) && clauseAdmits(clause, latest)) ceilings.push(clause);
     else dropped.push(clause);
   }

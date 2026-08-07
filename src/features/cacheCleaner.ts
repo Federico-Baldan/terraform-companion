@@ -156,6 +156,16 @@ async function hasCachePayload(tfDir: string): Promise<boolean> {
     }
     // a symlink is unlinked rather than emptied, so it reclaims nothing here
     if (!st.isDirectory()) continue;
+    // `plugins` has to ask the same question the delete will. A legacy
+    // `plugins/<os>_<arch>/` with no lock.json is deliberately kept by
+    // `reclaimablePluginEntries`, but a plain readdir counted it as payload —
+    // so a cache nothing would ever reclaim was reported stale, "cleaned",
+    // counted as freed bytes, and (its mtime never moving) offered again on
+    // every window open, forever.
+    if (sub === 'plugins') {
+      if ((await reclaimablePluginEntries(p)).length > 0) return true;
+      continue;
+    }
     try {
       if ((await readdir(p)).length > 0) return true;
     } catch {
@@ -365,7 +375,7 @@ async function reclaimablePluginEntries(pluginsDir: string): Promise<string[]> {
  *  symlink guard firing, the one case the guard exists for — indistinguishable
  *  from success at the call site, which then counted the bytes as freed and
  *  logged a clean. */
-export type CleanResult = { ok: true } | { ok: false; reason: string };
+export type CleanResult = { ok: true; removed: number } | { ok: false; reason: string };
 
 /** Remove the reclaimable parts of a cache, leaving `.terraform` itself and the
  *  metadata beside it in place. Deleting the directory wholesale also took
@@ -373,14 +383,23 @@ export type CleanResult = { ok: true } | { ok: false; reason: string };
  *  user's selected workspace and lost a `-backend-config` module's settings —
  *  for no space, since the bytes are all in the subdirectories below.
  *
- *  Every path is resolved and proven to land inside `workspaceRoot` first.
+ *  Every path is resolved and proven to land inside `workspaceRoot`, and then
+ *  re-proven immediately before each individual `rm`.
+ *
  *  `rm` resolves symlinks in *parent* components (verified: an `rm` of
  *  `<root>/mod/.terraform/providers` with `.terraform` a link deletes the
  *  target's `providers` outside the tree), so the name check and the `lstat`
  *  alone left a window — anything replacing `.terraform` with a symlink between
  *  the two, a `direnv` hook or a `make init` doing `rm -rf .terraform && ln -s`,
- *  redirected a recursive delete out of the workspace. Resolving first collapses
- *  that window and makes the escape unrepresentable rather than merely unlikely. */
+ *  redirected a recursive delete out of the workspace.
+ *
+ *  Proving containment once was not enough either: `realDir` is a path *string*,
+ *  not a handle, and this issues up to three independent removals. A swap
+ *  landing between two of them redirected every remaining delete — and the
+ *  function still reported success, so the caller logged a clean and counted the
+ *  bytes as freed. Node exposes no handle-relative remove, so the window cannot
+ *  be closed outright; re-proving per victim narrows it to one syscall pair and
+ *  turns the swap into a refusal instead of an escape. */
 export async function deleteCachePayload(
   tfDir: string,
   workspaceRoot: string,
@@ -414,6 +433,26 @@ export async function deleteCachePayload(
   }
 
   const failures: string[] = [];
+  let removed = 0;
+
+  /** Re-prove one victim right before it is removed. `'gone'` is the ordinary
+   *  race (already deleted, never existed); `'escaped'` means the path now
+   *  resolves somewhere it must never be removed from, which is a refusal the
+   *  caller has to hear about rather than a silent skip. */
+  const prove = async (victim: string): Promise<{ real: string } | 'gone' | 'escaped'> => {
+    let real: string;
+    try {
+      real = await realpath(victim);
+    } catch {
+      return 'gone';
+    }
+    if (!isInside(realRoot, real)) return 'escaped';
+    // still under a .terraform, and still under the one we vetted: a swap that
+    // keeps the path inside the workspace is still not ours to delete
+    if (!isInside(realDir, real)) return 'escaped';
+    return { real };
+  };
+
   for (const sub of CACHE_SUBDIRS) {
     const target = join(realDir, sub);
     let st: Awaited<ReturnType<typeof lstat>>;
@@ -432,6 +471,13 @@ export async function deleteCachePayload(
       sub === 'plugins' ? await reclaimablePluginEntries(target) : [null as string | null];
     for (const name of names) {
       const victim = name === null ? target : join(target, name);
+      const label = name === null ? sub : `${sub}/${name}`;
+      const proof = await prove(victim);
+      if (proof === 'gone') continue;
+      if (proof === 'escaped') {
+        failures.push(`${label}: no longer resolves inside the cache — refused`);
+        continue;
+      }
       try {
         // maxRetries defaults to 0, so the single most common cause of a failed
         // rm -rf — antivirus or the search indexer briefly holding a provider
@@ -440,13 +486,15 @@ export async function deleteCachePayload(
         // straight out of the loop, so `modules` was never even attempted and
         // the half-deleted provider tree left `terraform init` failing with
         // "could not find executable file" instead of re-downloading.
-        await rm(victim, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+        // the re-proved path, not the one built from the snapshot
+        await rm(proof.real, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+        removed++;
       } catch (e) {
-        failures.push(`${name === null ? sub : `${sub}/${name}`}: ${e}`);
+        failures.push(`${label}: ${e}`);
       }
     }
   }
   return failures.length === 0
-    ? { ok: true }
+    ? { ok: true, removed }
     : { ok: false, reason: `partially cleaned — ${failures.join('; ')}` };
 }
