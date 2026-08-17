@@ -9,6 +9,11 @@
     "type": "git",
     "url": "https://github.com/Federico-Baldan/terraform-companion.git"
   },
+  "homepage": "https://github.com/Federico-Baldan/terraform-companion#readme",
+  "bugs": {
+    "url": "https://github.com/Federico-Baldan/terraform-companion/issues"
+  },
+  "qna": "https://github.com/Federico-Baldan/terraform-companion/issues",
   "icon": "assets/logo/icon-256.png",
   "engines": {
     "vscode": "^1.125.0"

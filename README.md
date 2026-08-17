@@ -12,6 +12,16 @@
 <p align="center"><em>What does that <code>var.*</code> or <code>local.*</code> actually resolve to? Hover and find out.</em></p>
 
 <p align="center">
+  <a href="https://marketplace.visualstudio.com/items?itemName=Federico-Baldan.tf-companion"><img src="https://img.shields.io/visual-studio-marketplace/v/Federico-Baldan.tf-companion?label=marketplace&amp;color=7B42BC" alt="VS Code Marketplace version"></a>
+  <a href="https://github.com/Federico-Baldan/terraform-companion/actions/workflows/ci.yml"><img src="https://github.com/Federico-Baldan/terraform-companion/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT licence"></a>
+</p>
+
+<p align="center">
+  <a href="https://marketplace.visualstudio.com/items?itemName=Federico-Baldan.tf-companion"><strong>Install from the VS Code Marketplace →</strong></a>
+</p>
+
+<p align="center">
   <img src="assets/demos/resolved-hover-demo.gif" alt="Hovering over a var or local shows its resolved value">
 </p>
 
@@ -20,6 +30,14 @@
 You almost certainly already run the [HashiCorp Terraform](https://marketplace.visualstudio.com/items?itemName=HashiCorp.terraform) extension. Keep it. Formatting, completion, syntax and validation all go through terraform-ls, and nothing here reaches into any of that.
 
 This fills the gaps terraform-ls leaves: it won't tell you a provider constraint is a major release behind, and it won't tell you what `var.environment` resolves to until you run a plan. Install both and they stay out of each other's way.
+
+## Install
+
+[**Terraform Companion on the VS Code Marketplace**](https://marketplace.visualstudio.com/items?itemName=Federico-Baldan.tf-companion) — or from the command line:
+
+```bash
+code --install-extension Federico-Baldan.tf-companion
+```
 
 Requires VS Code 1.125 or newer. Activates on `.tf` / `.tfvars` files.
 
@@ -110,4 +128,8 @@ npm run lint       # biome check
 npm run package    # .vsix
 ```
 
+## Licence
+
 MIT.
+
+Built by [Federico Baldan](https://federico.baldan.dev). Bugs and feature requests go in [Issues](https://github.com/Federico-Baldan/terraform-companion/issues).
