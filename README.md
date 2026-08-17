@@ -12,7 +12,7 @@
 <p align="center"><em>What does that <code>var.*</code> or <code>local.*</code> actually resolve to? Hover and find out.</em></p>
 
 <p align="center">
-  <a href="https://marketplace.visualstudio.com/items?itemName=Federico-Baldan.tf-companion"><img src="https://img.shields.io/visual-studio-marketplace/v/Federico-Baldan.tf-companion?label=marketplace&amp;color=7B42BC" alt="VS Code Marketplace version"></a>
+  <a href="https://marketplace.visualstudio.com/items?itemName=Federico-Baldan.tf-companion"><img src="https://vsmarketplacebadges.dev/version-short/Federico-Baldan.tf-companion.svg?label=marketplace&amp;color=7B42BC" alt="VS Code Marketplace version"></a>
   <a href="https://github.com/Federico-Baldan/terraform-companion/actions/workflows/ci.yml"><img src="https://github.com/Federico-Baldan/terraform-companion/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT licence"></a>
 </p>
