@@ -84,7 +84,7 @@
         "tfCompanion.cacheCleaner.enabled": {
           "type": "boolean",
           "default": true,
-          "description": "On startup, offer to delete .terraform folders (cache only) of modules with no recent activity"
+          "description": "On startup, offer to delete the cached providers and modules of .terraform folders with no recent activity. The prompt names the folders, and Review… lists every path, size and subdirectory before anything is deleted"
         },
         "tfCompanion.cacheCleaner.staleDays": {
           "type": "number",
@@ -95,7 +95,7 @@
         "tfCompanion.cacheCleaner.autoDelete": {
           "type": "boolean",
           "default": false,
-          "description": "Delete stale .terraform folders automatically, without asking for confirmation (default: ask first)"
+          "description": "Delete the stale .terraform caches automatically, without asking for confirmation. The folders and the subdirectories removed are still listed in the Terraform Companion output channel (default: ask first, naming the folders)"
         },
         "tfCompanion.resolvedHover.enabled": {
           "type": "boolean",

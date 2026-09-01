@@ -222,8 +222,12 @@ describe('cache cleaner', () => {
     writeFileSync(join(cache, 'environment'), 'prod');
     writeFileSync(join(cache, 'terraform.tfstate'), '{"backend":{}}');
 
-    // providers + modules; the metadata files beside them are left in place
-    expect(await deleteCachePayload(cache, root)).toEqual({ ok: true, removed: 2 });
+    // providers + modules; the metadata files beside them are left in place.
+    // The names are asserted, not the count: they are what the prompt shows.
+    expect(await deleteCachePayload(cache, root)).toEqual({
+      ok: true,
+      removed: ['providers', 'modules'],
+    });
 
     expect(existsSync(join(cache, 'providers'))).toBe(false);
     expect(existsSync(join(cache, 'modules'))).toBe(false);
@@ -333,8 +337,10 @@ describe('cache cleaner', () => {
     const [found] = await findStaleTerraformDirs(root, 30, NOW);
     expect(found?.dir).toBe(cache);
 
-    // one entry removed: plugins/linux_amd64
-    expect(await deleteCachePayload(cache, root)).toEqual({ ok: true, removed: 1 });
+    expect(await deleteCachePayload(cache, root)).toEqual({
+      ok: true,
+      removed: ['plugins/linux_amd64'],
+    });
     expect(existsSync(join(cache, 'plugins', 'linux_amd64'))).toBe(false);
   });
 
@@ -353,8 +359,8 @@ describe('cache cleaner', () => {
     writeFileSync(join(cache, 'providers', 'bin'), 'refetchable');
 
     // only `providers` is reclaimed — the hand-placed platform dir is declined,
-    // so it must not be counted as something this delete removed
-    expect(await deleteCachePayload(cache, root)).toEqual({ ok: true, removed: 1 });
+    // so it must not be reported as something this delete removed
+    expect(await deleteCachePayload(cache, root)).toEqual({ ok: true, removed: ['providers'] });
 
     expect(existsSync(join(platform, 'terraform-provider-acme_v0.4.2'))).toBe(true);
     // the registry-managed half is still reclaimed
@@ -368,7 +374,10 @@ describe('cache cleaner', () => {
     mkdirSync(nested, { recursive: true });
     writeFileSync(join(nested, 'bin'), 'x');
 
-    expect(await deleteCachePayload(cache, root)).toEqual({ ok: true, removed: 1 });
+    expect(await deleteCachePayload(cache, root)).toEqual({
+      ok: true,
+      removed: ['plugins/registry.terraform.io'],
+    });
     expect(existsSync(join(cache, 'plugins', 'registry.terraform.io'))).toBe(false);
   });
 
@@ -433,6 +442,39 @@ describe('cache cleaner', () => {
     touch(join(mod, '.terraform', 'environment'), 90);
     touch(join(mod, '.terraform'), 90);
     expect(await findStaleTerraformDirs(root, 30, NOW)).toEqual([]);
+  });
+
+  /** The prompt renders this list, so it has to be what the delete targets —
+   *  same subdirs, same plugins lock.json rule — or the user approves one thing
+   *  and gets another. */
+  it('reports which directories a clean would remove', async () => {
+    const cache = makeModule(root, 'named', 60, 60);
+    mkdirSync(join(cache, 'modules'), { recursive: true });
+    writeFileSync(join(cache, 'modules', 'mod.json'), '{}');
+    mkdirSync(join(cache, 'plugins', 'linux_amd64'), { recursive: true });
+    writeFileSync(join(cache, 'plugins', 'linux_amd64', 'lock.json'), '{}');
+    // hand-placed, no lock.json: declined by the delete, so never listed
+    mkdirSync(join(cache, 'plugins', 'darwin_arm64'), { recursive: true });
+    writeFileSync(join(cache, 'plugins', 'darwin_arm64', 'terraform-provider-acme'), 'ELF');
+    writeFileSync(join(cache, 'environment'), 'prod');
+    for (const p of [
+      join(cache, 'modules'),
+      join(cache, 'plugins'),
+      join(cache, 'environment'),
+      cache,
+    ]) {
+      touch(p, 60);
+    }
+
+    const [found] = await findStaleTerraformDirs(root, 30, NOW);
+    expect(found?.entries).toEqual(['providers', 'plugins/linux_amd64', 'modules']);
+    // and the delete removes exactly that, nothing more
+    expect(await deleteCachePayload(found!.dir, root)).toEqual({
+      ok: true,
+      removed: found!.entries,
+    });
+    expect(existsSync(join(cache, 'plugins', 'darwin_arm64'))).toBe(true);
+    expect(readFileSync(join(cache, 'environment'), 'utf8')).toBe('prod');
   });
 
   it('sizes only the bytes it will actually reclaim', async () => {

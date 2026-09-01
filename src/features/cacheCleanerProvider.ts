@@ -1,3 +1,4 @@
+import { basename, dirname, isAbsolute, relative } from 'node:path';
 import * as vscode from 'vscode';
 import { cacheCleanerAutoDelete, cacheCleanerStaleDays, featureEnabled } from '../config';
 import {
@@ -22,6 +23,77 @@ const QUIET_SCAN_MS = 24 * 3_600_000;
 const IGNORE_SNOOZE_MS = 7 * 24 * 3_600_000;
 const SNOOZE_KEY = 'cacheCleaner.snoozeUntil';
 
+/** The workspace folder a cache was found under, kept beside it so the delete
+ *  can prove containment rather than trusting the path it was handed. */
+type FoundCache = StaleCache & { root: string };
+
+/** How many folders the notification names before it gives up and counts. VS
+ *  Code notifications are one line and strip newlines outright
+ *  (microsoft/vscode#101589), so a long list would be truncated mid-path —
+ *  which is worse than no list. Past this the "Review…" picker is the answer. */
+const NAMED_IN_PROMPT = 3;
+
+/** Opens the picker below. The ellipsis is VS Code's convention for a button
+ *  that leads to more UI rather than acting immediately. */
+const REVIEW = 'Review…';
+
+/** What to call a cache in the UI: the module directory it belongs to, relative
+ *  to the workspace folder it was found under. `.terraform` is the same name
+ *  every time and tells the reader nothing; the module path is what they
+ *  recognise, and it keeps the user's home directory out of a screenshot. Falls
+ *  back to the absolute path if the cache somehow does not sit under its root. */
+function moduleLabel(dir: string, root: string): string {
+  const mod = dirname(dir);
+  const rel = relative(root, mod);
+  if (rel === '') return basename(root) || root;
+  return rel.startsWith('..') || isAbsolute(rel) ? mod : rel;
+}
+
+/** ISO, never a locale format: this renders next to a Delete button, and a
+ *  dd/mm-vs-mm/dd misread is exactly the kind of mistake that costs a cache. */
+function activityDate(ms: number): string {
+  return ms > 0 ? new Date(ms).toISOString().slice(0, 10) : 'unknown';
+}
+
+/** `.terraform/providers, .terraform/modules` — the actual directories that go. */
+function victimList(c: StaleCache): string {
+  return c.entries.map((e) => `.terraform/${e}`).join(', ');
+}
+
+function nameList(caches: FoundCache[]): string {
+  const names = caches.map((c) => moduleLabel(c.dir, c.root));
+  if (names.length <= NAMED_IN_PROMPT) return names.join(', ');
+  return `${names.slice(0, NAMED_IN_PROMPT).join(', ')} and ${names.length - NAMED_IN_PROMPT} more`;
+}
+
+interface CacheItem extends vscode.QuickPickItem {
+  cache: FoundCache;
+}
+
+/** The list the notification cannot show. Everything is pre-checked, so Enter
+ *  is the same answer as "Delete all" — but the user has now seen the absolute
+ *  path, the size, the last-activity date and the exact subdirectories for
+ *  every single cache, and can uncheck any of them. */
+async function review(caches: FoundCache[], days: number): Promise<FoundCache[] | undefined> {
+  const items: CacheItem[] = caches.map((c) => ({
+    label: moduleLabel(c.dir, c.root),
+    description: `${formatSize(c.sizeBytes)} · last activity ${activityDate(c.lastActivityMs)}`,
+    detail: `${c.dir} — deletes ${victimList(c)}`,
+    picked: true,
+    cache: c,
+  }));
+  const picked = await vscode.window.showQuickPick(items, {
+    canPickMany: true,
+    title: `Stale .terraform caches — no activity for over ${days} days`,
+    placeHolder: 'Uncheck anything you want to keep, then press Enter to delete the rest',
+    // a destructive list must not disappear because the user clicked away to go
+    // and look at one of the paths it is asking about
+    ignoreFocusOut: true,
+    matchOnDetail: true,
+  });
+  return picked?.map((i) => i.cache);
+}
+
 export function registerCacheCleaner(
   context: vscode.ExtensionContext,
   log: (m: string) => void,
@@ -45,7 +117,12 @@ export function registerCacheCleaner(
   });
 }
 
-async function scan(
+/** The whole feature: walk, prompt, delete, report. Exported so the prompt and
+ *  the review picker can be driven against a real temp tree in tests — this is
+ *  the only code path that can delete a user's cache, and asserting on the
+ *  notification text is the only way to prove it names what it is about to
+ *  remove. `registerCacheCleaner` is the sole production caller. */
+export async function scan(
   log: (m: string) => void,
   cancelled: () => boolean,
   state: vscode.Memento,
@@ -62,14 +139,13 @@ async function scan(
     return;
   }
   const staleDays = cacheCleanerStaleDays();
+  const days = effectiveStaleDays(staleDays);
   const snooze = (ms: number) =>
     Promise.resolve(state.update(SNOOZE_KEY, Date.now() + ms)).then(undefined, (e) =>
       log(`cacheCleaner: could not record the snooze: ${e}`),
     );
 
-  // the workspace root each cache was found under, so the delete can prove
-  // containment rather than trusting the path it was handed
-  const stale: (StaleCache & { root: string })[] = [];
+  const stale: FoundCache[] = [];
   for (const folder of vscode.workspace.workspaceFolders ?? []) {
     // a multi-root workspace must not start the next folder's walk either
     if (cancelled()) return;
@@ -100,14 +176,37 @@ async function scan(
   }
 
   const total = unique.reduce((s, c) => s + c.sizeBytes, 0);
-  for (const c of unique) log(`cacheCleaner: stale ${c.dir} (${formatSize(c.sizeBytes)})`);
+  // the full inventory, always, whether or not a prompt is shown — with
+  // autoDelete on this is the only record of what was about to go
+  for (const c of unique) {
+    log(
+      `cacheCleaner: stale ${c.dir} (${formatSize(c.sizeBytes)}, last activity ${activityDate(c.lastActivityMs)}) — will delete ${victimList(c)}`,
+    );
+  }
+
+  let targets = unique;
   if (!cacheCleanerAutoDelete()) {
+    const plural = unique.length === 1 ? '' : 's';
+    const deleteLabel = unique.length === 1 ? 'Delete' : `Delete all ${unique.length}`;
+    // The folders are named, not just counted. "N .terraform folders, delete?"
+    // gave the user nothing to check the answer against, so the only available
+    // reply was a blind yes — and Review… puts the full list, with paths and
+    // sizes, one click away for when the names do not fit.
     const choice = await vscode.window.showWarningMessage(
-      `Terraform Companion: ${unique.length} .terraform folder${unique.length === 1 ? '' : 's'} with no activity for over ${effectiveStaleDays(staleDays)} days (about ${formatSize(total)}). Delete the cached providers and modules? terraform init recreates them, and the selected workspace and backend config are kept.`,
-      'Delete',
+      `Terraform Companion: stale .terraform cache${plural} in ${nameList(unique)} — no activity for over ${days} days, about ${formatSize(total)} of cached providers and modules. Delete? terraform init recreates them, and your state, selected workspace and backend config are kept.`,
+      REVIEW,
+      deleteLabel,
       'Ignore',
     );
-    if (choice !== 'Delete') {
+    if (choice === REVIEW) {
+      const picked = await review(unique, days);
+      // escaped, or unchecked everything: both mean "not now"
+      if (picked === undefined || picked.length === 0) {
+        await snooze(IGNORE_SNOOZE_MS);
+        return;
+      }
+      targets = picked;
+    } else if (choice !== deleteLabel) {
       // "Ignore" used to buy nothing: the identical prompt returned on the next
       // window open, forever, which is how a destructive prompt gets
       // click-throughed. Dismissing it now actually holds.
@@ -115,11 +214,15 @@ async function scan(
       return;
     }
   }
+  // caches the user looked at and deliberately kept. Without a snooze they are
+  // re-offered on the next window open, which trains exactly the click-through
+  // the prompt is trying to avoid.
+  const kept = unique.length - targets.length;
 
   let freed = 0;
-  let deleted = 0;
+  const cleaned: FoundCache[] = [];
   let failed = 0;
-  for (const c of unique) {
+  for (const c of targets) {
     if (cancelled()) return;
     if (!isTerraformCacheDir(c.dir)) continue; // hard guard: only .terraform dirs
     // the prompt may have sat open for a long time
@@ -143,18 +246,19 @@ async function scan(
       // already-empty cache and one nothing may reclaim both came back ok —
       // and both were counted as freed bytes. Two windows on the same repo
       // double-counted the same cache this way.
-      if (result.removed === 0) {
+      if (result.removed.length === 0) {
         log(`cacheCleaner: nothing reclaimable in ${c.dir}`);
         continue;
       }
-      deleted++;
+      cleaned.push(c);
       freed += c.sizeBytes;
-      log(`cacheCleaner: cleaned ${c.dir}`);
+      log(`cacheCleaner: cleaned ${c.dir} — removed ${result.removed.join(', ')}`);
     } catch (e) {
       failed++;
       log(`cacheCleaner: failed to clean ${c.dir}: ${e}`);
     }
   }
+  if (kept > 0) await snooze(IGNORE_SNOOZE_MS);
   // A partial delete is the case that matters: `rm -rf` removes files until it
   // hits EACCES, and the half-populated provider tree left behind makes
   // `terraform init` fail with "could not find executable file" instead of
@@ -163,17 +267,17 @@ async function scan(
   if (failed > 0) {
     vscode.window
       .showWarningMessage(
-        `Terraform Companion: ${failed} .terraform cache${failed === 1 ? '' : 's'} could not be cleaned${deleted > 0 ? ` (${deleted} succeeded)` : ''}. See the Terraform Companion output channel for details.`,
+        `Terraform Companion: ${failed} .terraform cache${failed === 1 ? '' : 's'} could not be cleaned${cleaned.length > 0 ? ` (${cleaned.length} succeeded)` : ''}. See the Terraform Companion output channel for details.`,
       )
       .then(undefined, (e) => log(`cacheCleaner: notification failed: ${e}`));
   }
-  if (deleted === 0) return;
+  if (cleaned.length === 0) return;
   // caught, not voided: this fires after a walk that may have taken a while, so
   // the window can be closing by now and a rejection would land on the
   // extension host as an unhandled one
   vscode.window
     .showInformationMessage(
-      `Terraform Companion: cleaned ${deleted} stale .terraform cache${deleted === 1 ? '' : 's'}, freed ${formatSize(freed)}. Those modules will need terraform init next time.`,
+      `Terraform Companion: cleaned the .terraform cache in ${nameList(cleaned)}, freed ${formatSize(freed)}. Those modules will need terraform init next time.`,
     )
     .then(undefined, (e) => log(`cacheCleaner: notification failed: ${e}`));
 }

@@ -92,7 +92,20 @@ It only offers the rewrite when the rewrite is safe. If `count.index` also drive
 
 ## .terraform cache cleanup
 
-On startup it looks for `.terraform` folders whose module hasn't been touched in 30 days, and asks before deleting. These are caches `terraform init` rebuilds. Your state is never touched: it lives in `terraform.tfstate` and `terraform.tfstate.d/` beside `.terraform`, not inside it, and `.terraform.lock.hcl` is a sibling too. What you do lose is the selected workspace, which resets to `default`, and the cached backend configuration — a module initialised with `terraform init -backend-config=…` needs those flags again. The scan never follows symlinks, so it can't wander out of the workspace, and it only ever removes a directory named exactly `.terraform`. Flip `cacheCleaner.autoDelete` on to skip the prompt.
+On startup it looks for `.terraform` folders whose module hasn't been touched in 30 days, and asks before deleting. These are caches `terraform init` rebuilds.
+
+**It tells you what it is about to delete.** The prompt names the modules — `infra/prod, modules/vpc` — rather than just counting them, and **Review…** opens a checklist with, for every cache, the full path, its size, the date it was last used and the exact subdirectories that go:
+
+```
+[x] infra/prod      12.0 MB · last activity 2026-05-04
+    /repo/infra/prod/.terraform — deletes .terraform/providers, .terraform/modules
+[x] modules/vpc      5.0 MB · last activity 2026-02-13
+    /repo/modules/vpc/.terraform — deletes .terraform/providers
+```
+
+Everything starts checked; uncheck anything you want to keep and only the rest is deleted. Whatever you choose, the Terraform Companion output channel gets the full inventory — one line per cache, with its path and its victims — before anything is removed.
+
+Only the cache goes. `providers`, `plugins` and `modules` are deleted; `.terraform` itself and the metadata beside it stay, so your selected workspace and your `-backend-config` settings survive. Your state is never touched either: it lives in `terraform.tfstate` and `terraform.tfstate.d/` beside `.terraform`, not inside it, and `.terraform.lock.hcl` is a sibling too. A pre-0.14 `plugins/<os>_<arch>/` with no `lock.json` is left alone — that is a hand-placed binary no `terraform init` can bring back. The scan never follows symlinks, so it can't wander out of the workspace, and it only ever removes a directory named exactly `.terraform`. Dismiss the prompt and it holds for a week instead of returning on the next window. Flip `cacheCleaner.autoDelete` on to skip the prompt entirely.
 
 ## Offline
 
@@ -112,9 +125,9 @@ All keys are under `tfCompanion.`
 | `unusedLocals.enabled` | `true` | |
 | `versionHygiene.enabled` | `true` | |
 | `versionHygiene.variableDocs` | `false` | also flag variables without `description` or `type` |
-| `cacheCleaner.enabled` | `true` | |
-| `cacheCleaner.staleDays` | `30` | floored at 1 |
-| `cacheCleaner.autoDelete` | `false` | delete without asking |
+| `cacheCleaner.enabled` | `true` | on startup, offer to delete the cache of modules with no recent activity |
+| `cacheCleaner.staleDays` | `30` | days of inactivity before a `.terraform` counts as stale; floored at 1 |
+| `cacheCleaner.autoDelete` | `false` | delete without asking — the folders are still listed in the output channel |
 
 ## Development
 

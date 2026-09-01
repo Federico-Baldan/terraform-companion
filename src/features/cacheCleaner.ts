@@ -6,6 +6,10 @@ export interface StaleCache {
   dir: string;
   sizeBytes: number;
   lastActivityMs: number;
+  /** Exactly what a clean would remove, relative to `dir` — `providers`,
+   *  `modules`, `plugins/<entry>`. Carried on the scan result so the prompt can
+   *  name the directories instead of asking for a blanket yes to a number. */
+  entries: string[];
 }
 
 /** Dependency and VCS trees only — dist, build, target, vendor stay out since
@@ -139,13 +143,26 @@ async function cacheSize(tfDir: string, cancelled?: () => boolean): Promise<numb
   return total;
 }
 
-/** Whether the deletion would actually reclaim anything.
+/** What a clean would remove from `tfDir`, and whether any of it is worth
+ *  removing.
  *
- *  Deliberately separate from `cacheSize`: that total is display-only and is
- *  deliberately bounded (depth cap, unreadable entries swallowed to 0), so
- *  using it to decide *reportability* meant a payload sitting below the cap, or
- *  one that could not be read, silently hid the whole cache from the feature. */
-async function hasCachePayload(tfDir: string): Promise<boolean> {
+ *  `entries` is the list the prompt shows, so it has to be exactly what
+ *  `deleteCachePayload` will target — same subdirectories, same symlink skip,
+ *  same `plugins` lock.json rule — or the user approves one thing and gets
+ *  another.
+ *
+ *  `hasPayload` is deliberately *not* derived from `cacheSize`: that total is
+ *  display-only and bounded (depth cap, unreadable entries swallowed to 0), so
+ *  using it to decide reportability meant a payload sitting below the cap, or
+ *  one that could not be read, silently hid the whole cache from the feature.
+ *  It is also not `entries.length > 0`: the delete leaves `.terraform`
+ *  standing, so a cache of empty directories would be offered again on every
+ *  single launch, forever. */
+export async function cacheTargets(
+  tfDir: string,
+): Promise<{ entries: string[]; hasPayload: boolean }> {
+  const entries: string[] = [];
+  let hasPayload = false;
   for (const sub of CACHE_SUBDIRS) {
     const p = join(tfDir, sub);
     let st: Awaited<ReturnType<typeof lstat>>;
@@ -154,7 +171,8 @@ async function hasCachePayload(tfDir: string): Promise<boolean> {
     } catch {
       continue; // not there
     }
-    // a symlink is unlinked rather than emptied, so it reclaims nothing here
+    // a symlink is unlinked rather than emptied, so it reclaims nothing and the
+    // delete skips it — it must not be listed as something we will remove
     if (!st.isDirectory()) continue;
     // `plugins` has to ask the same question the delete will. A legacy
     // `plugins/<os>_<arch>/` with no lock.json is deliberately kept by
@@ -163,17 +181,21 @@ async function hasCachePayload(tfDir: string): Promise<boolean> {
     // counted as freed bytes, and (its mtime never moving) offered again on
     // every window open, forever.
     if (sub === 'plugins') {
-      if ((await reclaimablePluginEntries(p)).length > 0) return true;
+      for (const name of await reclaimablePluginEntries(p)) {
+        entries.push(`${sub}/${name}`);
+        hasPayload = true;
+      }
       continue;
     }
+    entries.push(sub);
     try {
-      if ((await readdir(p)).length > 0) return true;
+      if ((await readdir(p)).length > 0) hasPayload = true;
     } catch {
       // unreadable: assume there is something rather than hide the cache
-      return true;
+      hasPayload = true;
     }
   }
-  return false;
+  return { entries, hasPayload };
 }
 
 /** Sibling files whose mtime counts as activity. `.json` and `.hcl` matter: a
@@ -288,12 +310,20 @@ export async function findStaleTerraformDirs(
       const p = join(dir, de.name);
       if (de.name === '.terraform') {
         const last = await lastActivity(p);
-        // A cache holding only metadata has nothing to reclaim, and since the
-        // deletion now leaves the directory standing, reporting it would mean
-        // prompting for the same folders on every single launch. Gated on the
-        // payload existing, not on its measured size — see hasCachePayload.
-        if (last < cutoff && (await hasCachePayload(p))) {
-          out.push({ dir: p, sizeBytes: await cacheSize(p, cancelled), lastActivityMs: last });
+        if (last < cutoff) {
+          // A cache holding only metadata has nothing to reclaim, and since the
+          // deletion now leaves the directory standing, reporting it would mean
+          // prompting for the same folders on every single launch. Gated on the
+          // payload existing, not on its measured size — see cacheTargets.
+          const { entries: victims, hasPayload } = await cacheTargets(p);
+          if (hasPayload) {
+            out.push({
+              dir: p,
+              sizeBytes: await cacheSize(p, cancelled),
+              lastActivityMs: last,
+              entries: victims,
+            });
+          }
         }
         continue; // never descend into .terraform
       }
@@ -374,8 +404,11 @@ async function reclaimablePluginEntries(pluginsDir: string): Promise<string[]> {
 /** What `deleteCachePayload` did. A bare `void` made a refusal — including the
  *  symlink guard firing, the one case the guard exists for — indistinguishable
  *  from success at the call site, which then counted the bytes as freed and
- *  logged a clean. */
-export type CleanResult = { ok: true; removed: number } | { ok: false; reason: string };
+ *  logged a clean.
+ *
+ *  `removed` names the entries rather than counting them, so the log and the
+ *  report say which directories actually went. */
+export type CleanResult = { ok: true; removed: string[] } | { ok: false; reason: string };
 
 /** Remove the reclaimable parts of a cache, leaving `.terraform` itself and the
  *  metadata beside it in place. Deleting the directory wholesale also took
@@ -433,7 +466,7 @@ export async function deleteCachePayload(
   }
 
   const failures: string[] = [];
-  let removed = 0;
+  const removed: string[] = [];
 
   /** Re-prove one victim right before it is removed. `'gone'` is the ordinary
    *  race (already deleted, never existed); `'escaped'` means the path now
@@ -488,7 +521,7 @@ export async function deleteCachePayload(
         // "could not find executable file" instead of re-downloading.
         // the re-proved path, not the one built from the snapshot
         await rm(proof.real, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
-        removed++;
+        removed.push(label);
       } catch (e) {
         failures.push(`${label}: ${e}`);
       }
