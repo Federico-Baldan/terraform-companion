@@ -2,6 +2,13 @@
 
 Notable changes to Terraform Companion. Versions follow semver; dates are ISO (YYYY-MM-DD).
 
+## [1.2.1](https://github.com/Federico-Baldan/terraform-companion/compare/v1.2.0...v1.2.1) (2026-09-13)
+
+
+### Bug Fixes
+
+* **deps:** update dependency web-tree-sitter to v0.27.0 ([#41](https://github.com/Federico-Baldan/terraform-companion/issues/41)) ([f40470f](https://github.com/Federico-Baldan/terraform-companion/commit/f40470fa88d0aca96f71fd485e2e4e3eba54d99e))
+
 ## [1.2.0](https://github.com/Federico-Baldan/terraform-companion/compare/v1.1.10...v1.2.0) (2026-09-01)
 
 
