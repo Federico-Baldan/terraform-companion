@@ -16,7 +16,7 @@
   "qna": "https://github.com/Federico-Baldan/terraform-companion/issues",
   "icon": "assets/logo/icon-256.png",
   "engines": {
-    "vscode": "^1.134.0"
+    "vscode": "^1.137.0"
   },
   "categories": [
     "Linters",
@@ -123,7 +123,7 @@
     "@biomejs/biome": "2.5.13",
     "@types/node": "24.13.4",
     "@types/semver": "7.8.0",
-    "@types/vscode": "1.134.0",
+    "@types/vscode": "1.137.0",
     "@vscode/vsce": "3.9.2",
     "esbuild": "0.28.2",
     "typescript": "7.0.2",
