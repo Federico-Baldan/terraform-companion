@@ -120,7 +120,7 @@
     "web-tree-sitter": "0.27.0"
   },
   "devDependencies": {
-    "@biomejs/biome": "2.5.12",
+    "@biomejs/biome": "2.5.13",
     "@types/node": "24.13.4",
     "@types/semver": "7.8.0",
     "@types/vscode": "1.134.0",
