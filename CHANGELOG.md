@@ -2,6 +2,13 @@
 
 Notable changes to Terraform Companion. Versions follow semver; dates are ISO (YYYY-MM-DD).
 
+## [1.2.2](https://github.com/Federico-Baldan/terraform-companion/compare/v1.2.1...v1.2.2) (2026-09-25)
+
+
+### Documentation
+
+* animate the logo at the top of the README ([97071e6](https://github.com/Federico-Baldan/terraform-companion/commit/97071e67c4e600ba2c3135d18207be4214141345))
+
 ## [1.2.1](https://github.com/Federico-Baldan/terraform-companion/compare/v1.2.0...v1.2.1) (2026-09-13)
 
 
