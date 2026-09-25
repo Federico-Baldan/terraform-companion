@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/logo/icon-256.png" alt="Terraform Companion" width="128" height="128">
+  <img src="assets/logo/icon-animated.webp" alt="Terraform Companion" width="128" height="128">
 </p>
 
 <h1 align="center">Terraform Companion</h1>
