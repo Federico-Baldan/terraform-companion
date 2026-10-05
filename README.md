@@ -48,7 +48,7 @@ This fills the gaps terraform-ls leaves: it won't tell you a provider constraint
 code --install-extension Federico-Baldan.tf-companion
 ```
 
-Requires VS Code 1.125 or newer. Activates on `.tf` / `.tfvars` files.
+Requires VS Code 1.138 or newer. Activates on `.tf` / `.tfvars` files.
 
 ## Version CodeLens
 
