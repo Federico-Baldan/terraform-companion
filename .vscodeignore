@@ -9,6 +9,7 @@ docs/**
 
 assets/logo/**
 !assets/logo/icon-256.png
+assets/signature/**
 
 *.vsix
 # scratch .tf/.tfvars used to exercise the extension by hand live at the repo

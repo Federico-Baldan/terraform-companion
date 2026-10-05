@@ -5,6 +5,15 @@
 <h1 align="center">Terraform Companion</h1>
 
 <p align="center">
+  <a href="https://federico.baldan.dev">
+    <picture>
+      <source media="(prefers-reduced-motion: reduce)" srcset="https://github.com/Federico-Baldan/terraform-companion/raw/HEAD/assets/signature/signature.png">
+      <img src="assets/signature/signature-animated.webp" alt="Federico Baldan" width="150">
+    </picture>
+  </a>
+</p>
+
+<p align="center">
   Version CodeLens, resolved-value hover on <code>var</code> and <code>local</code>, <code>count</code>&nbsp;→&nbsp;<code>for_each</code> refactor,<br>
   plus unused-local and version-constraint lints.
 </p>
@@ -145,4 +154,4 @@ npm run package    # .vsix
 
 MIT.
 
-Built by [Federico Baldan](https://federico.baldan.dev). Bugs and feature requests go in [Issues](https://github.com/Federico-Baldan/terraform-companion/issues).
+Bugs and feature requests go in [Issues](https://github.com/Federico-Baldan/terraform-companion/issues).
