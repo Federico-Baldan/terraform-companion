@@ -116,6 +116,12 @@
       "description": "Keep GitHub Actions current and automerge them, one Action per PR. Digests are pinned by config:best-practices, so a bump is a reviewed SHA move.",
       "matchManagers": ["github-actions"],
       "automerge": true
+    },
+    {
+      "description": "Keep Azure Login on its moving major tag so the workflow receives compatible action updates without Renovate replacing the tag with a commit SHA.",
+      "matchManagers": ["github-actions"],
+      "matchPackageNames": ["azure/login"],
+      "pinDigests": false
     }
   ]
 }
