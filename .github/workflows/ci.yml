@@ -116,7 +116,7 @@ jobs:
         run: npm run package
 
       - name: Publish to VS Code Marketplace
-        run: npx @vscode/vsce publish --azure-credential --no-dependencies --packagePath ./*.vsix
+        run: npx --yes @vscode/vsce@4.0.1-5 publish --oidc --no-dependencies --packagePath ./*.vsix
 
       # release-please already cut the GitHub Release; only the binary is missing.
       - name: Attach the VSIX to the release
