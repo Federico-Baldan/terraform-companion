@@ -2,6 +2,13 @@
 
 Notable changes to Terraform Companion. Versions follow semver; dates are ISO (YYYY-MM-DD).
 
+## [1.2.5](https://github.com/Federico-Baldan/terraform-companion/compare/v1.2.4...v1.2.5) (2026-10-23)
+
+
+### Bug Fixes
+
+* use supported VSCE Entra credential flag ([0733146](https://github.com/Federico-Baldan/terraform-companion/commit/07331465ffe045cf809fb93e167114603a84e843))
+
 ## [1.2.4](https://github.com/Federico-Baldan/terraform-companion/compare/v1.2.3...v1.2.4) (2026-10-23)
 
 
