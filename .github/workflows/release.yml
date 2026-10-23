@@ -77,32 +77,15 @@ jobs:
       # Publish before cutting the release: a Marketplace failure then leaves
       # nothing behind, and the tag can be moved and pushed again.
       - name: Login to Azure with OIDC
-        uses: azure/login@v2
+        uses: azure/login@v3
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           allow-no-subscriptions: true
 
-      - name: Show Azure DevOps profile ID
-        shell: bash
-        run: |
-          profile_id="$(az rest \
-            --method get \
-            --url 'https://app.vssps.visualstudio.com/_apis/profile/profiles/me' \
-            --resource '499b84ac-1321-427f-aa17-267ca6975798' \
-            --query id \
-            --output tsv)"
-
-          if [ -z "$profile_id" ]; then
-            echo "Azure DevOps profile ID was not returned" >&2
-            exit 1
-          fi
-
-          echo "Azure DevOps profile ID: $profile_id"
-
       - name: Publish to VS Code Marketplace
         if: startsWith(github.ref, 'refs/tags/')
-        run: npx --yes @vscode/vsce@4.0.1-5 publish --azure-credential --no-dependencies --packagePath ./*.vsix
+        run: npx --yes @vscode/vsce publish --azure-credential --no-dependencies --packagePath ./*.vsix
 
       - name: Create GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
