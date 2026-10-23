@@ -78,7 +78,7 @@ jobs:
       # nothing behind, and the tag can be moved and pushed again.
       - name: Publish to VS Code Marketplace
         if: startsWith(github.ref, 'refs/tags/')
-        run: npx @vscode/vsce publish --oidc --no-dependencies --packagePath ./*.vsix
+        run: npx @vscode/vsce publish --azure-credential --no-dependencies --packagePath ./*.vsix
 
       - name: Create GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
