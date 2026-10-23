@@ -98,8 +98,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-    env:
-      VSCE_PAT: ${{ secrets.VSCE_PAT }}
+      id-token: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -117,8 +116,7 @@ jobs:
         run: npm run package
 
       - name: Publish to VS Code Marketplace
-        if: env.VSCE_PAT != ''
-        run: npx @vscode/vsce publish --no-dependencies --packagePath ./*.vsix
+        run: npx @vscode/vsce publish --oidc --no-dependencies --packagePath ./*.vsix
 
       # release-please already cut the GitHub Release; only the binary is missing.
       - name: Attach the VSIX to the release
