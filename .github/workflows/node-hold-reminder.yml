@@ -2,11 +2,15 @@ name: Node hold reminder
 
 on:
   schedule:
-    # 1 January and 1 July, 10:00 Rome time: twice a year is plenty for a
+    # 1 January and 1 July, 10:17 Rome time: twice a year is plenty for a
     # decision that moves on a scale of months, and the message only goes out
     # when there is something to act on. timezone is honoured natively (GitHub
-    # handles the DST switch), so this stays 10:00 in Rome all year.
-    - cron: "0 10 1 1,7 *"
+    # handles the DST switch), so this stays 10:17 in Rome all year.
+    #
+    # Minute 17 and not 00 on purpose: GitHub documents that scheduled runs are
+    # delayed at the start of each hour and that under load some queued ones are
+    # dropped. A dropped run here costs six months, not a week.
+    - cron: "17 10 1 1,7 *"
       timezone: "Europe/Rome"
   workflow_dispatch:
     inputs:
