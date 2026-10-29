@@ -1,0 +1,129 @@
+name: Node hold reminder
+
+on:
+  schedule:
+    # Monday morning, Rome time. timezone is honoured natively (GitHub handles
+    # the DST switch), so this stays 10:00 in Rome all year.
+    - cron: "0 10 * * 1"
+      timezone: "Europe/Rome"
+  workflow_dispatch:
+    inputs:
+      always_notify:
+        description: "Send the status message even when there is nothing to act on (to test the Telegram wiring)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: node-hold-reminder
+  cancel-in-progress: false
+
+jobs:
+  remind:
+    name: Remind when the Node hold can go
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      # renovate.json holds node and @types/node on one Node line because VS Code
+      # embeds that line, and Renovate cannot expire a rule by itself. Without
+      # this the hold stays forever, or the update comes back as a notification
+      # for something nobody can take yet — the thing the hold exists to stop.
+      - name: Check whether the hold is still needed
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          # Defaulted in shell: a schedule run has no inputs, so this is empty.
+          ALWAYS_NOTIFY: ${{ inputs.always_notify }}
+          # The line renovate.json holds on (allowedVersions "<25" = line 24).
+          # Change the two together.
+          HELD_MAJOR: "24"
+          # Start reminding this long before the held line's end of life, which
+          # is the point where staying on it stops being a choice.
+          EOL_WARN_DAYS: "120"
+        run: |
+          set -euo pipefail
+          ALWAYS_NOTIFY="${ALWAYS_NOTIFY:-false}"
+
+          fail() {
+            echo "::error::$1"
+            exit 1
+          }
+
+          # The hold is the packageRules entry that sets allowedVersions on
+          # `node`. Once someone removes it there is nothing left to remind
+          # about, so this goes quiet by itself instead of nagging about a job
+          # that is already done.
+          if ! jq -e '[.packageRules[]?
+                | select((.matchDepNames // []) | index("node"))
+                | select(.allowedVersions)] | length > 0' renovate.json >/dev/null; then
+            echo "No Node hold in renovate.json — nothing to remind about"
+            exit 0
+          fi
+
+          # End of life read from the Node release schedule, not a date typed
+          # in here, so a change to the schedule is picked up on its own.
+          eol=$(curl -sS --fail --retry 3 --retry-delay 5 \
+            https://raw.githubusercontent.com/nodejs/Release/main/schedule.json \
+            | jq -r --arg v "v${HELD_MAJOR}" '.[$v].end // empty')
+          [ -n "$eol" ] || fail "No end-of-life date for Node ${HELD_MAJOR} in the Node release schedule"
+          days=$(( ( $(date -u -d "$eol" +%s) - $(date -u +%s) ) / 86400 ))
+
+          # What the oldest VS Code this extension supports embeds, which is
+          # what @types/node has to describe: engines.vscode -> the tag of that
+          # release -> the Electron it was built on (.npmrc target) -> the Node
+          # that Electron ships.
+          floor=$(jq -r '.engines.vscode' package.json | tr -d '^~')
+          electron=$(curl -sS --fail --retry 3 --retry-delay 5 \
+            "https://raw.githubusercontent.com/microsoft/vscode/${floor}/.npmrc" \
+            | sed -n 's/^target="\(.*\)"$/\1/p')
+          [ -n "$electron" ] || fail "No Electron target in microsoft/vscode ${floor} .npmrc"
+          # -L is load-bearing: this URL is a 301 to another host, and --fail does
+          # not treat a 3xx as an error, so without it jq is handed the redirect
+          # page's HTML instead of the index
+          embedded=$(curl -sSL --fail --retry 3 --retry-delay 5 \
+            https://electronjs.org/headers/index.json \
+            | jq -r --arg v "$electron" '.[] | select(.version == $v) | .node')
+          [ -n "$embedded" ] || fail "Electron ${electron} is not in the Electron headers index"
+
+          reasons=""
+          if [ "$days" -le "$EOL_WARN_DAYS" ]; then
+            reasons="${reasons}• Node ${HELD_MAJOR} reaches end of life on ${eol} (${days} day(s) left)"$'\n'
+          fi
+          if [ "${embedded%%.*}" -gt "$HELD_MAJOR" ]; then
+            reasons="${reasons}• The oldest supported VS Code (${floor}) already embeds Node ${embedded}, so the hold no longer matches the host"$'\n'
+          fi
+
+          status="Node ${HELD_MAJOR} ends ${eol} (${days} day(s)), VS Code ${floor} embeds Node ${embedded}"
+
+          if [ -z "$reasons" ]; then
+            if [ "$ALWAYS_NOTIFY" != true ]; then
+              echo "Nothing to act on: ${status}"
+              exit 0
+            fi
+            headline="ℹ️ Terraform Companion — Node ${HELD_MAJOR} hold status (test message)"
+            reasons="• Nothing to act on yet: ${status}"$'\n'
+          else
+            headline="🟡 Terraform Companion — the Node ${HELD_MAJOR} hold can be revisited"
+          fi
+
+          text=$(printf '%s\n' \
+            "$headline" \
+            "" \
+            "$reasons" \
+            "renovate.json still holds node and @types/node on the ${HELD_MAJOR} line. Remove that rule and Renovate offers the next major.")
+
+          if [ -z "${TELEGRAM_BOT_TOKEN:-}" ] || [ -z "${TELEGRAM_CHAT_ID:-}" ]; then
+            echo "::warning::TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID not configured — no notification sent"
+            printf '%s\n' "$text"
+            exit 0
+          fi
+
+          # no parse_mode — a title with < or * would otherwise 400 the Bot API
+          curl -sS --fail-with-body --retry 3 --retry-delay 5 -o /dev/null \
+            -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=${text}" \
+            -d disable_web_page_preview=true
