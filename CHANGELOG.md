@@ -2,6 +2,13 @@
 
 Notable changes to Terraform Companion. Versions follow semver; dates are ISO (YYYY-MM-DD).
 
+## [1.2.6](https://github.com/Federico-Baldan/terraform-companion/compare/v1.2.5...v1.2.6) (2026-10-29)
+
+
+### Bug Fixes
+
+* match the node hold by depName ([#79](https://github.com/Federico-Baldan/terraform-companion/issues/79)) ([14b8960](https://github.com/Federico-Baldan/terraform-companion/commit/14b8960d149b805f51a7aa4b56b66e9d1e6fb37e))
+
 ## [1.2.5](https://github.com/Federico-Baldan/terraform-companion/compare/v1.2.4...v1.2.5) (2026-10-23)
 
 
