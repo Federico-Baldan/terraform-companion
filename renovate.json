@@ -95,6 +95,11 @@
       "addLabels": ["needs-review"]
     },
     {
+      "description": "Node and @types/node stay on the 24 line until VS Code catches up. The extension runs inside VS Code's Electron, which embeds Node 24 at both ends of the supported range (1.138 -> Electron 42 -> Node 24.18, 1.144 -> Electron 43 -> Node 24.22), so a Node 26 bump describes and tests against a runtime the extension never runs on. Left unblocked it only parks a Pending Approval entry on the Dashboard and sends a Telegram notification for an update nobody can take yet. 24.x minors and patches keep flowing. Remove this rule once the engines.vscode floor ships an Electron whose Node is 26: the Electron version is the `target` in microsoft/vscode's .npmrc, and https://electronjs.org/headers/index.json maps it to a Node version. `<25` rather than `<26` keeps the odd, never-LTS release out too.",
+      "matchPackageNames": ["node", "@types/node"],
+      "allowedVersions": "<25"
+    },
+    {
       "description": "The one grouping that survives, and not for convenience: the runtime and the grammar are ABI-coupled, and dist/*.wasm is copied from both packages by esbuild.mjs. A PR that moves one without the other ships a runtime that cannot load the grammar it was built against, so splitting them would produce a broken PR by construction. Reviewed by hand, never automerged.",
       "matchPackageNames": [
         "web-tree-sitter",
