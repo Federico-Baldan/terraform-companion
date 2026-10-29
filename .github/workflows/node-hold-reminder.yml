@@ -2,15 +2,17 @@ name: Node hold reminder
 
 on:
   schedule:
-    # 1 January and 1 July, 10:17 Rome time: twice a year is plenty for a
-    # decision that moves on a scale of months, and the message only goes out
-    # when there is something to act on. timezone is honoured natively (GitHub
-    # handles the DST switch), so this stays 10:17 in Rome all year.
+    # The 1st of every month at 12:50 Rome time, so it lands during lunch.
+    # Monthly is often enough for a decision that moves on a scale of months,
+    # and the message only goes out when there is something to act on. timezone
+    # is honoured natively (GitHub handles the DST switch), so this stays 12:50
+    # in Rome all year.
     #
-    # Minute 17 and not 00 on purpose: GitHub documents that scheduled runs are
+    # Minute 50 and not 00 on purpose: GitHub documents that scheduled runs are
     # delayed at the start of each hour and that under load some queued ones are
-    # dropped. A dropped run here costs six months, not a week.
-    - cron: "17 10 1 1,7 *"
+    # dropped. Same reasoning as release-reminder.yml, which is why this is
+    # 12:50 rather than 13:00.
+    - cron: "50 12 1 * *"
       timezone: "Europe/Rome"
   workflow_dispatch:
     inputs:
@@ -48,9 +50,10 @@ jobs:
           HELD_MAJOR: "24"
           # Start reminding this long before the held line's end of life, which
           # is the point where staying on it stops being a choice. It has to be
-          # longer than the gap between two runs (up to 184 days, 1 Jul -> 1 Jan),
-          # or the end of life can fall between two runs and never be reported.
-          EOL_WARN_DAYS: "200"
+          # longer than the gap between two runs (up to 31 days), or the end of
+          # life can fall between two runs and never be reported. 120 gives
+          # about four monthly reminders ahead of it.
+          EOL_WARN_DAYS: "120"
         run: |
           set -euo pipefail
           ALWAYS_NOTIFY="${ALWAYS_NOTIFY:-false}"
