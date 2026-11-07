@@ -1,5 +1,6 @@
 import type { Dirent } from 'node:fs';
-import { lstat, readdir, realpath, rm } from 'node:fs/promises';
+import { lstat, readdir, readFile, realpath, rm } from 'node:fs/promises';
+import { homedir, platform } from 'node:os';
 import { basename, isAbsolute, join, relative, sep } from 'node:path';
 
 export interface StaleCache {
@@ -10,6 +11,51 @@ export interface StaleCache {
    *  `modules`, `plugins/<entry>`. Carried on the scan result so the prompt can
    *  name the directories instead of asking for a blanket yes to a number. */
   entries: string[];
+}
+
+export interface ProviderCacheEntry {
+  dir: string;
+  source: string;
+  sizeBytes: number;
+  lastActivityMs: number;
+}
+
+const LOCK_PROVIDER = /^\s*provider\s+"([^"]+)"\s*\{/gm;
+const PROVIDER_CACHE_ROOT = /(?:^|\n)\s*plugin_cache_dir\s*=\s*"([^"]+)"\s*(?:\n|$)/;
+
+/** Provider sources named by lock files. A lock file identifies a provider
+ * source, not a single version, so protecting the whole source is the only
+ * safe operation without guessing from constraints or checksums. */
+export function providerSourcesFromLockFile(contents: string): Set<string> {
+  return new Set(
+    [...contents.matchAll(LOCK_PROVIDER)]
+      .map((match) => match[1])
+      .filter((source): source is string => Boolean(source)),
+  );
+}
+
+export function expandHome(path: string): string {
+  return path.startsWith('~/') ? join(homedir(), path.slice(2)) : path;
+}
+
+/** Reads Terraform's CLI config without changing it. The shared cache is
+ * deliberately skipped when no explicit plugin_cache_dir is configured. */
+export async function configuredProviderCache(): Promise<string | undefined> {
+  const configured = process.env.TF_CLI_CONFIG_FILE;
+  const candidates = configured
+    ? [configured]
+    : platform() === 'win32'
+      ? [join(process.env.APPDATA ?? homedir(), 'terraform.rc')]
+      : [join(homedir(), '.terraformrc'), join(homedir(), '.terraform.d', 'terraform.rc')];
+  for (const candidate of candidates) {
+    try {
+      const match = PROVIDER_CACHE_ROOT.exec(await readFile(candidate, 'utf8'));
+      if (match?.[1]) return expandHome(match[1]);
+    } catch {
+      // An absent CLI config is normal; callers log only actual scan failures.
+    }
+  }
+  return undefined;
 }
 
 /** Dependency and VCS trees only — dist, build, target, vendor stay out since
@@ -332,6 +378,127 @@ export async function findStaleTerraformDirs(
   };
   await visit(root, 0);
   return out;
+}
+
+/** Collects lock-file provider sources during the same workspace walk used by
+ * the cache cleaner. Sources, rather than versions, are protected because
+ * Terraform lock files do not record a standalone selected-version field. */
+export async function collectProviderSources(
+  root: string,
+  cancelled?: () => boolean,
+): Promise<Set<string>> {
+  const sources = new Set<string>();
+  const visit = async (dir: string, depth: number): Promise<void> => {
+    if (cancelled?.() || depth > MAX_DEPTH) return;
+    let entries: Dirent[];
+    try {
+      entries = await readdir(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const de of entries) {
+      if (cancelled?.()) return;
+      if (de.isDirectory()) {
+        if (!SKIP.has(de.name)) await visit(join(dir, de.name), depth + 1);
+      } else if (de.isFile() && de.name === '.terraform.lock.hcl') {
+        try {
+          for (const source of providerSourcesFromLockFile(
+            await readFile(join(dir, de.name), 'utf8'),
+          ))
+            sources.add(source);
+        } catch {
+          // A lock file may disappear while the workspace is being edited.
+        }
+      }
+    }
+  };
+  await visit(root, 0);
+  return sources;
+}
+
+export async function findStaleProviderCacheEntries(
+  cacheRoot: string,
+  protectedSources: ReadonlySet<string>,
+  staleDays: number,
+  now: number = Date.now(),
+  cancelled?: () => boolean,
+): Promise<ProviderCacheEntry[]> {
+  const out: ProviderCacheEntry[] = [];
+  const cutoff = staleCutoff(staleDays, now);
+  let hosts: Dirent[];
+  try {
+    hosts = await readdir(cacheRoot, { withFileTypes: true });
+  } catch {
+    return out;
+  }
+  for (const host of hosts) {
+    if (cancelled?.() || !host.isDirectory()) continue;
+    let namespaces: Dirent[];
+    try {
+      namespaces = await readdir(join(cacheRoot, host.name), { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const namespace of namespaces) {
+      if (cancelled?.() || !namespace.isDirectory()) continue;
+      let providers: Dirent[];
+      try {
+        providers = await readdir(join(cacheRoot, host.name, namespace.name), {
+          withFileTypes: true,
+        });
+      } catch {
+        continue;
+      }
+      for (const provider of providers) {
+        if (cancelled?.() || !provider.isDirectory()) continue;
+        const source = `${host.name}/${namespace.name}/${provider.name}`;
+        if (protectedSources.has(source)) continue;
+        const providerDir = join(cacheRoot, host.name, namespace.name, provider.name);
+        let versions: Dirent[];
+        try {
+          versions = await readdir(providerDir, { withFileTypes: true });
+        } catch {
+          continue;
+        }
+        for (const version of versions) {
+          if (cancelled?.() || !version.isDirectory()) continue;
+          const dir = join(providerDir, version.name);
+          let st: Awaited<ReturnType<typeof lstat>>;
+          try {
+            st = await lstat(dir);
+          } catch {
+            continue;
+          }
+          if (st.mtimeMs >= cutoff) continue;
+          out.push({
+            dir,
+            source,
+            sizeBytes: await dirSize(dir, 0, cancelled),
+            lastActivityMs: st.mtimeMs,
+          });
+        }
+      }
+    }
+  }
+  return out;
+}
+
+export async function deleteProviderCacheEntry(
+  entry: ProviderCacheEntry,
+  cacheRoot: string,
+): Promise<CleanResult> {
+  try {
+    const realRoot = await realpath(cacheRoot);
+    const realEntry = await realpath(entry.dir);
+    if (!isInside(realRoot, realEntry) || realEntry === realRoot) {
+      return { ok: false, reason: 'provider cache path is outside the configured cache' };
+    }
+    if (!(await lstat(entry.dir)).isDirectory()) return { ok: false, reason: 'not a directory' };
+    await rm(realEntry, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+    return { ok: true, removed: [entry.dir] };
+  } catch (e) {
+    return { ok: false, reason: `${e}` };
+  }
 }
 
 /** The prompt can sit open indefinitely, so a `terraform init` run while

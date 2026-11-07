@@ -8,6 +8,7 @@ import { mock, type QuickPickItem, resetVscodeMock } from './mocks/vscode';
 const DAY = 86_400_000;
 
 let root: string;
+const originalCliConfig = process.env.TF_CLI_CONFIG_FILE;
 
 beforeEach(() => {
   root = mkdtempSync(join(tmpdir(), 'tfc-prompt-'));
@@ -16,6 +17,8 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  if (originalCliConfig === undefined) delete process.env.TF_CLI_CONFIG_FILE;
+  else process.env.TF_CLI_CONFIG_FILE = originalCliConfig;
   rmSync(root, { recursive: true, force: true });
 });
 
@@ -91,6 +94,25 @@ function picker(): QuickPickItem[] {
  *  nothing to check the answer against, so the only available reply was a blind
  *  yes on a recursive delete. */
 describe('cache cleaner prompt', () => {
+  it('shows a confirmation banner for stale unreferenced provider cache', async () => {
+    const cache = join(root, 'plugin-cache');
+    const provider = join(cache, 'registry.terraform.io', 'example', 'unused', '1.0.0');
+    mkdirSync(provider, { recursive: true });
+    writeFileSync(join(provider, 'provider'), 'x'.repeat(4096));
+    age(provider, 90);
+    const cliConfig = join(root, 'terraform.rc');
+    writeFileSync(cliConfig, `plugin_cache_dir = "${cache}"\n`);
+    process.env.TF_CLI_CONFIG_FILE = cliConfig;
+    mock.warningAnswers = ['Ignore'];
+
+    await run();
+
+    expect(mock.warnings).toHaveLength(1);
+    expect(mock.warnings[0]!.message).toContain('unused provider cache');
+    expect(mock.warnings[0]!.message).toContain('Delete');
+    expect(existsSync(provider)).toBe(true);
+  });
+
   it('names the folder it wants to delete', async () => {
     module_('infra/prod', 90);
     mock.warningAnswers = ['Ignore'];
@@ -205,6 +227,7 @@ describe('cache cleaner prompt', () => {
     );
 
     expect(mock.warnings).toEqual([]);
+    expect(mock.infos).toEqual([]);
     expect(logged.some((l) => l.includes('infra/prod') && l.includes('will delete'))).toBe(true);
     expect(logged.some((l) => l.includes('removed providers, modules'))).toBe(true);
     expect(existsSync(join(root, 'infra/prod/.terraform/providers'))).toBe(false);

@@ -103,6 +103,15 @@ It only offers the rewrite when the rewrite is safe. If `count.index` also drive
 
 On startup it looks for `.terraform` folders whose module hasn't been touched in 30 days, and asks before deleting. These are caches `terraform init` rebuilds.
 
+If Terraform has a configured `plugin_cache_dir`, the same scan also finds
+provider sources in that shared cache that are not mentioned by any
+`.terraform.lock.hcl` in the workspace and have not been touched for 30 days.
+It asks separately before removing those provider-version directories. A
+provider source mentioned by a lock file is protected in full: lock files do
+not contain a standalone selected-version field, so the cleaner never guesses
+which version is safe to remove. The CLI configuration and every lock file are
+read-only; neither is deleted.
+
 **It tells you what it is about to delete.** The prompt names the modules, such as `infra/prod, modules/vpc`, instead of showing only a count. **Review…** opens a checklist with each cache's full path, size, last-used date, and subdirectories:
 
 ```
@@ -136,7 +145,7 @@ All keys are under `tfCompanion.`
 | `versionHygiene.variableDocs` | `false` | also flag variables without `description` or `type` |
 | `cacheCleaner.enabled` | `true` | on startup, offer to delete the cache of modules with no recent activity |
 | `cacheCleaner.staleDays` | `30` | days of inactivity before a `.terraform` counts as stale; floored at 1 |
-| `cacheCleaner.autoDelete` | `false` | delete without asking; the folders are still listed in the output channel |
+| `cacheCleaner.autoDelete` | `false` | delete without asking or showing a confirmation/info banner; all targets are still listed in the output channel |
 
 ## Development
 

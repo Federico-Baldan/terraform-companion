@@ -15,10 +15,13 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
   deleteCachePayload,
+  deleteProviderCacheEntry,
+  findStaleProviderCacheEntries,
   findStaleTerraformDirs,
   formatSize,
   isStillStale,
   isTerraformCacheDir,
+  providerSourcesFromLockFile,
 } from '../src/features/cacheCleaner';
 
 const DAY = 86_400_000;
@@ -56,6 +59,44 @@ function makeModule(base: string, name: string, cacheAgeDays: number, tfAgeDays:
 }
 
 describe('cache cleaner', () => {
+  it('protects provider sources named by lock files', () => {
+    const sources = providerSourcesFromLockFile(`
+provider "registry.terraform.io/hashicorp/aws" {
+  hashes = ["h1:abc"]
+}
+provider "registry.terraform.io/hashicorp/random" {
+  hashes = ["h1:def"]
+}
+`);
+    expect([...sources]).toEqual([
+      'registry.terraform.io/hashicorp/aws',
+      'registry.terraform.io/hashicorp/random',
+    ]);
+  });
+
+  it('finds and deletes stale providers from an unreferenced source only', async () => {
+    const cache = join(root, 'plugin-cache');
+    const stale = join(cache, 'registry.terraform.io', 'example', 'unused', '1.0.0');
+    const protectedVersion = join(cache, 'registry.terraform.io', 'hashicorp', 'aws', '5.0.0');
+    mkdirSync(stale, { recursive: true });
+    mkdirSync(protectedVersion, { recursive: true });
+    writeFileSync(join(stale, 'provider'), 'x'.repeat(2048));
+    writeFileSync(join(protectedVersion, 'provider'), 'x');
+    touch(stale, 60);
+    touch(protectedVersion, 60);
+
+    const found = await findStaleProviderCacheEntries(
+      cache,
+      new Set(['registry.terraform.io/hashicorp/aws']),
+      30,
+      NOW,
+    );
+    expect(found.map((entry) => entry.source)).toEqual(['registry.terraform.io/example/unused']);
+    expect((await deleteProviderCacheEntry(found[0]!, cache)).ok).toBe(true);
+    expect(existsSync(stale)).toBe(false);
+    expect(existsSync(protectedVersion)).toBe(true);
+  });
+
   it('finds .terraform dirs with no recent activity', async () => {
     const old = makeModule(root, 'old', 60, 60);
     makeModule(root, 'fresh', 60, 2); // recently edited .tf → not stale
