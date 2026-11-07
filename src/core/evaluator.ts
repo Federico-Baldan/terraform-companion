@@ -1,5 +1,6 @@
 import type { Node } from 'web-tree-sitter';
 import { attrOf } from './hcl';
+import type { TfBlock } from './model';
 import { withExpressionNode } from './parser';
 import type { ModuleCallSite, WorkspaceIndex } from './workspaceIndex';
 
@@ -152,14 +153,135 @@ const MAX_REF_HOPS = 256;
 export interface EvalScope {
   index: WorkspaceIndex;
   moduleDir: string;
+  rootDir?: string;
+  cwd?: string;
   /** Per-directory lookup, not one map — climbing from submodule to caller
    *  needs the caller's own tfvars. */
   tfvarsOf?: (moduleDir: string) => ReadonlyMap<string, TfvarsValue>;
   /** module dir → the single call site to resolve through, ignoring the others */
   pinnedSites?: Map<string, ModuleCallSite>;
   used?: EvalUsage;
+  /** Terraform's implicit values for the block containing the expression. */
+  context?: ContextInstance;
+  /** Internal guard used while discovering for_each collections. */
+  contextDiscovery?: boolean;
+  isCancelled?: () => boolean;
   /** internal; the entry points install it, spreads carry it down */
   state?: EvalState;
+}
+
+export interface ContextInstance {
+  label: string;
+  countIndex?: number;
+  eachKey?: string;
+  eachValue?: string | number | boolean | null | string[] | Record<string, unknown>;
+}
+
+export interface ContextOptions {
+  isCancelled?: () => boolean;
+}
+
+const MAX_CONTEXT_INSTANCES = 64;
+const CONTEXT_BLOCK_KINDS = new Set(['resource', 'data', 'module', 'ephemeral']);
+
+/** Discover only statically provable instances of count/for_each. */
+export function resolveContext(
+  block: TfBlock,
+  scope: EvalScope,
+  options: ContextOptions = {},
+): ContextInstance[] | undefined {
+  const cancelled = options.isCancelled ?? scope.isCancelled;
+  if (cancelled?.()) return undefined;
+  if (!CONTEXT_BLOCK_KINDS.has(block.kind)) return undefined;
+  const count = attrOf(block, 'count');
+  const each = attrOf(block, 'for_each');
+  if (count && each) return undefined;
+  if (!count && !each) return undefined;
+  if (scope.index.moduleHasParseError(scope.moduleDir)) return undefined;
+  const value = evalText(
+    (count ?? each)?.valueText ?? '',
+    withState({ ...scope, contextDiscovery: true, isCancelled: cancelled }),
+    0,
+  );
+  if (cancelled?.()) return undefined;
+  if (count) {
+    if (!(value instanceof NonString) || !/^\d+$/.test(value.text)) return undefined;
+    const n = Number(value.text);
+    if (!Number.isSafeInteger(n) || n < 0 || n > MAX_CONTEXT_INSTANCES) return undefined;
+    return Array.from({ length: n }, (_, i) => ({ label: `count.index = ${i}`, countIndex: i }));
+  }
+  if (isObject(value)) {
+    if (value.size > MAX_CONTEXT_INSTANCES) return undefined;
+    const out: ContextInstance[] = [];
+    for (const [key, item] of value) {
+      if (cancelled?.()) return undefined;
+      const eachValue = publicValue(item, cancelled);
+      if (eachValue === undefined) return undefined;
+      out.push({ label: `each.key = ${key}`, eachKey: key, eachValue });
+    }
+    return out.length > 0 ? out : undefined;
+  }
+  if (value instanceof SetValue) {
+    if (value.values.length > MAX_CONTEXT_INSTANCES) return undefined;
+    if (!value.values.every((v): v is string => typeof v === 'string')) return undefined;
+    const out = value.values.map((v) => ({ label: `each.key = ${v}`, eachKey: v, eachValue: v }));
+    return out.length > 0 ? out : undefined;
+  }
+  return undefined;
+}
+
+function publicValue(
+  value: Value,
+  isCancelled?: () => boolean,
+): ContextInstance['eachValue'] | undefined {
+  if (isCancelled?.()) return undefined;
+  if (value === undefined) return undefined;
+  if (value instanceof NonString) {
+    if (value.text === 'null') return null;
+    if (/^-?\d+(?:\.\d+)?$/.test(value.text)) return Number(value.text);
+    if (value.text === 'true' || value.text === 'false') return value.text === 'true';
+    return value.text;
+  }
+  if (typeof value === 'string') return value;
+  if (value instanceof SetValue) {
+    const values = value.values.map((item) => publicValue(item, isCancelled));
+    return values.some((v) => v === undefined) ? undefined : (values as string[]);
+  }
+  if (Array.isArray(value)) {
+    const values = value.map((item) => publicValue(item, isCancelled));
+    return values.some((v) => v === undefined) ? undefined : (values as string[]);
+  }
+
+  const out: Record<string, unknown> = {};
+  for (const [key, item] of value) {
+    const converted = publicValue(item, isCancelled);
+    if (converted === undefined) return undefined;
+    out[key] = converted;
+  }
+  return out;
+}
+
+function internalValue(
+  value: Exclude<ContextInstance['eachValue'], undefined>,
+  isCancelled?: () => boolean,
+): Value {
+  if (isCancelled?.()) return undefined;
+  if (value === null) return new NonString('null');
+  if (typeof value === 'string') return value;
+  if (Array.isArray(value)) {
+    return value.map((v) =>
+      internalValue(v as Exclude<ContextInstance['eachValue'], undefined>, isCancelled),
+    );
+  }
+  if (typeof value === 'number' || typeof value === 'boolean') return new NonString(String(value));
+  const out: ObjValue = new Map();
+  for (const [key, item] of Object.entries(value)) {
+    out.set(
+      key,
+      internalValue(item as Exclude<ContextInstance['eachValue'], undefined>, isCancelled),
+    );
+  }
+  return out;
 }
 
 /** Separate from strings because rendering loses the type: 8080 and "8080"
@@ -168,7 +290,11 @@ class NonString {
   constructor(readonly text: string) {}
 }
 
-type Value = string | NonString | Value[] | ObjValue | undefined;
+class SetValue {
+  constructor(readonly values: Value[]) {}
+}
+
+type Value = string | NonString | Value[] | ObjValue | SetValue | undefined;
 /** insertion-ordered so a rendered object reads in the order it was written */
 type ObjValue = Map<string, Value>;
 
@@ -267,6 +393,15 @@ function renderInto(
   // tag can never collide with a value that merely looks like one
   if (depth > MAX_RENDER_DEPTH || v === undefined) {
     emit(tagged ? '\0unknown' : UNKNOWN);
+    return;
+  }
+  if (v instanceof SetValue) {
+    emit('[');
+    v.values.forEach((item, i) => {
+      if (i > 0) emit(', ');
+      renderInto(item, out, budget, depth + 1, tagged);
+    });
+    emit(']');
     return;
   }
   if (Array.isArray(v)) {
@@ -485,8 +620,8 @@ function callFunction(name: string, args: Value[], scope: EvalScope): Value {
       // UTF-16 code units, which disagree once an astral character meets one in
       // U+E000–U+FFFF. Code-point order is UTF-8 byte order.
       return list.every((v): v is string => typeof v === 'string')
-        ? [...new Set(list)].sort(compareCodePoints)
-        : list;
+        ? new SetValue([...new Set(list)].sort(compareCodePoints))
+        : new SetValue(list);
     }
     default:
       return undefined;
@@ -644,14 +779,17 @@ function evalNode(node: Node, scope: EvalScope, depth: number, struct = 0): Valu
       case 'tuple': {
         // charged too, so a hand-written or generated 200k-element literal is
         // covered by the same budget as concat
-        const items = named(node)
-          .filter((c) => c.type === 'expression')
-          .map((c) => evalNode(c, scope, depth, struct + 1));
+        const items: Value[] = [];
+        for (const child of named(node).filter((c) => c.type === 'expression')) {
+          if (scope.isCancelled?.()) return undefined;
+          items.push(evalNode(child, scope, depth, struct + 1));
+        }
         return chargeElements(scope, items.length) ? items : undefined;
       }
       case 'object': {
         const out: ObjValue = new Map();
         for (const elem of named(node)) {
+          if (scope.contextDiscovery && out.size >= MAX_CONTEXT_INSTANCES) return undefined;
           if (elem.type !== 'object_elem') continue;
           const [key, value] = named(elem).filter((c) => c.type === 'expression');
           if (!key || !value) continue;
@@ -659,7 +797,7 @@ function evalNode(node: Node, scope: EvalScope, depth: number, struct = 0): Valu
           const name = /^[\w-]+$/.test(key.text.trim())
             ? key.text.trim()
             : asString(evalNode(key, scope, depth, struct + 1));
-          if (name === undefined) continue;
+          if (name === undefined || scope.isCancelled?.()) return undefined;
           out.set(name, evalNode(value, scope, depth, struct + 1));
         }
         return chargeElements(scope, out.size) ? out : undefined;
@@ -684,8 +822,38 @@ function evalNode(node: Node, scope: EvalScope, depth: number, struct = 0): Valu
 
 /** `var.x` / `local.x`, plus an attribute path into whatever they resolve to. */
 function resolveRefValue(parts: string[], scope: EvalScope, depth: number): Value {
+  if (scope.isCancelled?.()) return undefined;
   const [head, name] = parts;
   if (!name) return undefined;
+  if (head === 'count' && name === 'index') {
+    if (parts.length !== 2) return undefined;
+    if (scope.context) {
+      return scope.context.countIndex === undefined
+        ? undefined
+        : new NonString(String(scope.context.countIndex));
+    }
+    return undefined;
+  }
+  if (head === 'each' && name === 'key') {
+    if (parts.length !== 2) return undefined;
+    if (scope.context) {
+      return scope.context.eachKey === undefined ? undefined : scope.context.eachKey;
+    }
+    return undefined;
+  }
+  if (head === 'each' && name === 'value') {
+    if (parts.length !== 2) return undefined;
+    if (scope.context) {
+      if (scope.context.eachValue === undefined) return undefined;
+      return internalValue(scope.context.eachValue, scope.isCancelled);
+    }
+    return undefined;
+  }
+  if (head === 'path' && (name === 'module' || name === 'root' || name === 'cwd')) {
+    if (parts.length !== 2) return undefined;
+    const path = name === 'module' ? scope.moduleDir : name === 'root' ? scope.rootDir : scope.cwd;
+    return path === undefined ? undefined : path;
+  }
   if (head !== 'var' && head !== 'local') return undefined;
   const path = parts.slice(2);
   // the reference itself, without the attribute path — `local.cfg.db.host` and
@@ -888,7 +1056,7 @@ function shapeOf(v: Value): ValueShape {
   if (v === undefined) return 'unknown';
   // a number, bool or null is still one value with one spelling — only a list
   // or object is a rendering of several
-  return Array.isArray(v) || isObject(v) ? 'collection' : 'scalar';
+  return Array.isArray(v) || isObject(v) || v instanceof SetValue ? 'collection' : 'scalar';
 }
 
 /** `resolveRef` with the shape the rendering throws away. */
@@ -922,6 +1090,12 @@ export function listShape(text: string, scope: EvalScope): ListShape {
     (scoped.state?.spends ?? 0) > 0 || scoped.state?.gaveUp === true
       ? { kind: 'unknown', overBudget: true }
       : { kind: 'unknown' };
+  if (value instanceof SetValue) {
+    if (!value.values.every((v): v is string => typeof v === 'string')) {
+      return { kind: 'nonStrings' };
+    }
+    return { kind: 'strings', values: value.values };
+  }
   if (!Array.isArray(value)) return unknown;
   // an unresolved element says nothing; a resolved non-string says everything
   // — numbers count too, for_each rejects those

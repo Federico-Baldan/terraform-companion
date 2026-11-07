@@ -2,6 +2,7 @@ import {
   type EvalScope,
   type EvalUsage,
   emptyUsage,
+  resolveContext,
   resolveRefShaped,
   type TfvarsValue,
   UNKNOWN,
@@ -277,6 +278,27 @@ export interface HoverContext {
   /** the tfvars in force for a module directory (see EvalScope.tfvarsOf) */
   tfvarsOf: (moduleDir: string) => ReadonlyMap<string, TfvarsValue>;
   copyCommand: string;
+  rootDir?: string;
+  cwd?: string;
+  isCancelled?: () => boolean;
+}
+
+function enclosingBlock(file: ParsedFile, pos: Pos): import('../core/model').TfBlock | undefined {
+  let best: import('../core/model').TfBlock | undefined;
+  const visit = (blocks: import('../core/model').TfBlock[]): void => {
+    for (const block of blocks) {
+      if (!spanContainsExclusiveEnd(block.span, pos)) continue;
+      if (
+        !best ||
+        block.span.end.row - block.span.start.row < best.span.end.row - best.span.start.row
+      ) {
+        best = block;
+      }
+      visit(block.blocks);
+    }
+  };
+  visit(file.blocks);
+  return best;
 }
 
 /** The full hover pipeline, VS Code-free: ref-or-definition under the cursor →
@@ -308,7 +330,9 @@ export function computeHover(file: ParsedFile, pos: Pos, ctx: HoverContext): str
     // exclusive end: a reference is a token, so the column just past it belongs
     // to whatever follows — the `}` of "${var.env}", or the trailing space
     (r) =>
-      (r.parts[0] === 'var' || r.parts[0] === 'local') && spanContainsExclusiveEnd(r.span, pos),
+      r.parts[0] !== undefined &&
+      ['var', 'local', 'count', 'each', 'path'].includes(r.parts[0]) &&
+      spanContainsExclusiveEnd(r.span, pos),
   );
   // keep the whole reference, path included — truncating local.cfg.db.host to
   // local.cfg would report the enclosing object instead of the field
@@ -320,10 +344,44 @@ export function computeHover(file: ParsedFile, pos: Pos, ctx: HoverContext): str
   const scope: EvalScope = {
     index: ctx.index,
     moduleDir: ctx.index.moduleDirOf(file.path),
+    rootDir: ctx.rootDir,
+    cwd: ctx.cwd,
+    ...(ctx.isCancelled ? { isCancelled: ctx.isCancelled } : {}),
     tfvarsOf: ctx.tfvarsOf,
     used,
   };
+  if (ctx.isCancelled?.()) return undefined;
+  const contextTarget = target[0] === 'count' || target[0] === 'each';
+  const block = enclosingBlock(file, pos);
+  const instances =
+    contextTarget && block && !file.hasError
+      ? resolveContext(block, scope, { isCancelled: ctx.isCancelled })
+      : undefined;
+  if (ctx.isCancelled?.()) return undefined;
+  if (contextTarget && (!instances || instances.length === 0)) return undefined;
+  if (instances && instances.length > 1) {
+    for (const instance of instances) {
+      if (ctx.isCancelled?.()) return undefined;
+      const row = resolveRefShaped(target, {
+        ...scope,
+        context: instance,
+        used: emptyUsage(),
+      });
+      used.conflicts.set(instance.label, row);
+    }
+    if (ctx.isCancelled?.()) return undefined;
+    return hoverMarkdown({
+      target,
+      value: UNKNOWN,
+      shape: 'unknown',
+      used,
+      copyCommand: ctx.copyCommand,
+      ...(ctx.isCancelled ? { isCancelled: ctx.isCancelled } : {}),
+    });
+  }
+  if (instances?.[0]) scope.context = instances[0];
   let resolved = resolveRefShaped(target, scope);
+  if (ctx.isCancelled?.()) return undefined;
   // evaluator reports where call sites split; re-resolving the *whole* target
   // per site (not just the diverged var) shows "app-dev" for
   // local.name = "app-${var.env}" instead of the bare "dev"
@@ -340,6 +398,7 @@ export function computeHover(file: ParsedFile, pos: Pos, ctx: HoverContext): str
         pinnedSites: new Map([...(scope.pinnedSites ?? []), [diverged.moduleDir, site]]),
       }),
     }));
+    if (ctx.isCancelled?.()) return undefined;
     if (omitted > 0 || new Set(rows.map((r) => r.value.text)).size > 1) {
       // With instances left unread we cannot claim they agree, so the collapse
       // below is not available: listing what was measured is honest, naming one
@@ -356,6 +415,7 @@ export function computeHover(file: ParsedFile, pos: Pos, ctx: HoverContext): str
   const inForce = [
     ...new Set([...ctx.tfvarsOf(scope.moduleDir).values()].map((v) => baseName(v.file))),
   ].sort();
+  if (ctx.isCancelled?.()) return undefined;
   return hoverMarkdown({
     target,
     value: resolved.text,
@@ -364,6 +424,7 @@ export function computeHover(file: ParsedFile, pos: Pos, ctx: HoverContext): str
     tfvarsNames: inForce,
     copyCommand: ctx.copyCommand,
     conflictsOmitted: omitted,
+    ...(ctx.isCancelled ? { isCancelled: ctx.isCancelled } : {}),
   });
 }
 
@@ -381,10 +442,15 @@ export interface HoverParts {
   copyCommand: string;
   /** instances past MAX_CONFLICT_SITES that were never resolved */
   conflictsOmitted?: number;
+  isCancelled?: () => boolean;
 }
 
 /** Markdown body of the resolved-value hover: value, real provenance, copy link.
  *  When module instances pass different values, lists one value per instance. */
+export function hoverMarkdown(parts: Omit<HoverParts, 'isCancelled'>): string;
+export function hoverMarkdown(
+  parts: HoverParts & { isCancelled: () => boolean },
+): string | undefined;
 export function hoverMarkdown({
   target,
   value,
@@ -393,20 +459,30 @@ export function hoverMarkdown({
   tfvarsNames,
   copyCommand,
   conflictsOmitted = 0,
-}: HoverParts): string {
+  isCancelled,
+}: HoverParts): string | undefined {
   // a block label is whatever the parser accepted between the quotes, and this
   // hover renders trusted, so the name needs the same escaping as every other
   // untrusted string here. An ordinary identifier is left alone: it has nothing
   // markdown reacts to, and escaping it would spell `name_prefix` as
   // `name\_prefix` in the one line the reader is here to read.
-  const name = target.map((p) => (/^[\w-]+$/.test(p) ? p : escapeMd(p))).join('.');
+  const nameParts: string[] = [];
+  for (const part of target) {
+    if (isCancelled?.()) return undefined;
+    const escaped = /^[\w-]+$/.test(part) ? part : escapeMd(part, isCancelled);
+    if (escaped === undefined) return undefined;
+    nameParts.push(escaped);
+  }
+  const name = nameParts.join('.');
   // encodeURIComponent leaves parens alone, and an unescaped ) closes the link
   // early — cidr(10.0.0.0/8) would copy a truncated string
-  const copyLink = (v: string) =>
-    `[Copy value](command:${copyCommand}?${encodeURIComponent(JSON.stringify([v])).replace(
-      /[()]/g,
-      (c) => (c === '(' ? '%28' : '%29'),
-    )})`;
+  const copyLink = (v: string): string | undefined => {
+    if (isCancelled?.()) return undefined;
+    const encoded = encodeURIComponent(JSON.stringify([v])).replace(/[()]/g, (c) =>
+      c === '(' ? '%28' : '%29',
+    );
+    return isCancelled?.() ? undefined : `[Copy value](command:${copyCommand}?${encoded})`;
+  };
 
   if (used.conflicts.size > 0) {
     // per row, because that is the case where one instance fits a limit and
@@ -416,6 +492,7 @@ export function hoverMarkdown({
     let spent = 0;
     let dropped = conflictsOmitted;
     for (const [label, v] of used.conflicts) {
+      if (isCancelled?.()) return undefined;
       const count = charNote(v.text, v.shape);
       const shown = count === undefined ? '' : ` (${count})`;
       // One row is a per-instance summary, not the value itself: at full length
@@ -426,8 +503,14 @@ export function hoverMarkdown({
       // instance holds, and `charNote` already reports the real size.
       const clipped = v.text.length > MAX_ROW_VALUE_CHARS;
       const body = clipped ? `${v.text.slice(0, MAX_ROW_VALUE_CHARS)}…` : v.text;
-      const copy = clipped ? '' : ` — ${copyLink(v.text)}`;
-      const row = `- ${escapeMd(label)}: ${inlineCode(body)}${shown}${copy}`;
+      const escapedLabel = escapeMd(label, isCancelled);
+      const code = inlineCode(body, isCancelled);
+      const link = clipped ? '' : copyLink(v.text);
+      if (escapedLabel === undefined || code === undefined || (!clipped && link === undefined)) {
+        return undefined;
+      }
+      const copy = clipped ? '' : ` — ${link}`;
+      const row = `- ${escapedLabel}: ${code}${shown}${copy}`;
       // measured as they are built: `copyLink` alone is 2-3x the value it
       // encodes, so rendering every row and trimming afterwards still pays the
       // whole allocation the cap exists to avoid
@@ -439,18 +522,30 @@ export function hoverMarkdown({
       spent += row.length;
     }
     const more = dropped > 0 ? `\n- …and ${dropped} more instance${dropped === 1 ? '' : 's'}` : '';
-    return `**${name}** differs per module instance:\n\n${rows.join('\n')}${more}`;
+    return isCancelled?.()
+      ? undefined
+      : `**${name}** differs per module instance:\n\n${rows.join('\n')}${more}`;
   }
 
   const origins: string[] = [];
   // with per-module tfvars, only the evaluator can name the file it came from
   const fromFiles = [...new Set([...used.tfvarsFiles].map(baseName))].sort();
-  if (fromFiles.length > 0) origins.push(`from ${fromFiles.map(escapeMd).join(', ')}`);
+  if (fromFiles.length > 0) {
+    const escaped = fromFiles.map((file) => escapeMd(file, isCancelled));
+    if (escaped.some((file) => file === undefined)) return undefined;
+    origins.push(`from ${escaped.join(', ')}`);
+  }
   if (used.defaults.size > 0) {
     const files = [...new Set([...used.defaults.values()].map(baseName))];
-    origins.push(`default in ${files.map(escapeMd).join(', ')}`);
+    const escaped = files.map((file) => escapeMd(file, isCancelled));
+    if (escaped.some((file) => file === undefined)) return undefined;
+    origins.push(`default in ${escaped.join(', ')}`);
   }
-  if (used.calls.size > 0) origins.push(`via ${[...used.calls].map(escapeMd).join(' → ')}`);
+  if (used.calls.size > 0) {
+    const escaped = [...used.calls].map((call) => escapeMd(call, isCancelled));
+    if (escaped.some((call) => call === undefined)) return undefined;
+    origins.push(`via ${escaped.join(' → ')}`);
+  }
 
   // one metadata line under the value rather than a stack of italics: length
   // first, because a resolved name is usually on its way into a field with a
@@ -464,12 +559,16 @@ export function hoverMarkdown({
   else if (target[0] === 'var' && value === UNKNOWN) {
     const where =
       tfvarsNames && tfvarsNames.length > 0
-        ? tfvarsNames.map(escapeMd).join(', ')
+        ? tfvarsNames.map((file) => escapeMd(file, isCancelled)).join(', ')
         : 'any tfvars for this module';
+    if (isCancelled?.()) return undefined;
     meta.push(`no value: not set in ${where} and no default`);
   }
   const note = meta.length > 0 ? `\n\n_${meta.join(' · ')}_` : '';
-  return `**${name}** = ${inlineCode(value)}${note}\n\n${copyLink(value)}`;
+  const code = inlineCode(value, isCancelled);
+  const link = copyLink(value);
+  if (code === undefined || link === undefined) return undefined;
+  return isCancelled?.() ? undefined : `**${name}** = ${code}${note}\n\n${link}`;
 }
 
 /** Length of the real value, spelled for a human, or nothing when there is no
@@ -496,8 +595,13 @@ function charNote(v: string, shape: ValueShape): string | undefined {
 /** Escape anything that can open a link, code span, autolink, or emphasis, so
  *  labels/filenames we don't control render literally. Bare parens are safe
  *  — no unescaped `[` means no inline link can form. */
-function escapeMd(v: string): string {
-  return v.replace(/[\\`[\]<>*_~]/g, '\\$&');
+function escapeMd(v: string, isCancelled?: () => boolean): string | undefined {
+  let out = '';
+  for (const char of v) {
+    if (isCancelled?.()) return undefined;
+    out += /[\\`[\]<>*_~]/.test(char) ? `\\${char}` : char;
+  }
+  return out;
 }
 
 /** Untrusted text as an inline code span that can't break out: the delimiter
@@ -508,10 +612,11 @@ function escapeMd(v: string): string {
  *  blank line (it ends the paragraph and spills the tail as markdown) and a
  *  lone \n silently becomes a space. A fence would fix only the first and
  *  break the conflict-row list, which is inline. Copy still yields real bytes. */
-function inlineCode(v: string): string {
+function inlineCode(v: string, isCancelled?: () => boolean): string | undefined {
+  if (isCancelled?.()) return undefined;
   const shown = v.replace(/\r/g, '\\r').replace(/\n/g, '\\n');
   const longestRun = (shown.match(/`+/g) ?? []).reduce((n, run) => Math.max(n, run.length), 0);
   const fence = '`'.repeat(longestRun + 1);
   const pad = shown === '' || shown.startsWith('`') || shown.endsWith('`') ? ' ' : '';
-  return `${fence}${pad}${shown}${pad}${fence}`;
+  return isCancelled?.() ? undefined : `${fence}${pad}${shown}${pad}${fence}`;
 }

@@ -101,6 +101,14 @@
           "type": "boolean",
           "default": true,
           "description": "Hover on var.* and local.* with the final value resolved through the var→local chain"
+        },
+        "tfCompanion.terraformCwd": {
+          "type": "string",
+          "description": "Explicit Terraform invocation directory used to resolve path.cwd; left unset when unknown"
+        },
+        "tfCompanion.terraformRoot": {
+          "type": "string",
+          "description": "Explicit Terraform root module directory used to resolve path.root; left unset when unknown"
         }
       }
     }
