@@ -448,6 +448,12 @@ export function registerResolvedHover(
         if (token.isCancellationRequested) return undefined;
         const file = parseCached(document, path);
         if (!file || token.isCancellationRequested) return undefined;
+        const configuredRoot = vscode.workspace
+          .getConfiguration('tfCompanion')
+          .get<string>('terraformRoot');
+        const configuredCwd = vscode.workspace
+          .getConfiguration('tfCompanion')
+          .get<string>('terraformCwd');
         const body = computeHover(
           file,
           { row: position.line, column: position.character },
@@ -455,6 +461,13 @@ export function registerResolvedHover(
             index,
             tfvarsOf: (dir) => active.valuesFor(dir),
             copyCommand: COPY_VALUE_COMMAND,
+            // A workspace folder is the only root information VS Code
+            // authoritatively supplies. Terraform's invocation directory is
+            // not the extension host cwd; expose it only when explicitly
+            // configured by the user.
+            rootDir: configuredRoot ? normalizePath(configuredRoot) : undefined,
+            cwd: configuredCwd ? normalizePath(configuredCwd) : undefined,
+            isCancelled: () => token.isCancellationRequested,
           },
         );
         if (body === undefined) return undefined;

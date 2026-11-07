@@ -103,6 +103,7 @@ describe('F7 hover markdown', () => {
       used,
       copyCommand,
     });
+
     expect(md).toContain('**local.name_prefix** = `prod-name-dev`');
     expect(md).toContain('_13 chars · from prod.tfvars + default in variables.tf_');
     expect(md).toContain(
@@ -634,4 +635,103 @@ describe('a module called from many stacks cannot freeze the hover', () => {
     // runner, tight enough that either cap regressing trips it.
     expect(elapsed).toBeLessThan(2_500);
   }, 120_000);
+});
+
+describe('Terraform context hover', () => {
+  async function hover(source: string, line: number, column: number, extra = {}) {
+    const localIndex = new WorkspaceIndex();
+    const path = '/context/main.tf';
+    await localIndex.updateFile(path, source);
+    const file = parseFile(path, source);
+    return computeHover(
+      file,
+      { row: line, column },
+      {
+        index: localIndex,
+        tfvarsOf: () => new Map(),
+        copyCommand: 'tfCompanion.copyValue',
+        ...extra,
+      },
+    );
+  }
+
+  it('renders count instances and rejects an attribute tail', async () => {
+    const md = await hover(
+      'resource "x" "item" {\n  count = 3\n  name = "${count.index}"\n}\n',
+      2,
+      22,
+    );
+    expect(md).toContain('count.index = 0');
+    expect(md).toContain('count.index = 2');
+    expect(
+      await hover('resource "x" "item" {\n  count = 1\n  name = "${count.index.foo}"\n}\n', 2, 25),
+    ).toContain('⟨unknown⟩');
+  });
+
+  it('renders each.key for every for_each map instance', async () => {
+    const md = await hover(
+      'resource "x" "item" {\n  for_each = { api = "small", web = "large" }\n  name = each.key\n}\n',
+      2,
+      10,
+    );
+    expect(md).toContain('each.key = api');
+    expect(md).toContain('each.key = web');
+  });
+
+  it('renders each.value for every for_each map instance', async () => {
+    const md = await hover(
+      'resource "x" "item" {\n  for_each = { api = "small", web = "large" }\n  size = each.value\n}\n',
+      2,
+      10,
+    );
+    expect(md).toContain('each.key = api');
+    expect(md).toContain('`small`');
+    expect(md).toContain('each.key = web');
+    expect(md).toContain('`large`');
+  });
+
+  it('does not branch ordinary var hover for a multi-instance block', async () => {
+    const md = await hover(
+      'variable "name" { default = "x" }\nresource "x" "item" {\n  count = 3\n  name = var.name\n}\n',
+      3,
+      10,
+    );
+    expect(md).toContain('**var.name**');
+    expect(md).not.toContain('differs per');
+  });
+
+  it('uses explicit path context and leaves unavailable cwd unknown', async () => {
+    const md = await hover(
+      'locals { paths = "${path.module}|${path.root}|${path.cwd}" }\nresource "x" "item" {\n  name = local.paths\n}\n',
+      2,
+      10,
+      { rootDir: '/context', cwd: '/terraform-run' },
+    );
+    expect(md).toContain('/context|/context|/terraform-run');
+    const noRoot = await hover('resource "x" "item" { name = path.root }\n', 0, 35);
+    expect(noRoot).toContain('⟨unknown⟩');
+    const unknown = await hover('resource "x" "item" { name = path.cwd }\n', 0, 35);
+    expect(unknown).toContain('⟨unknown⟩');
+  });
+
+  it('does not inherit context into nested blocks', async () => {
+    const md = await hover(
+      'resource "x" "item" {\n  count = 2\n  nested {\n    name = count.index\n  }\n}\n',
+      3,
+      15,
+    );
+    expect(md).toBeUndefined();
+  });
+
+  it('abandons markdown when cancellation occurs during rendering', () => {
+    let checks = 0;
+    const md = hoverMarkdown({
+      target: ['var', 'value'],
+      value: 'value with [markdown] and a long copy payload',
+      used: emptyUsage(),
+      copyCommand: 'tfCompanion.copyValue',
+      isCancelled: () => ++checks > 2,
+    });
+    expect(md).toBeUndefined();
+  });
 });

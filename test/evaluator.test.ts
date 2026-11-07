@@ -1,5 +1,12 @@
 import { beforeAll, describe, expect, it } from 'vitest';
-import { type EvalScope, resolveExpr, resolveRef, UNKNOWN } from '../src/core/evaluator';
+import {
+  type EvalScope,
+  resolveContext,
+  resolveExpr,
+  resolveRef,
+  UNKNOWN,
+} from '../src/core/evaluator';
+import { parseFile } from '../src/core/parser';
 import { WorkspaceIndex } from '../src/core/workspaceIndex';
 import { initTestParser, tfvarsIn } from './helpers';
 
@@ -437,5 +444,90 @@ describe('nesting cannot overflow the stack', () => {
     await index.updateFile('/chain/l.tf', lines.join('\n'));
     const s: EvalScope = { index, moduleDir: '/chain', tfvarsOf: tfvarsIn('/chain', {}) };
     expect(resolveRef(['local', 'c250'], s)).toBe('x');
+  });
+
+  it('resolves supported block context and leaves unsupported context unknown', async () => {
+    const index = new WorkspaceIndex();
+    const source = 'resource "x" "item" {\n  count = 3\n  name = "${count.index}"\n}\n';
+    await index.updateFile('/context/main.tf', source);
+    const block = parseFile('/context/main.tf', source).blocks[0];
+    if (!block) throw new Error('test fixture did not parse a resource block');
+    const s: EvalScope = { index, moduleDir: '/context' };
+    const instances = resolveContext(block, s);
+    expect(instances?.at(-1)?.countIndex).toBe(2);
+    expect(resolveRef(['count', 'index'], { ...s, context: instances?.[1] })).toBe('1');
+    expect(resolveRef(['self', 'id'], { ...s, context: instances?.[1] })).toBe(UNKNOWN);
+  });
+
+  it('accepts only map and set collections for for_each', async () => {
+    const index = new WorkspaceIndex();
+    const source = 'resource "x" "item" {\n  for_each = ["a", "b"]\n}\n';
+    await index.updateFile('/context/list.tf', source);
+    const listBlock = parseFile('/context/list.tf', source).blocks[0];
+    if (!listBlock) throw new Error('test fixture did not parse a resource block');
+    expect(resolveContext(listBlock, { index, moduleDir: '/context' })).toBeUndefined();
+
+    const setSource = 'resource "x" "item" {\n  for_each = toset(["a", "b"])\n}\n';
+    await index.updateFile('/context/set.tf', setSource);
+    const setBlock = parseFile('/context/set.tf', setSource).blocks[0];
+    if (!setBlock) throw new Error('test fixture did not parse a resource block');
+    expect(resolveContext(setBlock, { index, moduleDir: '/context' })).toHaveLength(2);
+  });
+
+  it('rejects oversized for_each maps and attribute tails on context values', async () => {
+    const entries = Array.from({ length: 65 }, (_, i) => `k${i} = "${i}"`).join(', ');
+    const index = new WorkspaceIndex();
+    const source = `resource "x" "item" {\n  for_each = { ${entries} }\n}\n`;
+    await index.updateFile('/context/map.tf', source);
+    const block = parseFile('/context/map.tf', source).blocks[0];
+    if (!block) throw new Error('test fixture did not parse a resource block');
+    const scope: EvalScope = {
+      index,
+      moduleDir: '/context',
+      context: { label: 'x', countIndex: 0 },
+    };
+    expect(resolveContext(block, scope)).toBeUndefined();
+    expect(resolveRef(['count', 'index', 'tail'], scope)).toBe(UNKNOWN);
+    expect(resolveRef(['path', 'module', 'tail'], { ...scope, context: undefined })).toBe(UNKNOWN);
+  });
+
+  it('rejects dynamic or unknown map entries as a whole', async () => {
+    const index = new WorkspaceIndex();
+    const source =
+      'variable "value" {}\nresource "x" "item" {\n  for_each = { known = "ok", dynamic = var.value }\n}\n';
+    await index.updateFile('/context/dynamic.tf', source);
+    const block = parseFile('/context/dynamic.tf', source).blocks[1];
+    if (!block) throw new Error('test fixture did not parse a resource block');
+    expect(resolveContext(block, { index, moduleDir: '/context' })).toBeUndefined();
+  });
+
+  it('stops context evaluation when cancelled', async () => {
+    const index = new WorkspaceIndex();
+    const source = 'resource "x" "item" {\n  for_each = { a = "one", b = "two" }\n}\n';
+    await index.updateFile('/context/cancel.tf', source);
+    const block = parseFile('/context/cancel.tf', source).blocks[0];
+    if (!block) throw new Error('test fixture did not parse a resource block');
+    let checks = 0;
+    expect(
+      resolveContext(
+        block,
+        { index, moduleDir: '/context' },
+        {
+          isCancelled: () => ++checks > 1,
+        },
+      ),
+    ).toBeUndefined();
+  });
+
+  it('does not treat ordinary or nested blocks as Terraform instance blocks', async () => {
+    const index = new WorkspaceIndex();
+    const source = 'locals {\n  nested {\n    count = 2\n  }\n}\n';
+    await index.updateFile('/context/ordinary.tf', source);
+    const block = parseFile('/context/ordinary.tf', source).blocks[0];
+    if (!block) throw new Error('test fixture did not parse a block');
+    expect(resolveContext(block, { index, moduleDir: '/context' })).toBeUndefined();
+    const nested = block.blocks[0];
+    if (!nested) throw new Error('test fixture did not parse nested block');
+    expect(resolveContext(nested, { index, moduleDir: '/context' })).toBeUndefined();
   });
 });
