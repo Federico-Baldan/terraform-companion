@@ -30,7 +30,7 @@
 <p align="center"><em>What does that <code>var.*</code> or <code>local.*</code> actually resolve to? Hover and find out.</em></p>
 
 <p align="center">
-  <img src="assets/demos/resolved-hover-demo.gif" alt="Hovering over a var or local shows its resolved value">
+  <img src="assets/demos/resolved-hover-demo.webp" alt="Hovering over a var or local shows its resolved value">
 </p>
 
 <br>
