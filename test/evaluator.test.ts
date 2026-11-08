@@ -575,9 +575,62 @@ describe('a reference that ran out of budget is evaluated once', () => {
     lines.push(`  all = [${Array.from({ length: count }, (_, i) => `local.v${i}`).join(', ')}]`);
     lines.push('}', '');
     await index.updateFile('/wide/locals.tf', lines.join('\n'));
+    const lookups = vi.spyOn(index, 'localsOf');
     const shape = listShape('local.all', { index, moduleDir: '/wide' });
     expect(shape.kind).toBe('strings');
     if (shape.kind === 'strings') expect(shape.values).toHaveLength(count);
+    // the module's locals are listed once for the resolve, not copied and searched
+    // again for each of the five thousand references
+    expect(lookups.mock.calls.length).toBeLessThan(10);
+  });
+
+  /** The other side of the cap: just under it, a list of interpolated locals is
+   *  measured in full and certified as the strings it is. */
+  it('measures in full a list that stays under the evaluation cap', async () => {
+    const index = new WorkspaceIndex();
+    const count = 19_500;
+    const lines = ['locals {'];
+    for (let i = 0; i < count; i++) lines.push(`  v${i} = "x${i}"`);
+    const elements = Array.from({ length: count }, (_, i) => `"\${local.v${i}}"`);
+    lines.push(`  names = [${elements.join(', ')}]`, '}', '');
+    await index.updateFile('/under/cap.tf', lines.join('\n'));
+    const shape = listShape('local.names', { index, moduleDir: '/under' });
+    expect(shape.kind).toBe('strings');
+    if (shape.kind === 'strings') {
+      expect(shape.values).toHaveLength(count);
+      expect(shape.values).not.toContain(UNKNOWN);
+    }
+  });
+
+  /** A count of evaluations says nothing about what each one costs: a read parses
+   *  the whole text of the local it reads. Under a chain past the hop limit, with
+   *  every local carrying a few hundred characters, the evaluations the cap allows
+   *  are tens of megabytes of text — a minute of host for a file under the parse
+   *  limit. The text a resolve may parse is bounded too. */
+  it('bounds the text a resolve parses, not only how many references it reads', async () => {
+    const index = new WorkspaceIndex();
+    const chain = 260;
+    const levels = 8;
+    const pad = 'p'.repeat(300);
+    const lines = ['locals {', '  c0 = ["leaf"]'];
+    for (let i = 1; i <= chain; i++) lines.push(`  c${i} = concat(local.c${i - 1}, ["${pad}"])`);
+    lines.push(`  d0 = local.c${chain}`);
+    for (let j = 1; j <= levels; j++) {
+      lines.push(`  x${j} = local.d${j - 1}`, `  y${j} = local.d${j - 1}`);
+      lines.push(`  d${j} = concat(local.x${j}, local.y${j})`);
+    }
+    lines.push('}', '');
+    await index.updateFile('/chars/locals.tf', lines.join('\n'));
+
+    const reads = vi.spyOn(parser, 'withExpressionNode');
+    try {
+      resolveRef(['local', `d${levels}`], { index, moduleDir: '/chars' });
+      const chars = reads.mock.calls.reduce((n, [text]) => n + text.length, 0);
+      // the budget is 1,000,000, checked before each read, so one text over at most
+      expect(chars).toBeLessThan(1_100_000);
+    } finally {
+      reads.mockRestore();
+    }
   });
 
   /** `MAX_DEPTH` counts module call hops, so it is another limit a reference can run

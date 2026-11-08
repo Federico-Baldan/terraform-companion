@@ -154,6 +154,13 @@ interface EvalState {
   frame: number;
   /** Evaluations of references begun so far; what `frame` numbers come from. */
   frames: number;
+  /** Characters of expression text handed to the parser so far; see
+   *  MAX_EVALUATED_CHARS. */
+  chars: number;
+  /** Each module's locals by name, listed once for the resolve: `localsOf` copies
+   *  the whole array, and a reference used to copy and search it again every time
+   *  it was evaluated. First definition wins, as `find` did. */
+  locals: Map<string, Map<string, ReturnType<WorkspaceIndex['localsOf']>[number]>>;
   /** References found already in progress, which answer `undefined` for no reason
    *  of their own: it is the walk that closed a loop, so what a subtree that met
    *  one gave up on says nothing about the subtree. Neither `failed` nor
@@ -239,9 +246,22 @@ const MAX_REF_HOPS = 256;
  *  is ⟨unknown⟩, counted as a spend so nothing certifies a rewrite on it. It only
  *  ever goes one way, so it is remembered like the element budget is. Sized by
  *  the work it bounds rather than by anything a real file does: a module reading
- *  five thousand distinct locals in one expression costs five thousand, and one
- *  read is ~25µs, so this is about half a second at the very worst. */
+ *  five thousand distinct locals in one expression costs five thousand.
+ *
+ *  It counts evaluations, not what they cost: an evaluation parses the text of
+ *  the local it reads, so the time these allow depends on how long that text is.
+ *  MAX_EVALUATED_CHARS bounds that side. */
 const MAX_REF_EVALUATIONS = 20_000;
+
+/** Characters of expression text one resolve may hand to the parser.
+ *
+ *  The other half of MAX_REF_EVALUATIONS: a read parses the whole text of what it
+ *  reads, at about a megabyte a second, so twenty thousand reads of a local with a
+ *  few hundred characters is a minute of host. A resolve evaluates each distinct
+ *  reference once, so what this counts is the text of what an expression reaches,
+ *  which is far under a megabyte for anything a module holds. Past it the rest is
+ *  ⟨unknown⟩, as a spend, and it only ever goes one way like the other budgets. */
+const MAX_EVALUATED_CHARS = 1_000_000;
 
 export interface EvalScope {
   index: WorkspaceIndex;
@@ -1032,7 +1052,7 @@ function resolveRefValue(parts: string[], scope: EvalScope, depth: number): Valu
   if (head === 'var') {
     value = resolveVar(name, scope, depth);
   } else {
-    const def = scope.index.localsOf(scope.moduleDir).find((l) => l.name === name);
+    const def = localDef(scope, name);
     // a definition starts its own expression, so structural depth restarts with
     // it; the chain is bounded by inProgress instead
     value = def ? evalText(def.attr.valueText, scope, 0) : undefined;
@@ -1257,7 +1277,33 @@ function varDefault(name: string, scope: EvalScope, depth: number): Value {
 }
 
 function evalText(text: string, scope: EvalScope, depth: number): Value {
+  const state = scope.state;
+  if (state) {
+    state.chars += text.length;
+    if (state.chars > MAX_EVALUATED_CHARS) {
+      state.spends++;
+      return undefined;
+    }
+  }
   return withExpressionNode(text, (expr) => evalNode(expr, scope, depth));
+}
+
+/** The definition of `local.<name>` in the module being resolved. */
+function localDef(
+  scope: EvalScope,
+  name: string,
+): ReturnType<WorkspaceIndex['localsOf']>[number] | undefined {
+  const state = scope.state;
+  if (!state) return scope.index.localsOf(scope.moduleDir).find((l) => l.name === name);
+  let byName = state.locals.get(scope.moduleDir);
+  if (!byName) {
+    byName = new Map();
+    for (const def of scope.index.localsOf(scope.moduleDir)) {
+      if (!byName.has(def.name)) byName.set(def.name, def);
+    }
+    state.locals.set(scope.moduleDir, byName);
+  }
+  return byName.get(name);
 }
 
 /** A fresh memo per top-level resolve, on a copy — the caller's scope is left
@@ -1279,6 +1325,8 @@ function withState(scope: EvalScope): EvalScope {
       writes: 0,
       frame: 0,
       frames: 0,
+      chars: 0,
+      locals: new Map(),
       cuts: 0,
     },
   };
