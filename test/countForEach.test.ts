@@ -834,3 +834,37 @@ describe('a sibling that does not parse cannot unlock the rewrite', () => {
     expect(detectCountLength(clean.file('/c/main.tf')!, clean)[0]!.safeToRefactor).toBe(true);
   });
 });
+
+/** The safety check pins each call site of a module that passes different values
+ *  and asks again. A call site whose *own* value runs the evaluation budget out
+ *  is reported as divergent however it is pinned, so the question that was meant
+ *  to narrow it down was asked again unchanged, without end: the stack overflowed
+ *  after ~4s of blocked extension host, and the RangeError came out of the
+ *  code-action provider on every cursor move over that block. The answer it was
+ *  heading for is the one the evaluator already gave: the list was never
+ *  measured, so nothing certifies the rewrite. */
+describe('a call site that cannot be measured', () => {
+  it('withholds the rewrite instead of recursing until the stack gives out', async () => {
+    const levels = 18;
+    const caller = ['locals {', '  L0 = ["a", "b"]'];
+    for (let i = 1; i <= levels; i++)
+      caller.push(`  L${i} = concat(local.L${i - 1}, local.L${i - 1})`);
+    caller.push('}', 'module "m" {', '  source = "../mod"', `  xs = local.L${levels}`, '}', '');
+    const module = [
+      'variable "xs" {}',
+      'resource "aws_instance" "web" {',
+      '  count = length(var.xs)',
+      '  name  = var.xs[count.index]',
+      '}',
+      '',
+    ].join('\n');
+    const index = new WorkspaceIndex();
+    await index.updateFile('/call/caller/main.tf', caller.join('\n'));
+    await index.updateFile('/call/mod/main.tf', module);
+
+    const [pattern] = detectCountLength(parseFile('/call/mod/main.tf', module), index);
+    expect(pattern).toBeDefined();
+    expect(() => pattern?.safeToRefactor).not.toThrow();
+    expect(pattern?.safeToRefactor).toBe(false);
+  });
+});

@@ -209,6 +209,12 @@ function resolvedListUnusable(
   const shape = listShape(refText, { ...base, used, pinnedSites });
   const diverged = used.divergedAt;
   if (!diverged) return shapeUnusable(shape);
+  // That module's call site is already pinned, so what diverged was not one site
+  // against another: the one site passes a value the evaluation could not finish
+  // measuring, and is reported as divergent however it is pinned. Pinning it again
+  // asks the same question, without end. The shape above is the answer already:
+  // never measured, so nothing certifies the rewrite.
+  if (pinnedSites.has(diverged.moduleDir)) return shapeUnusable(shape);
   return diverged.sites.some((site) =>
     resolvedListUnusable(
       refText,
