@@ -1,24 +1,13 @@
 <p align="center">
-  <img src="assets/logo/icon-animated.webp" alt="Terraform Companion" width="128" height="128">
+  <img src="assets/logo/icon-animated.webp" alt="Terraform Companion" width="96" height="96">
 </p>
 
-<h1 align="center">Terraform Companion</h1>
-
-<p align="center">
-  <a href="https://federico.baldan.dev">
-    <picture>
-      <source media="(prefers-reduced-motion: reduce)" srcset="https://github.com/Federico-Baldan/terraform-companion/raw/HEAD/assets/signature/signature.png">
-      <img src="assets/signature/signature-animated.webp" alt="Federico Baldan" width="150">
-    </picture>
-  </a>
-</p>
+<h2 align="center">Terraform Companion</h2>
 
 <p align="center">
   Version CodeLens, resolved-value hover on <code>var</code>, <code>local</code> and <code>path</code>, <code>count</code>&nbsp;→&nbsp;<code>for_each</code> refactor,<br>
   plus unused-local, version-constraint and <code>depends_on</code> lints, and cleanup of stale Terraform caches.
 </p>
-
-<p align="center"><em>What does that <code>var.*</code> or <code>local.*</code> actually resolve to? Hover and find out.</em></p>
 
 <p align="center">
   <a href="https://marketplace.visualstudio.com/items?itemName=Federico-Baldan.tf-companion"><img src="https://vsmarketplacebadges.dev/version-short/Federico-Baldan.tf-companion.svg?label=marketplace&amp;color=7B42BC" alt="VS Code Marketplace version"></a>
@@ -29,6 +18,16 @@
 <p align="center">
   <a href="https://marketplace.visualstudio.com/items?itemName=Federico-Baldan.tf-companion"><strong>Install from the VS Code Marketplace →</strong></a>
 </p>
+
+<p align="center">
+  <a href="#version-codelens"><kbd>Version CodeLens</kbd></a>
+  <a href="#resolved-value-hover"><kbd>Resolved-value hover</kbd></a>
+  <a href="#count--for_each"><kbd>count → for_each</kbd></a>
+  <a href="#lints"><kbd>Lints</kbd></a>
+  <a href="#cache-cleanup"><kbd>Cache cleanup</kbd></a>
+</p>
+
+<p align="center"><em>What does that <code>var.*</code> or <code>local.*</code> actually resolve to? Hover and find out.</em></p>
 
 <p align="center">
   <img src="assets/demos/resolved-hover-demo.gif" alt="Hovering over a var or local shows its resolved value">
@@ -214,3 +213,12 @@ npm run package    # .vsix
 ## Licence
 
 [MIT](LICENSE). Bugs and feature requests go in [Issues](https://github.com/Federico-Baldan/terraform-companion/issues).
+
+<p align="center">
+  <a href="https://federico.baldan.dev">
+    <picture>
+      <source media="(prefers-reduced-motion: reduce)" srcset="https://github.com/Federico-Baldan/terraform-companion/raw/HEAD/assets/signature/signature.png">
+      <img src="assets/signature/signature-animated.webp" alt="Federico Baldan" width="150">
+    </picture>
+  </a>
+</p>
