@@ -252,6 +252,23 @@ describe('F7 hover markdown', () => {
     expect(md).toContain('_no value: not set in dev.tfvars and no default_');
   });
 
+  /** An assumption qualifies a value; it does not replace the explanation of why
+   *  there is none. A file too large to read adds one to every variable, and a
+   *  variable with no value then read as if the note contradicted it. */
+  it('keeps the no-value explanation next to an assumption', () => {
+    const used = emptyUsage();
+    used.assumes.add('no file over 1 MiB, which was not read, sets this');
+    const md = hoverMarkdown({
+      target: ['var', 'region'],
+      value: UNKNOWN,
+      used,
+      tfvarsNames: ['dev.tfvars'],
+      copyCommand,
+    });
+    expect(md).toContain('assumes no file over 1 MiB, which was not read, sets this');
+    expect(md).toContain('no value: not set in dev.tfvars and no default');
+  });
+
   /** The count exists to warn before a field's hard ceiling does. A number
    *  measured on a string that still has ⟨unknown⟩ in it measures the
    *  placeholder's spelling, so it would warn about the wrong length —

@@ -602,6 +602,24 @@ describe('a reference that ran out of budget is evaluated once', () => {
     }
   });
 
+  /** The text budget is a spend like the others: a list whose later elements the
+   *  budget refused is not one that was measured, however unique it looks. */
+  it('does not certify a list when the text budget ran out before one of its elements', async () => {
+    const index = new WorkspaceIndex();
+    // each under the cap on one string (100,000), together over the text budget
+    const big = 'x'.repeat(95_000);
+    const count = 12;
+    for (let i = 0; i < count; i++) {
+      await index.updateFile(`/budget/p${i}.tf`, `locals {\n  p${i} = "${big}"\n}\n`);
+    }
+    const names = Array.from({ length: count }, (_, i) => `"\${local.p${i}}-${i}"`);
+    await index.updateFile('/budget/names.tf', `locals {\n  names = [${names.join(', ')}]\n}\n`);
+    expect(listShape('local.names', { index, moduleDir: '/budget' })).toEqual({
+      kind: 'unknown',
+      overBudget: true,
+    });
+  });
+
   /** A count of evaluations says nothing about what each one costs: a read parses
    *  the whole text of the local it reads. Under a chain past the hop limit, with
    *  every local carrying a few hundred characters, the evaluations the cap allows
@@ -626,8 +644,9 @@ describe('a reference that ran out of budget is evaluated once', () => {
     try {
       resolveRef(['local', `d${levels}`], { index, moduleDir: '/chars' });
       const chars = reads.mock.calls.reduce((n, [text]) => n + text.length, 0);
-      // the budget is 1,000,000, checked before each read, so one text over at most
-      expect(chars).toBeLessThan(1_100_000);
+      // the budget is 1,000,000 and is checked before a text is read: the one that
+      // would cross it is refused, so what was parsed never exceeds it
+      expect(chars).toBeLessThanOrEqual(1_000_000);
     } finally {
       reads.mockRestore();
     }

@@ -257,9 +257,11 @@ const MAX_REF_EVALUATIONS = 20_000;
  *
  *  The other half of MAX_REF_EVALUATIONS: a read parses the whole text of what it
  *  reads, at about a megabyte a second, so twenty thousand reads of a local with a
- *  few hundred characters is a minute of host. A resolve evaluates each distinct
- *  reference once, so what this counts is the text of what an expression reaches,
- *  which is far under a megabyte for anything a module holds. Past it the rest is
+ *  few hundred characters is a minute of host. A local is evaluated once per
+ *  resolve, so what this counts is the text of what an expression reaches, which
+ *  is far under a megabyte for anything a module holds (a call site's arguments
+ *  and a variable's default are read once per site, and count each time). The text
+ *  that would cross the budget is refused, not parsed. Past it the rest is
  *  ⟨unknown⟩, as a spend, and it only ever goes one way like the other budgets. */
 const MAX_EVALUATED_CHARS = 1_000_000;
 
@@ -945,6 +947,11 @@ function resolveRefValue(parts: string[], scope: EvalScope, depth: number): Valu
   if (head === 'path' && (name === 'module' || name === 'root' || name === 'cwd')) {
     if (parts.length !== 2) return undefined;
     const root = rootDirOf(scope);
+    // the root is found by climbing the callers, so a caller that was not read is
+    // what would make this module something other than one
+    if (scope.index.hasUnreadFile()) {
+      scope.used?.assumes.add('no file over 1 MiB, which was not read, calls this module');
+    }
     if (name === 'cwd') {
       if (scope.cwd !== undefined) {
         if (scope.rootDir === undefined) {

@@ -4,7 +4,7 @@ import { parseFile, withExpressionNode } from '../src/core/parser';
 import { WorkspaceIndex } from '../src/core/workspaceIndex';
 import { detectCountLength } from '../src/features/countForEach';
 import { detectUnusedLocals } from '../src/features/unusedLocals';
-import { initTestParser } from './helpers';
+import { initTestParser, tfvarsIn } from './helpers';
 
 beforeAll(initTestParser);
 
@@ -147,6 +147,52 @@ resource "aws_instance" "srv" {
     const index = new WorkspaceIndex();
     await index.updateFile('/w/modules/app/main.tf', child);
     expect(safeToRefactor(index)).toBe(true);
+  });
+
+  it('tells the hover that a path rests on a caller that was not read', async () => {
+    const index = new WorkspaceIndex();
+    await index.updateFile('/w/modules/app/main.tf', 'locals {\n  here = path.module\n}\n');
+    const at = (used = emptyUsage()) => ({ index, moduleDir: '/w/modules/app', used });
+    const read = emptyUsage();
+    resolveRef(['local', 'here'], at(read));
+    expect([...read.assumes].some((what) => what.includes('over 1 MiB'))).toBe(false);
+
+    // path.module is relative to the root, and an unread caller is what would make
+    // this module something other than one
+    await index.updateFile('/w/env/main.tf', unread());
+    const used = emptyUsage();
+    resolveRef(['local', 'here'], at(used));
+    expect([...used.assumes].some((what) => what.includes('over 1 MiB'))).toBe(true);
+  });
+
+  it('withholds the rewrite for a list passed by a read caller, too: another may be unread', async () => {
+    const callee = child.replace('  default = ["a", "b"]\n', '');
+    const caller = 'module "app" {\n  source = "../modules/app"\n  names  = ["a", "b"]\n}\n';
+    const check = async (withUnread: boolean) => {
+      const index = new WorkspaceIndex();
+      await index.updateFile('/w/modules/app/main.tf', callee);
+      await index.updateFile('/w/env1/main.tf', caller);
+      if (withUnread) await index.updateFile('/w/env2/main.tf', unread());
+      return detectCountLength(parseFile('/w/modules/app/main.tf', callee), index, {
+        tfvarsOf: () => new Map(),
+      })[0]?.safeToRefactor;
+    };
+    expect(await check(false)).toBe(true);
+    expect(await check(true)).toBe(false);
+  });
+
+  it('withholds the rewrite for a list set by tfvars, too: another file may be unread', async () => {
+    const callee = child.replace('  default = ["a", "b"]\n', '');
+    const check = async (withUnread: boolean) => {
+      const index = new WorkspaceIndex();
+      await index.updateFile('/w/root/main.tf', callee);
+      if (withUnread) await index.updateFile('/w/other/big.tf', unread());
+      return detectCountLength(parseFile('/w/root/main.tf', callee), index, {
+        tfvarsOf: tfvarsIn('/w/root', { names: '["a", "b"]' }),
+      })[0]?.safeToRefactor;
+    };
+    expect(await check(false)).toBe(true);
+    expect(await check(true)).toBe(false);
   });
 
   it('tells the hover that a value rests on something not read', async () => {

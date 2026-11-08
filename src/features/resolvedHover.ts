@@ -586,6 +586,9 @@ export function hoverMarkdown({
     if (escaped.some((call) => call === undefined)) return undefined;
     origins.push(`via ${escaped.join(' → ')}`);
   }
+  // where the value came from, before an assumption is added to the list: an
+  // assumption qualifies a value and says nothing of whether there is one
+  const sourced = origins.length > 0;
   // a value that rests on something no file shows says so, rather than read as fact
   if (used.assumes.size > 0) {
     const escaped = [...used.assumes].map((what) => escapeMd(what, isCancelled));
@@ -602,7 +605,7 @@ export function hoverMarkdown({
   const count = charNote(value, shape);
   if (count !== undefined) meta.push(count);
   if (origins.length > 0) meta.push(origins.join(' + '));
-  else if (target[0] === 'var' && value === UNKNOWN) {
+  if (!sourced && target[0] === 'var' && value === UNKNOWN) {
     const where =
       tfvarsNames && tfvarsNames.length > 0
         ? tfvarsNames.map((file) => escapeMd(file, isCancelled)).join(', ')
