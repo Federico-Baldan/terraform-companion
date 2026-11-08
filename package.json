@@ -2,7 +2,7 @@
   "name": "tf-companion",
   "displayName": "Terraform Companion",
   "description": "Terraform version CodeLens, resolved-value hover on var, local and path, count→for_each refactor, lints, and cache cleanup.",
-  "version": "1.2.5",
+  "version": "1.3.0",
   "publisher": "Federico-Baldan",
   "license": "MIT",
   "repository": {
