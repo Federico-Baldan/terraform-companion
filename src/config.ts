@@ -1,3 +1,4 @@
+import { isAbsolute } from 'node:path';
 import * as vscode from 'vscode';
 
 /**
@@ -52,6 +53,33 @@ const MIN_STALE_DAYS = 1;
 export function cacheCleanerStaleDays(): number {
   const configured = cfg().get<number>('cacheCleaner.staleDays', DEFAULT_STALE_DAYS);
   return Number.isFinite(configured) ? Math.max(configured, MIN_STALE_DAYS) : DEFAULT_STALE_DAYS;
+}
+
+/** A directory setting, only if it can be used as written. VS Code does not
+ *  expand `${workspaceFolder}` in a setting and settings.json is not
+ *  type-checked, and a relative path would resolve against the extension host's
+ *  own working directory, which is nobody's Terraform directory. */
+function absolutePath(key: string): string | undefined {
+  const value = cfg().get<unknown>(key);
+  if (typeof value !== 'string') return undefined;
+  const trimmed = value.trim();
+  if (trimmed === '' || trimmed.includes('${') || !isAbsolute(trimmed)) return undefined;
+  // no directory Terraform reports carries a trailing separator, and one would
+  // keep the setting from matching the directory the index spells without it.
+  // A root (`/`, `C:\`) is all separator and stays as it is.
+  const bare = trimmed.replace(/[\\/]+$/, '');
+  if (bare === '') return trimmed.charAt(0);
+  return /^[a-zA-Z]:$/.test(bare) ? trimmed.slice(0, bare.length + 1) : bare;
+}
+
+/** The Terraform root module directory, when the user said which it is. */
+export function terraformRoot(): string | undefined {
+  return absolutePath('terraformRoot');
+}
+
+/** The directory Terraform is run from, when the user said which it is. */
+export function terraformCwd(): string | undefined {
+  return absolutePath('terraformCwd');
 }
 
 export function cacheCleanerAutoDelete(): boolean {

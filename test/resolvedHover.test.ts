@@ -103,6 +103,7 @@ describe('F7 hover markdown', () => {
       used,
       copyCommand,
     });
+
     expect(md).toContain('**local.name_prefix** = `prod-name-dev`');
     expect(md).toContain('_13 chars · from prod.tfvars + default in variables.tf_');
     expect(md).toContain(
@@ -634,4 +635,218 @@ describe('a module called from many stacks cannot freeze the hover', () => {
     // runner, tight enough that either cap regressing trips it.
     expect(elapsed).toBeLessThan(2_500);
   }, 120_000);
+});
+
+describe('Terraform context hover', () => {
+  async function hover(source: string, line: number, column: number, extra = {}) {
+    const localIndex = new WorkspaceIndex();
+    const path = '/context/main.tf';
+    await localIndex.updateFile(path, source);
+    const file = parseFile(path, source);
+    return computeHover(
+      file,
+      { row: line, column },
+      {
+        index: localIndex,
+        tfvarsOf: () => new Map(),
+        copyCommand: 'tfCompanion.copyValue',
+        ...extra,
+      },
+    );
+  }
+
+  it('renders count instances and rejects an attribute tail', async () => {
+    const md = await hover(
+      'resource "x" "item" {\n  count = 3\n  name = "${count.index}"\n}\n',
+      2,
+      22,
+    );
+    expect(md).toContain('count.index = 0');
+    expect(md).toContain('count.index = 2');
+    expect(
+      await hover('resource "x" "item" {\n  count = 1\n  name = "${count.index.foo}"\n}\n', 2, 25),
+    ).toContain('⟨unknown⟩');
+  });
+
+  it('renders each.key for every for_each map instance', async () => {
+    const md = await hover(
+      'resource "x" "item" {\n  for_each = { api = "small", web = "large" }\n  name = each.key\n}\n',
+      2,
+      10,
+    );
+    expect(md).toContain('each.key = api');
+    expect(md).toContain('each.key = web');
+  });
+
+  it('renders each.value for every for_each map instance', async () => {
+    const md = await hover(
+      'resource "x" "item" {\n  for_each = { api = "small", web = "large" }\n  size = each.value\n}\n',
+      2,
+      10,
+    );
+    expect(md).toContain('each.key = api');
+    expect(md).toContain('`small`');
+    expect(md).toContain('each.key = web');
+    expect(md).toContain('`large`');
+  });
+
+  it('does not branch ordinary var hover for a multi-instance block', async () => {
+    const md = await hover(
+      'variable "name" { default = "x" }\nresource "x" "item" {\n  count = 3\n  name = var.name\n}\n',
+      3,
+      10,
+    );
+    expect(md).toContain('**var.name**');
+    expect(md).not.toContain('differs per');
+  });
+
+  it('walks into an each.value object, one row per instance', async () => {
+    const md = await hover(
+      'resource "x" "item" {\n  for_each = { api = { size = "small" }, web = { size = "large" } }\n  size = each.value.size\n}\n',
+      2,
+      10,
+    );
+    expect(md).toContain('each.key = api');
+    expect(md).toContain('`small`');
+    expect(md).toContain('each.key = web');
+    expect(md).toContain('`large`');
+    expect(md).not.toContain('⟨unknown⟩');
+  });
+
+  it('uses explicit path context and leaves unavailable cwd unknown', async () => {
+    const md = await hover(
+      'locals { paths = "${path.module}|${path.root}|${path.cwd}" }\nresource "x" "item" {\n  name = local.paths\n}\n',
+      2,
+      10,
+      { rootDir: '/context', cwd: '/terraform-run' },
+    );
+    // module and root are relative to the root module, cwd is the absolute run directory
+    expect(md).toContain('.|.|/terraform-run');
+    // no terraformRoot: a module nothing calls is the root, so it needs no setting
+    const found = await hover('resource "x" "item" { name = path.root }\n', 0, 35);
+    expect(found).toContain('**path.root** = `.`');
+    // the run directory is not in any file: without terraformCwd it is the root
+    // module directory, and the hover says that is an assumption
+    const assumed = await hover('resource "x" "item" { name = path.cwd }\n', 0, 35);
+    expect(assumed).toContain('**path.cwd** = `/context`');
+    expect(assumed).toContain('assumes terraform runs in the root module directory');
+    expect(md).not.toContain('assumes');
+  });
+
+  it('does not borrow provenance from the count it had to evaluate', async () => {
+    const md = await hover(
+      'variable "n" { default = 1 }\nresource "x" "item" {\n  count = var.n\n  name = count.index\n}\n',
+      3,
+      12,
+    );
+    expect(md).toContain('**count.index** = `0`');
+    expect(md).not.toContain('default in');
+  });
+
+  it('says nothing when the block does not use the meta-argument asked about', async () => {
+    expect(
+      await hover(
+        'resource "x" "item" {\n  for_each = { a = "1", b = "2" }\n  name = count.index\n}\n',
+        2,
+        12,
+      ),
+    ).toBeUndefined();
+    expect(
+      await hover('resource "x" "item" {\n  count = 2\n  name = each.key\n}\n', 2, 12),
+    ).toBeUndefined();
+  });
+
+  it('labels the rows as instances of the block, not of a module', async () => {
+    const md = await hover(
+      'resource "x" "item" {\n  count = 3\n  name = "${count.index}"\n}\n',
+      2,
+      22,
+    );
+    expect(md).toContain('per instance');
+    expect(md).not.toContain('differs per module instance');
+  });
+
+  it('keeps a newline in a for_each key out of the markdown structure', async () => {
+    const md = await hover(
+      'resource "x" "item" {\n  for_each = { "a\\n\\n# Heading\\n- fake row" = "v", b = "w" }\n  name = each.key\n}\n',
+      2,
+      10,
+    );
+    expect(md).toBeDefined();
+    expect(md!.split('\n').some((line) => line.startsWith('# Heading'))).toBe(false);
+    expect(md!.split('\n').some((line) => line.startsWith('- fake row'))).toBe(false);
+  });
+
+  /** `for each in ...` binds its own `each`: inside the expression it is not the
+   *  resource's, and showing the resource's value there is a wrong answer. */
+  it('says nothing for an each or count that a for expression rebinds', async () => {
+    expect(
+      await hover(
+        'variable "objs" { default = [{ value = "from-iterator" }] }\nresource "x" "i" {\n  for_each = { a = "resource-value" }\n  n = [for each in var.objs : each.value]\n}\n',
+        3,
+        33,
+      ),
+    ).toBeUndefined();
+    expect(
+      await hover(
+        'resource "x" "i" {\n  count = 2\n  n = [for count in [7, 8] : count.index]\n}\n',
+        2,
+        32,
+      ),
+    ).toBeUndefined();
+  });
+
+  /** The rows and `each` are read through throwaway usages so the hovered value
+   *  does not borrow the provenance of the collection it was discovered in, but an
+   *  assumption is not provenance: a value that rests on one has to say so wherever
+   *  it is shown. */
+  it('keeps the assumption behind a path.cwd that reaches each.value', async () => {
+    const note = 'assumes terraform runs in the root module directory';
+    const one = await hover(
+      'resource "x" "item" {\n  for_each = { a = path.cwd }\n  name = each.value\n}\n',
+      2,
+      12,
+    );
+    expect(one).toContain('/context');
+    expect(one).toContain(note);
+    const two = await hover(
+      'resource "x" "item" {\n  for_each = { a = path.cwd, b = "x" }\n  name = each.value\n}\n',
+      2,
+      12,
+    );
+    expect(two).toContain('per instance');
+    expect(two).toContain(note);
+  });
+
+  it('says nothing for an each that a for expression binds as its key', async () => {
+    const line = '  n = [for each, v in var.o : each.key]';
+    expect(
+      await hover(
+        `variable "o" { default = { x = "v" } }\nresource "x" "i" {\n  for_each = { a = "r" }\n${line}\n}\n`,
+        3,
+        line.lastIndexOf('each') + 1,
+      ),
+    ).toBeUndefined();
+  });
+
+  it('does not inherit context into nested blocks', async () => {
+    const md = await hover(
+      'resource "x" "item" {\n  count = 2\n  nested {\n    name = count.index\n  }\n}\n',
+      3,
+      15,
+    );
+    expect(md).toBeUndefined();
+  });
+
+  it('abandons markdown when cancellation occurs during rendering', () => {
+    let checks = 0;
+    const md = hoverMarkdown({
+      target: ['var', 'value'],
+      value: 'value with [markdown] and a long copy payload',
+      used: emptyUsage(),
+      copyCommand: 'tfCompanion.copyValue',
+      isCancelled: () => ++checks > 2,
+    });
+    expect(md).toBeUndefined();
+  });
 });

@@ -1,5 +1,14 @@
-import { beforeAll, describe, expect, it } from 'vitest';
-import { type EvalScope, resolveExpr, resolveRef, UNKNOWN } from '../src/core/evaluator';
+import { beforeAll, describe, expect, it, vi } from 'vitest';
+import {
+  type EvalScope,
+  emptyUsage,
+  listShape,
+  resolveContext,
+  resolveExpr,
+  resolveRef,
+  UNKNOWN,
+} from '../src/core/evaluator';
+import { parseFile } from '../src/core/parser';
 import { WorkspaceIndex } from '../src/core/workspaceIndex';
 import { initTestParser, tfvarsIn } from './helpers';
 
@@ -74,6 +83,35 @@ describe('F7 evaluator', () => {
     expect(resolveExpr('toset(["b", "a", "b"])', scope)).toBe('[a, b]');
     // non-strings keep their elements: the shape checks still need them
     expect(resolveExpr('toset([8080, 8080])', scope)).toBe('[8080, 8080]');
+  });
+
+  /** A set converts to a list wherever a function wants one, so wrapping a list
+   *  in `toset` must not turn a resolvable `join` into ⟨unknown⟩. */
+  it('joins and re-sets a set, which converts to a list for the call', () => {
+    expect(resolveExpr('join(",", toset(["b", "a", "b"]))', scope)).toBe('a,b');
+    expect(resolveExpr('toset(toset(["b", "a"]))', scope)).toBe('[a, b]');
+  });
+
+  /** Terraform reports a module's directory as it was loaded, relative to the
+   *  root module's directory, and only `path.cwd` as an absolute path (see
+   *  GetPathAttr in hashicorp/terraform internal/terraform/evaluate.go). */
+  it('reports path.module and path.root relative to the root module, like terraform', async () => {
+    const index = new WorkspaceIndex();
+    await index.updateFile(
+      '/work/infra/main.tf',
+      'module "vpc" {\n  source = "./modules/vpc"\n}\nmodule "shared" {\n  source = "../shared/vpc"\n}\n',
+    );
+    await index.updateFile('/work/infra/modules/vpc/main.tf', 'locals {}\n');
+    await index.updateFile('/work/shared/vpc/main.tf', 'locals {}\n');
+    const at = (moduleDir: string): EvalScope => ({ index, moduleDir, rootDir: '/work/infra' });
+    expect(resolveRef(['path', 'root'], at('/work/infra'))).toBe('.');
+    expect(resolveRef(['path', 'module'], at('/work/infra'))).toBe('.');
+    expect(resolveRef(['path', 'module'], at('/work/infra/modules/vpc'))).toBe('modules/vpc');
+    expect(resolveRef(['path', 'module'], at('/work/shared/vpc'))).toBe('../shared/vpc');
+  });
+
+  it('keeps a configured path.cwd as given, absolute', () => {
+    expect(resolveRef(['path', 'cwd'], { ...scope, cwd: '/terraform-run' })).toBe('/terraform-run');
   });
 
   it('format supports %q (quoted) and %% (literal percent)', () => {
@@ -437,5 +475,365 @@ describe('nesting cannot overflow the stack', () => {
     await index.updateFile('/chain/l.tf', lines.join('\n'));
     const s: EvalScope = { index, moduleDir: '/chain', tfvarsOf: tfvarsIn('/chain', {}) };
     expect(resolveRef(['local', 'c250'], s)).toBe('x');
+  });
+
+  it('resolves supported block context and leaves unsupported context unknown', async () => {
+    const index = new WorkspaceIndex();
+    const source = 'resource "x" "item" {\n  count = 3\n  name = "${count.index}"\n}\n';
+    await index.updateFile('/context/main.tf', source);
+    const block = parseFile('/context/main.tf', source).blocks[0];
+    if (!block) throw new Error('test fixture did not parse a resource block');
+    const s: EvalScope = { index, moduleDir: '/context' };
+    const instances = resolveContext(block, s);
+    expect(instances?.at(-1)?.countIndex).toBe(2);
+    expect(resolveRef(['count', 'index'], { ...s, context: instances?.[1] })).toBe('1');
+    expect(resolveRef(['self', 'id'], { ...s, context: instances?.[1] })).toBe(UNKNOWN);
+  });
+
+  it('accepts only map and set collections for for_each', async () => {
+    const index = new WorkspaceIndex();
+    const source = 'resource "x" "item" {\n  for_each = ["a", "b"]\n}\n';
+    await index.updateFile('/context/list.tf', source);
+    const listBlock = parseFile('/context/list.tf', source).blocks[0];
+    if (!listBlock) throw new Error('test fixture did not parse a resource block');
+    expect(resolveContext(listBlock, { index, moduleDir: '/context' })).toBeUndefined();
+
+    const setSource = 'resource "x" "item" {\n  for_each = toset(["a", "b"])\n}\n';
+    await index.updateFile('/context/set.tf', setSource);
+    const setBlock = parseFile('/context/set.tf', setSource).blocks[0];
+    if (!setBlock) throw new Error('test fixture did not parse a resource block');
+    expect(resolveContext(setBlock, { index, moduleDir: '/context' })).toHaveLength(2);
+  });
+
+  it('rejects oversized for_each maps and attribute tails on context values', async () => {
+    const entries = Array.from({ length: 65 }, (_, i) => `k${i} = "${i}"`).join(', ');
+    const index = new WorkspaceIndex();
+    const source = `resource "x" "item" {\n  for_each = { ${entries} }\n}\n`;
+    await index.updateFile('/context/map.tf', source);
+    const block = parseFile('/context/map.tf', source).blocks[0];
+    if (!block) throw new Error('test fixture did not parse a resource block');
+    const scope: EvalScope = {
+      index,
+      moduleDir: '/context',
+      context: { label: 'x', countIndex: 0 },
+    };
+    expect(resolveContext(block, scope)).toBeUndefined();
+    expect(resolveRef(['count', 'index', 'tail'], scope)).toBe(UNKNOWN);
+    expect(resolveRef(['path', 'module', 'tail'], { ...scope, context: undefined })).toBe(UNKNOWN);
+  });
+
+  it('rejects dynamic or unknown map entries as a whole', async () => {
+    const index = new WorkspaceIndex();
+    const source =
+      'variable "value" {}\nresource "x" "item" {\n  for_each = { known = "ok", dynamic = var.value }\n}\n';
+    await index.updateFile('/context/dynamic.tf', source);
+    const block = parseFile('/context/dynamic.tf', source).blocks[1];
+    if (!block) throw new Error('test fixture did not parse a resource block');
+    expect(resolveContext(block, { index, moduleDir: '/context' })).toBeUndefined();
+  });
+
+  it('stops context evaluation when cancelled', async () => {
+    const index = new WorkspaceIndex();
+    const source = 'resource "x" "item" {\n  for_each = { a = "one", b = "two" }\n}\n';
+    await index.updateFile('/context/cancel.tf', source);
+    const block = parseFile('/context/cancel.tf', source).blocks[0];
+    if (!block) throw new Error('test fixture did not parse a resource block');
+    let checks = 0;
+    expect(
+      resolveContext(
+        block,
+        { index, moduleDir: '/context' },
+        {
+          isCancelled: () => ++checks > 1,
+        },
+      ),
+    ).toBeUndefined();
+  });
+
+  it('does not treat ordinary or nested blocks as Terraform instance blocks', async () => {
+    const index = new WorkspaceIndex();
+    const source = 'locals {\n  nested {\n    count = 2\n  }\n}\n';
+    await index.updateFile('/context/ordinary.tf', source);
+    const block = parseFile('/context/ordinary.tf', source).blocks[0];
+    if (!block) throw new Error('test fixture did not parse a block');
+    expect(resolveContext(block, { index, moduleDir: '/context' })).toBeUndefined();
+    const nested = block.blocks[0];
+    if (!nested) throw new Error('test fixture did not parse nested block');
+    expect(resolveContext(nested, { index, moduleDir: '/context' })).toBeUndefined();
+  });
+});
+
+describe('context values', () => {
+  async function resource(source: string) {
+    const index = new WorkspaceIndex();
+    await index.updateFile('/context/main.tf', source);
+    const block = parseFile('/context/main.tf', source).blocks.find((b) => b.kind === 'resource');
+    if (!block) throw new Error('fixture has no resource block');
+    return { index, block, s: { index, moduleDir: '/context' } as EvalScope };
+  }
+
+  /** Values share structure: a local read twice is one object. Converting one as
+   *  a tree doubles the work with every level, so a 24-line chain of locals froze
+   *  the extension host. */
+  it('does not expand a shared value as a tree', async () => {
+    // deep enough that expanding the shared structure as a tree takes seconds, not
+    // the fraction of one that a slower machine could blame
+    const levels = 26;
+    const chain = ['a0 = ["x", "x"]'];
+    for (let i = 1; i <= levels; i++) chain.push(`a${i} = [local.a${i - 1}, local.a${i - 1}]`);
+    const { block, s } = await resource(
+      `locals {\n${chain.map((l) => `  ${l}`).join('\n')}\n}\nresource "x" "r" {\n  for_each = { k = local.a${levels} }\n}\n`,
+    );
+    const started = performance.now();
+    const instances = resolveContext(block, s);
+    resolveRef(['each', 'value'], { ...s, context: instances?.[0] });
+    expect(performance.now() - started).toBeLessThan(500);
+    expect(instances).toHaveLength(1);
+  });
+
+  it('keeps numbers exactly as written', async () => {
+    const { block, s } = await resource(
+      'resource "x" "r" {\n  for_each = { k = { a = 12345678901234567890, b = 100000000000000000000000, c = 0.1234567890123456789 } }\n}\n',
+    );
+    const [instance] = resolveContext(block, s) ?? [];
+    for (const [key, literal] of [
+      ['a', '12345678901234567890'],
+      ['b', '100000000000000000000000'],
+      ['c', '0.1234567890123456789'],
+    ] as const) {
+      expect(resolveRef(['each', 'value', key], { ...s, context: instance })).toBe(
+        resolveExpr(literal, s),
+      );
+    }
+  });
+
+  it('keeps a key named __proto__', async () => {
+    const { block, s } = await resource(
+      'resource "x" "r" {\n  for_each = { k = { "__proto__" = "p", real = "r" } }\n}\n',
+    );
+    const [instance] = resolveContext(block, s) ?? [];
+    expect(resolveRef(['each', 'value', '__proto__'], { ...s, context: instance })).toBe('p');
+    expect(resolveRef(['each', 'value', 'real'], { ...s, context: instance })).toBe('r');
+  });
+
+  it('accepts a for_each map of exactly 64 entries and rejects 65', async () => {
+    const map = (n: number) =>
+      `resource "x" "r" {\n  for_each = { ${Array.from({ length: n }, (_, i) => `k${i} = "${i}"`).join(', ')} }\n}\n`;
+    const sixtyFour = await resource(map(64));
+    expect(resolveContext(sixtyFour.block, sixtyFour.s)).toHaveLength(64);
+    const sixtyFive = await resource(map(65));
+    expect(resolveContext(sixtyFive.block, sixtyFive.s)).toBeUndefined();
+  });
+
+  it('reads an unresolved element of a set as unknown, the way it does for a list', () => {
+    const asList = listShape('[var.region, "a"]', scope);
+    expect(asList.kind).toBe('unknown');
+    expect(listShape('toset([var.region, "a"])', scope)).toEqual(asList);
+  });
+
+  /** An explicit root answers "which directory is the root". It cannot speak for a
+   *  module that another root owns, so there the root is found from the files. */
+  it('uses an explicit root only for the modules it applies to', async () => {
+    const index = new WorkspaceIndex();
+    await index.updateFile(
+      '/repo/envs/prod/main.tf',
+      'module "vpc" {\n  source = "../../modules/vpc"\n}\n',
+    );
+    await index.updateFile('/repo/envs/dev/main.tf', 'locals {}\n');
+    await index.updateFile('/repo/modules/vpc/main.tf', 'locals {}\n');
+    const base = { index, rootDir: '/repo/envs/prod', cwd: '/run/prod' };
+
+    const dev: EvalScope = { ...base, moduleDir: '/repo/envs/dev' };
+    expect(resolveRef(['path', 'module'], dev)).toBe('.');
+    const assumed = emptyUsage();
+    expect(resolveRef(['path', 'cwd'], { ...dev, used: assumed })).toBe('/repo/envs/dev');
+    expect(assumed.assumes.size).toBe(1);
+
+    const prod: EvalScope = { ...base, moduleDir: '/repo/envs/prod' };
+    expect(resolveRef(['path', 'module'], prod)).toBe('.');
+    expect(resolveRef(['path', 'cwd'], prod)).toBe('/run/prod');
+    const vpc: EvalScope = { ...base, moduleDir: '/repo/modules/vpc' };
+    expect(resolveRef(['path', 'module'], vpc)).toBe('../../modules/vpc');
+  });
+
+  /** One window can hold several roots, and a single terraformCwd describes only
+   *  one run. `terraform -chdir=` may point anywhere, so no relation between the
+   *  run directory and a root can be checked: what can be said is that, with
+   *  several roots and no terraformRoot to say which one the setting belongs to,
+   *  the setting is applied to all of them as an assumption. */
+  it('says a configured path.cwd is an assumption for a root among several', async () => {
+    const index = new WorkspaceIndex();
+    await index.updateFile('/ws/envs/dev/main.tf', 'locals {}\n');
+    await index.updateFile('/ws/envs/prod/main.tf', 'locals {}\n');
+    const used = emptyUsage();
+    const scope: EvalScope = { index, moduleDir: '/ws/envs/dev', cwd: '/run/prod', used };
+    expect(resolveRef(['path', 'cwd'], scope)).toBe('/run/prod');
+    expect([...used.assumes].join()).toContain('terraformCwd');
+  });
+
+  it('takes a configured path.cwd at its word when there is a single root', async () => {
+    const index = new WorkspaceIndex();
+    await index.updateFile('/ws/main.tf', 'module "m" {\n  source = "./m"\n}\n');
+    await index.updateFile('/ws/m/main.tf', 'locals {}\n');
+    const used = emptyUsage();
+    expect(resolveRef(['path', 'cwd'], { index, moduleDir: '/ws/m', cwd: '/run', used })).toBe(
+      '/run',
+    );
+    expect(used.assumes.size).toBe(0);
+  });
+
+  /** VS Code spells a Windows drive letter in lower case; a setting is spelled as
+   *  it was typed. */
+  it('compares configured directories without regard to the case of a drive letter', async () => {
+    const index = new WorkspaceIndex();
+    await index.updateFile('c:/ws/envs/prod/main.tf', 'locals {}\n');
+    const used = emptyUsage();
+    const scope: EvalScope = {
+      index,
+      moduleDir: 'c:/ws/envs/prod',
+      rootDir: 'C:/ws/envs/prod',
+      cwd: 'C:/ws',
+      used,
+    };
+    expect(resolveRef(['path', 'cwd'], scope)).toBe('C:/ws');
+    expect(used.assumes.size).toBe(0);
+  });
+
+  describe('which root a module belongs to', () => {
+    const workspace = async (files: Record<string, string>) => {
+      const index = new WorkspaceIndex();
+      for (const [path, text] of Object.entries(files)) await index.updateFile(path, text);
+      return index;
+    };
+    const call = (name: string, source: string) =>
+      `module "${name}" {\n  source = "${source}"\n}\n`;
+
+    it('finds the one root above a module that two of its modules both call', async () => {
+      const index = await workspace({
+        '/r/main.tf': call('b', './b') + call('c', './c'),
+        '/r/b/main.tf': call('d', '../d'),
+        '/r/c/main.tf': call('d', '../d'),
+        '/r/d/main.tf': 'locals {}\n',
+      });
+      expect(resolveRef(['path', 'module'], { index, moduleDir: '/r/d' })).toBe('d');
+    });
+
+    it('is not thrown by modules that call each other', async () => {
+      const index = await workspace({
+        '/r/main.tf': call('a', './a') + call('b', './b'),
+        '/r/a/main.tf': call('b', '../b'),
+        '/r/b/main.tf': call('a', '../a'),
+      });
+      expect(resolveRef(['path', 'module'], { index, moduleDir: '/r/a' })).toBe('a');
+    });
+
+    const twoRoots = {
+      '/repo/envs/prod/main.tf': call('vpc', '../../modules/vpc'),
+      '/repo/envs/dev/main.tf': call('vpc', '../../modules/vpc'),
+      '/repo/modules/vpc/main.tf': 'locals {}\n',
+    };
+
+    it('claims nothing for a module two roots reach, since path.module differs between them', async () => {
+      const index = await workspace(twoRoots);
+      const scope: EvalScope = { index, moduleDir: '/repo/modules/vpc' };
+      expect(resolveRef(['path', 'module'], scope)).toBe(UNKNOWN);
+    });
+
+    it('lets an explicit root settle a module two roots reach', async () => {
+      const index = await workspace(twoRoots);
+      const scope: EvalScope = {
+        index,
+        moduleDir: '/repo/modules/vpc',
+        rootDir: '/repo/envs/prod',
+      };
+      expect(resolveRef(['path', 'module'], scope)).toBe('../../modules/vpc');
+    });
+  });
+
+  /** The note is for a window that really holds several roots. A directory that
+   *  has only a .tfvars file is not a module, so it is not one. */
+  it('does not count a directory holding only tfvars as a second root', async () => {
+    const index = new WorkspaceIndex();
+    await index.updateFile('/repo/main.tf', 'locals {}\n');
+    await index.updateFile('/repo/environments/prod.tfvars', 'x = 1\n');
+    const used = emptyUsage();
+    const scope: EvalScope = { index, moduleDir: '/repo', cwd: '/run', used };
+    expect(resolveRef(['path', 'cwd'], scope)).toBe('/run');
+    expect(used.assumes.size).toBe(0);
+  });
+
+  /** An example that calls the module it sits in is a root of its own: it is run
+   *  from its own directory. Roots are told apart the way `rootDirOf` tells them,
+   *  by the calls from outside a module's own tree. */
+  it('counts an example that calls its own module as a second root', async () => {
+    const index = new WorkspaceIndex();
+    await index.updateFile('/lib/main.tf', 'locals {}\n');
+    await index.updateFile(
+      '/lib/examples/basic/main.tf',
+      'module "lib" {\n  source = "../.."\n}\n',
+    );
+    const used = emptyUsage();
+    expect(resolveRef(['path', 'cwd'], { index, moduleDir: '/lib', cwd: '/run', used })).toBe(
+      '/run',
+    );
+    expect([...used.assumes].join()).toContain('terraformCwd');
+  });
+
+  /** A hover can evaluate path.cwd once per row, and counting the roots walks the
+   *  whole index. */
+  it('counts the roots once for as long as the index does not change', async () => {
+    const index = new WorkspaceIndex();
+    await index.updateFile('/ws/a/main.tf', 'locals {}\n');
+    await index.updateFile('/ws/b/main.tf', 'locals {}\n');
+    const files = vi.spyOn(index, 'files');
+    const scope: EvalScope = { index, moduleDir: '/ws/a', cwd: '/run', used: emptyUsage() };
+    resolveRef(['path', 'cwd'], scope);
+    resolveRef(['path', 'cwd'], scope);
+    expect(files).toHaveBeenCalledTimes(1);
+    await index.updateFile('/ws/c/main.tf', 'locals {}\n');
+    resolveRef(['path', 'cwd'], scope);
+    expect(files).toHaveBeenCalledTimes(2);
+  });
+
+  describe('configured directories against the index', () => {
+    const matches = async (indexed: string, rootDir: string): Promise<boolean> => {
+      const index = new WorkspaceIndex();
+      await index.updateFile(`${indexed}/main.tf`.replace(/^\/\//, '/'), 'locals {}\n');
+      const used = emptyUsage();
+      const scope: EvalScope = {
+        index,
+        moduleDir: index.moduleDirOf(`${indexed}/main.tf`.replace(/^\/\//, '/')),
+        rootDir,
+        cwd: '/run',
+        used,
+      };
+      const value = resolveRef(['path', 'cwd'], scope);
+      return value === '/run' && used.assumes.size === 0;
+    };
+
+    it('matches a root at the root of the file system, which the index spells empty', async () => {
+      expect(await matches('', '/')).toBe(true);
+      expect(await matches('c:', 'C:/')).toBe(true);
+    });
+
+    it('keeps two directories that differ only in case apart', async () => {
+      expect(await matches('/ws/envs/prod', '/WS/envs/prod')).toBe(false);
+      expect(await matches('/ws/envs/prod', '/ws/envs/prod')).toBe(true);
+    });
+
+    it('stops the climb at an explicit root that another module calls', async () => {
+      const index = new WorkspaceIndex();
+      await index.updateFile(
+        'c:/ws/envs/prod/main.tf',
+        'module "m" {\n  source = "../../modules/m"\n}\n',
+      );
+      await index.updateFile('c:/ws/modules/m/main.tf', 'locals {}\n');
+      const scope: EvalScope = {
+        index,
+        moduleDir: 'c:/ws/modules/m',
+        rootDir: 'C:/ws/modules/m',
+      };
+      expect(resolveRef(['path', 'module'], scope)).toBe('.');
+    });
   });
 });

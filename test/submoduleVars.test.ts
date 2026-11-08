@@ -316,6 +316,7 @@ locals {
   twice = "\${var.env}-\${var.env}"
   combo = "\${var.env}-\${var.region}"
   fixed = "constant"
+  where = "\${path.cwd}/\${var.env}"
 }
 `,
   };
@@ -345,6 +346,15 @@ locals {
     expect(body).toContain('`app-dev`');
     expect(body).toContain('`app-prod`');
     expect(body).not.toMatch(/`dev`/);
+  });
+
+  /** Each row is resolved under its own call site, hence its own root, so its
+   *  run directory differs too, and each one is an assumption. */
+  it('says that a run directory read per instance is an assumption', async () => {
+    const body = await hoverLocal('where');
+    expect(body).toContain('`/ws/envs/dev/dev`');
+    expect(body).toContain('`/ws/envs/prod/prod`');
+    expect(body).toContain('assumes terraform runs in the root module directory');
   });
 
   it('substitutes the divergent var at every occurrence', async () => {

@@ -107,6 +107,14 @@
           "type": "boolean",
           "default": true,
           "description": "Hover on var.* and local.* with the final value resolved through the var→local chain"
+        },
+        "tfCompanion.terraformCwd": {
+          "type": "string",
+          "description": "Absolute path of the directory Terraform is run from, used for path.cwd in the resolved-value hover. A relative path or ${workspaceFolder} is ignored. Unset means the root module directory is assumed, and the hover says so. With several roots in the window (folders with .tf files that no module calls, examples included) and no terraformRoot, it is used for every one of them, and the hover says so too"
+        },
+        "tfCompanion.terraformRoot": {
+          "type": "string",
+          "description": "Absolute path of the Terraform root module directory, used for path.root and path.module in the resolved-value hover. A relative path or ${workspaceFolder} is ignored. It applies to the modules under that root; any other root in the window is found from the module calls. Unset means the root is the module that no other module calls"
         }
       }
     }

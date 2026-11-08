@@ -1,5 +1,7 @@
+import { relative } from 'node:path';
 import type { Node } from 'web-tree-sitter';
 import { attrOf } from './hcl';
+import type { TfBlock } from './model';
 import { withExpressionNode } from './parser';
 import type { ModuleCallSite, WorkspaceIndex } from './workspaceIndex';
 
@@ -26,6 +28,10 @@ export interface EvalUsage {
    *  Carries the shape because each row is rendered on its own terms — one
    *  instance can pass a name and another a list. */
   conflicts: Map<string, ResolvedValue>;
+  /** What a value rests on that no file in the workspace can show, so the hover
+   *  can say so instead of presenting a guess as a fact. Today that is one case:
+   *  where Terraform was run from, for `path.cwd`. */
+  assumes: Set<string>;
   /** Where call sites disagreed — `"app-${var.env}"` needs per-instance eval,
    *  so this marks where to branch. */
   divergedAt?: { moduleDir: string; sites: ModuleCallSite[]; labels: string[] };
@@ -38,6 +44,7 @@ export function emptyUsage(): EvalUsage {
     defaults: new Map(),
     calls: new Set(),
     conflicts: new Map(),
+    assumes: new Set(),
   };
 }
 
@@ -152,14 +159,104 @@ const MAX_REF_HOPS = 256;
 export interface EvalScope {
   index: WorkspaceIndex;
   moduleDir: string;
+  rootDir?: string;
+  cwd?: string;
   /** Per-directory lookup, not one map — climbing from submodule to caller
    *  needs the caller's own tfvars. */
   tfvarsOf?: (moduleDir: string) => ReadonlyMap<string, TfvarsValue>;
   /** module dir → the single call site to resolve through, ignoring the others */
   pinnedSites?: Map<string, ModuleCallSite>;
   used?: EvalUsage;
+  /** Terraform's implicit values for the block containing the expression. */
+  context?: ContextInstance;
+  /** Internal guard used while discovering for_each collections. */
+  contextDiscovery?: boolean;
+  isCancelled?: () => boolean;
   /** internal; the entry points install it, spreads carry it down */
   state?: EvalState;
+}
+
+export interface ContextInstance {
+  label: string;
+  countIndex?: number;
+  eachKey?: string;
+  /** The evaluator's own value, shared rather than copied: values share
+   *  structure, so a converted copy of one built from locals read twice grows by
+   *  a factor per level, and a number cannot survive a trip through a JS `Number`. */
+  eachValue?: Value;
+}
+
+export interface ContextOptions {
+  isCancelled?: () => boolean;
+}
+
+const MAX_CONTEXT_INSTANCES = 64;
+const CONTEXT_BLOCK_KINDS = new Set(['resource', 'data', 'module', 'ephemeral']);
+
+/** Discover only statically provable instances of count/for_each. */
+export function resolveContext(
+  block: TfBlock,
+  scope: EvalScope,
+  options: ContextOptions = {},
+): ContextInstance[] | undefined {
+  const cancelled = options.isCancelled ?? scope.isCancelled;
+  if (cancelled?.()) return undefined;
+  if (!CONTEXT_BLOCK_KINDS.has(block.kind)) return undefined;
+  const count = attrOf(block, 'count');
+  const each = attrOf(block, 'for_each');
+  if (count && each) return undefined;
+  if (!count && !each) return undefined;
+  if (scope.index.moduleHasParseError(scope.moduleDir)) return undefined;
+  const value = evalText(
+    (count ?? each)?.valueText ?? '',
+    withState({ ...scope, contextDiscovery: true, isCancelled: cancelled }),
+    0,
+  );
+  if (cancelled?.()) return undefined;
+  if (count) {
+    if (!(value instanceof NonString) || !/^\d+$/.test(value.text)) return undefined;
+    const n = Number(value.text);
+    if (!Number.isSafeInteger(n) || n < 0 || n > MAX_CONTEXT_INSTANCES) return undefined;
+    return Array.from({ length: n }, (_, i) => ({ label: `count.index = ${i}`, countIndex: i }));
+  }
+  if (isObject(value)) {
+    if (value.size > MAX_CONTEXT_INSTANCES) return undefined;
+    const out: ContextInstance[] = [];
+    const known = new Set<object>();
+    for (const [key, item] of value) {
+      if (cancelled?.()) return undefined;
+      if (!isFullyKnown(item, cancelled, known)) return undefined;
+      out.push({ label: `each.key = ${key}`, eachKey: key, eachValue: item });
+    }
+    return out.length > 0 ? out : undefined;
+  }
+  if (value instanceof SetValue) {
+    if (value.values.length > MAX_CONTEXT_INSTANCES) return undefined;
+    if (!value.values.every((v): v is string => typeof v === 'string')) return undefined;
+    const out = value.values.map((v) => ({ label: `each.key = ${v}`, eachKey: v, eachValue: v }));
+    return out.length > 0 ? out : undefined;
+  }
+  return undefined;
+}
+
+/** Nothing unresolved anywhere inside `value`. Each shared object is visited
+ *  once: a local read twice is one object, and walking it as a tree doubles the
+ *  work with every level. Past the nesting cap the answer is no, which only
+ *  means no hover. */
+const MAX_KNOWN_DEPTH = 64;
+function isFullyKnown(
+  value: Value,
+  cancelled?: () => boolean,
+  seen: Set<object> = new Set(),
+  depth = 0,
+): boolean {
+  if (cancelled?.() || depth > MAX_KNOWN_DEPTH || value === undefined) return false;
+  if (typeof value === 'string' || value instanceof NonString) return true;
+  if (seen.has(value)) return true;
+  seen.add(value);
+  const children =
+    value instanceof SetValue ? value.values : Array.isArray(value) ? value : [...value.values()];
+  return children.every((child) => isFullyKnown(child, cancelled, seen, depth + 1));
 }
 
 /** Separate from strings because rendering loses the type: 8080 and "8080"
@@ -168,7 +265,11 @@ class NonString {
   constructor(readonly text: string) {}
 }
 
-type Value = string | NonString | Value[] | ObjValue | undefined;
+class SetValue {
+  constructor(readonly values: Value[]) {}
+}
+
+type Value = string | NonString | Value[] | ObjValue | SetValue | undefined;
 /** insertion-ordered so a rendered object reads in the order it was written */
 type ObjValue = Map<string, Value>;
 
@@ -267,6 +368,15 @@ function renderInto(
   // tag can never collide with a value that merely looks like one
   if (depth > MAX_RENDER_DEPTH || v === undefined) {
     emit(tagged ? '\0unknown' : UNKNOWN);
+    return;
+  }
+  if (v instanceof SetValue) {
+    emit('[');
+    v.values.forEach((item, i) => {
+      if (i > 0) emit(', ');
+      renderInto(item, out, budget, depth + 1, tagged);
+    });
+    emit(']');
     return;
   }
   if (Array.isArray(v)) {
@@ -444,8 +554,10 @@ function compareCodePoints(a: string, b: string): number {
 function callFunction(name: string, args: Value[], scope: EvalScope): Value {
   switch (name) {
     case 'join': {
-      const [sep, list] = args;
+      const [sep, given] = args;
       const delim = asString(sep);
+      // a set converts to the list `join` asks for, in the order the set keeps
+      const list = given instanceof SetValue ? given.values : given;
       if (delim === undefined || !Array.isArray(list)) return undefined;
       const items = list.map(asString);
       if (!items.every((i) => i !== undefined)) return undefined;
@@ -478,6 +590,8 @@ function callFunction(name: string, args: Value[], scope: EvalScope): Value {
     }
     case 'toset': {
       const list = args[0];
+      // already a set: converting again changes nothing
+      if (list instanceof SetValue) return list;
       if (!Array.isArray(list)) return undefined;
       // sets dedupe and sort lexically, but only for known strings — anything
       // else keeps its elements for shape checks
@@ -485,8 +599,8 @@ function callFunction(name: string, args: Value[], scope: EvalScope): Value {
       // UTF-16 code units, which disagree once an astral character meets one in
       // U+E000–U+FFFF. Code-point order is UTF-8 byte order.
       return list.every((v): v is string => typeof v === 'string')
-        ? [...new Set(list)].sort(compareCodePoints)
-        : list;
+        ? new SetValue([...new Set(list)].sort(compareCodePoints))
+        : new SetValue(list);
     }
     default:
       return undefined;
@@ -644,22 +758,27 @@ function evalNode(node: Node, scope: EvalScope, depth: number, struct = 0): Valu
       case 'tuple': {
         // charged too, so a hand-written or generated 200k-element literal is
         // covered by the same budget as concat
-        const items = named(node)
-          .filter((c) => c.type === 'expression')
-          .map((c) => evalNode(c, scope, depth, struct + 1));
+        const items: Value[] = [];
+        for (const child of named(node).filter((c) => c.type === 'expression')) {
+          if (scope.isCancelled?.()) return undefined;
+          items.push(evalNode(child, scope, depth, struct + 1));
+        }
         return chargeElements(scope, items.length) ? items : undefined;
       }
       case 'object': {
         const out: ObjValue = new Map();
         for (const elem of named(node)) {
           if (elem.type !== 'object_elem') continue;
+          // checked per entry, not per node: the closing brace is a named child too,
+          // and counting it rejected a map of exactly MAX_CONTEXT_INSTANCES entries
+          if (scope.contextDiscovery && out.size >= MAX_CONTEXT_INSTANCES) return undefined;
           const [key, value] = named(elem).filter((c) => c.type === 'expression');
           if (!key || !value) continue;
           // a bare key is literal: { env = 1 } has key "env" even if var.env exists
           const name = /^[\w-]+$/.test(key.text.trim())
             ? key.text.trim()
             : asString(evalNode(key, scope, depth, struct + 1));
-          if (name === undefined) continue;
+          if (name === undefined || scope.isCancelled?.()) return undefined;
           out.set(name, evalNode(value, scope, depth, struct + 1));
         }
         return chargeElements(scope, out.size) ? out : undefined;
@@ -684,8 +803,67 @@ function evalNode(node: Node, scope: EvalScope, depth: number, struct = 0): Valu
 
 /** `var.x` / `local.x`, plus an attribute path into whatever they resolve to. */
 function resolveRefValue(parts: string[], scope: EvalScope, depth: number): Value {
+  if (scope.isCancelled?.()) return undefined;
   const [head, name] = parts;
   if (!name) return undefined;
+  if (head === 'count' && name === 'index') {
+    if (parts.length !== 2) return undefined;
+    if (scope.context) {
+      return scope.context.countIndex === undefined
+        ? undefined
+        : new NonString(String(scope.context.countIndex));
+    }
+    return undefined;
+  }
+  if (head === 'each' && name === 'key') {
+    if (parts.length !== 2) return undefined;
+    if (scope.context) {
+      return scope.context.eachKey === undefined ? undefined : scope.context.eachKey;
+    }
+    return undefined;
+  }
+  if (head === 'each' && name === 'value') {
+    if (scope.context?.eachValue === undefined) return undefined;
+    // `each.value.size` is the usual spelling: the attribute walk is the same
+    // one `var.x.y` gets, over the instance's own value
+    return walkPath(scope.context.eachValue, parts.slice(2));
+  }
+  if (head === 'path' && (name === 'module' || name === 'root' || name === 'cwd')) {
+    if (parts.length !== 2) return undefined;
+    const root = rootDirOf(scope);
+    if (name === 'cwd') {
+      if (scope.cwd !== undefined) {
+        if (scope.rootDir === undefined) {
+          // `terraform -chdir=` may point anywhere, so the run directory has no
+          // checkable relation to a root. With several roots in the window and no
+          // terraformRoot saying which one the setting belongs to, it is applied
+          // to all of them, and says so
+          if (hasSeveralRoots(scope.index))
+            scope.used?.assumes.add('terraformCwd is the run directory for this root');
+          return scope.cwd;
+        }
+        // the configured run directory belongs to the configured root: for a
+        // module another root owns it says nothing, and the assumption below applies
+        if (root !== undefined && sameDir(root, scope.rootDir)) return scope.cwd;
+      }
+      // The run directory is in no file: `cd infra && terraform plan` and
+      // `terraform -chdir=infra plan` from the repo root differ, and path.cwd is
+      // the original directory, before -chdir. The usual workflow is the first,
+      // where it is the root module directory — so that is the value, recorded
+      // as an assumption for the hover to state. No single root, no guess.
+      if (root === undefined) return undefined;
+      scope.used?.assumes.add('terraform runs in the root module directory');
+      return root;
+    }
+    // Terraform hands back a module's SourceDir as it was loaded (the parent's
+    // directory joined with the source, cleaned), relative to the root module's
+    // directory, and makes only path.cwd absolute (GetPathAttr in
+    // hashicorp/terraform internal/terraform/evaluate.go). An absolute path
+    // would be a value Terraform never produces.
+    if (root === undefined) return undefined;
+    if (name === 'root') return '.';
+    return relative(root, scope.moduleDir).split('\\').join('/') || '.';
+  }
   if (head !== 'var' && head !== 'local') return undefined;
   const path = parts.slice(2);
   // the reference itself, without the attribute path — `local.cfg.db.host` and
@@ -727,6 +905,81 @@ function resolveRefValue(parts: string[], scope: EvalScope, depth: number): Valu
   return walkPath(value, path);
 }
 
+/** The root module this module is reached from, or nothing when that is not a
+ *  single directory. The root is found the way `resolveVar` already finds it — a
+ *  directory no `module` block calls is a root, which is also what makes its
+ *  variables come from tfvars — by climbing the callers, honouring the call site
+ *  the hover is pinned to. An explicit `rootDir` (the setting) is a root the
+ *  climb stops at, and settles it for every module under it. It cannot speak for
+ *  a module another root owns, so there the root found from the files stands.
+ *  Reached from two roots, `path.module` differs between them, so nothing is
+ *  claimed; a loop of modules that only call each other has no root. */
+function rootDirOf(scope: EvalScope): string | undefined {
+  const roots = new Set<string>();
+  const seen = new Set<string>();
+  const climb = (dir: string): boolean => {
+    if (seen.has(dir)) return true; // a loop contributes no root of its own
+    if (seen.size >= MAX_REF_HOPS) return false;
+    seen.add(dir);
+    if (scope.rootDir !== undefined && sameDir(dir, scope.rootDir)) {
+      roots.add(dir);
+      return true;
+    }
+    const pinned = scope.pinnedSites?.get(dir);
+    const sites = pinned ? [pinned] : scope.index.externalCallSitesOf(dir);
+    if (sites.length === 0) {
+      roots.add(dir);
+      return true;
+    }
+    return sites.every((site) => climb(site.callerDir));
+  };
+  if (!climb(scope.moduleDir)) return undefined;
+  // spelled as the index spells it, so `relative` against a module directory works
+  const explicit = [...roots].find((r) => scope.rootDir !== undefined && sameDir(r, scope.rootDir));
+  if (explicit !== undefined) return explicit;
+  return roots.size === 1 ? [...roots][0] : undefined;
+}
+
+/** A setting and the index can spell one directory differently in two ways that
+ *  matter: VS Code lowers a Windows drive letter and a typed path may not, and
+ *  the index drops the separator after a root (`dirOf('/main.tf')` is `''`,
+ *  `dirOf('c:/main.tf')` is `c:`) where a setting keeps it. */
+function dirKey(path: string): string {
+  const folded = /^[a-zA-Z]:/.test(path) ? path.charAt(0).toLowerCase() + path.slice(1) : path;
+  return folded.replace(/\/+$/, '');
+}
+
+function sameDir(a: string, b: string): boolean {
+  return dirKey(a) === dirKey(b);
+}
+
+const rootCounts = new WeakMap<WorkspaceIndex, { generation: number; several: boolean }>();
+
+/** Whether the window holds more than one root module: directories with
+ *  Terraform files that no `module` block calls. A directory with only a
+ *  `.tfvars` file is not a module. Counted once per state of the index, since a
+ *  hover can ask once per row and the count walks every file. */
+function hasSeveralRoots(index: WorkspaceIndex): boolean {
+  const generation = index.generation();
+  const known = rootCounts.get(index);
+  if (known?.generation === generation) return known.several;
+  const dirs = new Set(
+    index
+      .files()
+      .filter((file) => file.path.endsWith('.tf'))
+      .map((file) => index.moduleDirOf(file.path)),
+  );
+  let roots = 0;
+  let several = false;
+  for (const dir of dirs) {
+    if (index.externalCallSitesOf(dir).length === 0 && ++roots > 1) {
+      several = true;
+      break;
+    }
+  }
+  rootCounts.set(index, { generation, several });
+  return several;
+}
 /** Module name + shortest path suffix that disambiguates sites — basenames
  *  alone would collapse envs/dev/main.tf and envs/prod/main.tf into one. */
 function siteLabels(sites: ModuleCallSite[]): string[] {
@@ -888,7 +1141,7 @@ function shapeOf(v: Value): ValueShape {
   if (v === undefined) return 'unknown';
   // a number, bool or null is still one value with one spelling — only a list
   // or object is a rendering of several
-  return Array.isArray(v) || isObject(v) ? 'collection' : 'scalar';
+  return Array.isArray(v) || isObject(v) || v instanceof SetValue ? 'collection' : 'scalar';
 }
 
 /** `resolveRef` with the shape the rendering throws away. */
@@ -922,11 +1175,19 @@ export function listShape(text: string, scope: EvalScope): ListShape {
     (scoped.state?.spends ?? 0) > 0 || scoped.state?.gaveUp === true
       ? { kind: 'unknown', overBudget: true }
       : { kind: 'unknown' };
-  if (!Array.isArray(value)) return unknown;
+  // a set is read exactly as the list it was made from
+  const items = value instanceof SetValue ? value.values : Array.isArray(value) ? value : undefined;
+  if (!items) return unknown;
   // an unresolved element says nothing; a resolved non-string says everything
   // — numbers count too, for_each rejects those
-  if (value.some((v) => Array.isArray(v) || isObject(v) || v instanceof NonString)) {
+  if (
+    items.some(
+      (v) => Array.isArray(v) || isObject(v) || v instanceof SetValue || v instanceof NonString,
+    )
+  ) {
     return { kind: 'nonStrings' };
   }
-  return value.every((v) => typeof v === 'string') ? { kind: 'strings', values: value } : unknown;
+  return items.every((v): v is string => typeof v === 'string')
+    ? { kind: 'strings', values: items }
+    : unknown;
 }
