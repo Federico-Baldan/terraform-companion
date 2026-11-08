@@ -34,6 +34,11 @@ export interface ParsedFile {
    *  really has. Anything treating an absent reference as permission (the
    *  count→for_each rewrite, the unused-local lint) must consult this first. */
   hasError: boolean;
+  /** The source was past `MAX_PARSE_CHARS` and was not parsed at all: `blocks` and
+   *  `refs` are empty and `hasError` is set, so everything that withholds on an
+   *  incomplete read withholds here. Kept apart from `hasError` so the one place
+   *  that can say why — the output channel — can. Absent otherwise. */
+  tooLarge?: true;
   /** materialised on first read, then cached — see `parseFile` */
   lines: string[];
 }

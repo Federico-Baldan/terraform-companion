@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import { MAX_PARSE_CHARS } from './core/parser';
 import { TrackedDirs } from './core/trackedDirs';
 import { normalizePath, READ_CONCURRENCY, type WorkspaceIndex } from './core/workspaceIndex';
 import { isExcludedTfPath, isTfPath, TF_EXCLUDE, TF_GLOB } from './vscodeUtils';
@@ -15,6 +16,12 @@ const READ_TIMEOUT_MS = 30_000;
  *  told. Short enough to stay invisible next to DEBOUNCE_MS, long enough that a
  *  git checkout's per-file watcher events land in one batch. */
 const COALESCE_MS = 50;
+
+/** What the output channel says about a file past the parse limit: the one place
+ *  that can say why a module's lints went quiet. */
+export function tooLargeNotice(path: string): string {
+  return `Skipped (larger than ${MAX_PARSE_CHARS / 1_048_576} MiB, so it is not parsed): ${path}. Nothing in it is analysed, and lints that need the whole module stay quiet while it is there.`;
+}
 
 /**
  * Keeps the workspace index in sync with the editor: re-parses on edit
@@ -87,6 +94,27 @@ export function registerIndexSync(
   const tracked = new TrackedDirs();
   for (const file of index.files()) tracked.add(file.path);
 
+  /** Files already named in the log as too large to parse, so an edit of one does
+   *  not repeat it on every pause. Leaves the set when the file is read below the
+   *  limit again, so growing past it a second time is named a second time. Seeded
+   *  from the initial scan, whose files are named here at registration. */
+  const namedTooLarge = new Set<string>();
+  for (const file of index.files()) {
+    if (!file.tooLarge) continue;
+    namedTooLarge.add(normalizePath(file.path));
+    log?.(tooLargeNotice(file.path));
+  }
+  const noteTooLarge = (path: string): void => {
+    const key = normalizePath(path);
+    if (!index.file(path)?.tooLarge) {
+      namedTooLarge.delete(key);
+      return;
+    }
+    if (namedTooLarge.has(key)) return;
+    namedTooLarge.add(key);
+    log?.(tooLargeNotice(path));
+  };
+
   /** Changed paths waiting to be announced.
    *
    *  A burst — git checkout, git pull, `terraform fmt -recursive`, codegen —
@@ -150,6 +178,7 @@ export function registerIndexSync(
           log?.(`Not indexed (parse failed): ${path}: ${e}`);
           return;
         }
+        if (!disposed) noteTooLarge(path);
         // Identical bytes are the common case here, not the exception: opening
         // a file, and typing a character then deleting it, both land on text the
         // index already holds. Announcing anyway re-lints every file in the
@@ -220,7 +249,9 @@ export function registerIndexSync(
       if (disposed || tokenOf(uri.fsPath) !== token) return;
       // a save makes this re-read what the 500ms buffer debounce already
       // parsed, so without the guard every save costs two full refresh rounds
-      if (await index.updateFile(uri.fsPath, text)) announce([uri.fsPath]);
+      const changed = await index.updateFile(uri.fsPath, text);
+      if (!disposed) noteTooLarge(uri.fsPath);
+      if (changed) announce([uri.fsPath]);
     } catch (e) {
       // After the teardown the output channel is gone, and writing to it throws
       // from a promise nothing awaits. A read given up on late lands here too.
@@ -292,7 +323,9 @@ export function registerIndexSync(
         const text = new TextDecoder().decode(await vscode.workspace.fs.readFile(uri));
         // the folder can be removed again while this scan is still running
         if (disposed || tokenOf(uri.fsPath) !== token) continue;
-        if (await index.updateFile(uri.fsPath, text)) added.push(uri.fsPath);
+        const changed = await index.updateFile(uri.fsPath, text);
+        if (!disposed) noteTooLarge(uri.fsPath);
+        if (changed) added.push(uri.fsPath);
       } catch (e) {
         log?.(`Not indexed (unreadable or parse failed): ${uri.fsPath}: ${e}`);
       }

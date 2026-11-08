@@ -250,6 +250,9 @@ function collectRefs(node: Node, refs: TfRef[], ctx: WalkCtx, depth = 0): void {
  *  CST node to `use`. Frees the tree afterward; undefined on parse failure. */
 export function withExpressionNode<T>(text: string, use: (expr: Node) => T): T | undefined {
   if (!parser) throw new Error('initParser() must be called before withExpressionNode()');
+  // same limit as a whole file, for the same reason: no expression anyone wrote is
+  // this long, and the evaluator would only throw the value away at its own caps
+  if (text.length > MAX_PARSE_CHARS) return undefined;
   const source = `x = ${text}`;
   const tree = parser.parse(source);
   if (!tree) return undefined;
@@ -268,6 +271,17 @@ export function withExpressionNode<T>(text: string, use: (expr: Node) => T): T |
     tree.delete();
   }
 }
+
+/** The largest source `parseFile` hands to tree-sitter, in characters.
+ *
+ *  Parsing costs about 0.9s and 150MB per MB of source, on the extension host,
+ *  in a WebAssembly heap that stops at 2GB: a file of a few MB froze the host for
+ *  seconds on every edit pause, and one past ~10MB could take the parser down for
+ *  the rest of the session, since the heap does not come back. No hand-written
+ *  Terraform file is within a factor of ten of this. Past it the file is read as
+ *  "incomplete" (`hasError`), which every consumer already answers by
+ *  withholding, and the output channel says so (`tooLarge`). */
+export const MAX_PARSE_CHARS = 1_048_576;
 
 /** How many files `parseFile` remembers the latest parse of. A handful is the
  *  point: what repeats is the *same buffer* being asked about by several
@@ -293,6 +307,10 @@ const memo = new Map<string, ParsedFile>();
  *  whole input to the parse, so identical text can only mean an identical
  *  result — an edit changes the text and misses. */
 export function parseFile(path: string, source: string): ParsedFile {
+  // Not parsed, and not remembered: there is nothing to share between providers
+  // and the answer costs nothing to build, while a slot taken here would push out
+  // a file that is actually in use.
+  if (source.length > MAX_PARSE_CHARS) return fileOf(path, source, [], [], true, true);
   const hit = memo.get(path);
   if (hit && hit.source === source) {
     // a hit is a use: the buffer under the cursor is asked about between every
@@ -360,6 +378,17 @@ function parseUncached(path: string, source: string): ParsedFile {
       tree.delete();
     }
   }
+  return fileOf(path, source, blocks, refs, hasError);
+}
+
+function fileOf(
+  path: string,
+  source: string,
+  blocks: TfBlock[],
+  refs: TfRef[],
+  hasError: boolean,
+  tooLarge?: true,
+): ParsedFile {
   // Only the file currently being linted or hovered ever reads `lines`, and it
   // reads one or two of them. Splitting eagerly kept one string per line of
   // every indexed file alive for the whole session — on a 2000-file workspace
@@ -372,6 +401,7 @@ function parseUncached(path: string, source: string): ParsedFile {
     blocks,
     refs,
     hasError,
+    ...(tooLarge ? { tooLarge } : {}),
     get lines(): string[] {
       lines ??= source.split(/\r?\n/);
       return lines;
