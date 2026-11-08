@@ -8,6 +8,7 @@ import {
   resolveRef,
   UNKNOWN,
 } from '../src/core/evaluator';
+import * as parser from '../src/core/parser';
 import { parseFile } from '../src/core/parser';
 import { WorkspaceIndex } from '../src/core/workspaceIndex';
 import { initTestParser, tfvarsIn } from './helpers';
@@ -418,6 +419,203 @@ describe('values that are copied, not shared', () => {
     const started = Date.now();
     expect(resolveRef(['local', 'bad'], { index, moduleDir: '/re' })).toBe(UNKNOWN);
     expect(Date.now() - started).toBeLessThan(1000);
+  });
+});
+
+/** A reference that gave up because a budget ran out used to be forgotten, so
+ *  every later lookup of it ran the whole evaluation again. In a ladder where each
+ *  level reads the one below twice, the levels past the budget each doubled the
+ *  work of the level under them: 17 levels of `concat(x, x)` fit the budget, and
+ *  every level after that cost twice the one before. Measured on this parser:
+ *  the 30-level ladder below took 32,783 expression reads, and a 40-level one
+ *  was still running after three minutes — a synchronous loop on the extension
+ *  host, so the hover's cancellation token could not even be read. */
+describe('a reference that ran out of budget is evaluated once', () => {
+  const ladder = (levels: number): string => {
+    const lines = ['locals {', '  a0 = ["leaf"]'];
+    for (let i = 1; i <= levels; i++)
+      lines.push(`  a${i} = concat(local.a${i - 1}, local.a${i - 1})`);
+    lines.push('}', '');
+    return lines.join('\n');
+  };
+
+  it('does not repeat the evaluation of a level that already gave up', async () => {
+    const index = new WorkspaceIndex();
+    const levels = 30;
+    await index.updateFile('/gaveup/locals.tf', ladder(levels));
+    const at: EvalScope = { index, moduleDir: '/gaveup' };
+
+    // every expression the evaluator reads goes through this one door
+    const reads = vi.spyOn(parser, 'withExpressionNode');
+    try {
+      expect(resolveRef(['local', `a${levels}`], at)).toBe(UNKNOWN);
+      // one read per local is the floor; the doubling made it 32,783
+      expect(reads.mock.calls.length).toBeLessThan(100);
+    } finally {
+      reads.mockRestore();
+    }
+  });
+
+  it('still reports the list as unmeasured, not as absent', async () => {
+    const index = new WorkspaceIndex();
+    await index.updateFile('/gaveup/shape.tf', ladder(30));
+    // the answer the count -> for_each safety check reads: an unmeasured list must
+    // never be certified, however the evaluation got to giving up
+    expect(listShape('local.a30', { index, moduleDir: '/gaveup' })).toEqual({
+      kind: 'unknown',
+      overBudget: true,
+    });
+  });
+
+  /** The same ladder under a chain longer than the reference-hop limit: the walk
+   *  gives up at the limit before any budget is spent, so what stops the doubling
+   *  there is not the element budget at all. */
+  it('does not repeat the evaluation of a level that gave up at the hop limit', async () => {
+    const index = new WorkspaceIndex();
+    const chain = 258;
+    const levels = 9;
+    const lines = ['locals {', '  a0 = ["leaf"]'];
+    for (let i = 1; i <= chain; i++) lines.push(`  a${i} = local.a${i - 1}`);
+    for (let i = chain + 1; i <= chain + levels; i++) {
+      lines.push(`  a${i} = concat(local.a${i - 1}, local.a${i - 1})`);
+    }
+    lines.push('}', '');
+    await index.updateFile('/gaveup/hops.tf', lines.join('\n'));
+
+    const reads = vi.spyOn(parser, 'withExpressionNode');
+    try {
+      const top = `a${chain + levels}`;
+      expect(resolveRef(['local', top], { index, moduleDir: '/gaveup' })).toBe(UNKNOWN);
+      // every level read once is the floor; the doubling made it ~130,000
+      expect(reads.mock.calls.length).toBeLessThan(2000);
+    } finally {
+      reads.mockRestore();
+    }
+  });
+
+  /** `MAX_DEPTH` counts module call hops, so it is another limit a reference can run
+   *  into from where the walk stands and not from what it is. Thirteen modules
+   *  each passing the next a value, with ladders in some that run the budget out,
+   *  and an expression reading the same variables twice: the second read of a
+   *  variable once showed ⟨unknown⟩ where the walk had since resolved part of it,
+   *  because the first read's give-up had been remembered for good. Pinned to what
+   *  the evaluator showed before anything was remembered. */
+  it('shows what a fresh evaluation shows for a variable read twice near the depth limit', async () => {
+    const ladder = (levels: number): string => {
+      const lines = ['  L0 = ["x", "y"]'];
+      for (let i = 1; i <= levels; i++)
+        lines.push(`  L${i} = concat(local.L${i - 1}, local.L${i - 1})`);
+      return [...lines, `  big = local.L${levels}`].join('\n');
+    };
+    // [ladder levels, v passed to the next module, w passed to it]
+    const modules: [number, string, string?][] = [
+      [18, '"${var.v}-${local.x}"'],
+      [17, 'var.w'],
+      [18, 'local.big'],
+      [0, 'local.big'],
+      [0, '[var.v, local.big]'],
+      [17, 'concat(local.big, local.big)', 'var.w'],
+      [0, 'var.v', '"${var.v}-${local.x}"'],
+      [0, '"${var.v}-${local.x}"', 'lower(var.v)'],
+      [0, 'join(",", var.w)', 'local.y'],
+      [0, 'var.v', '[var.v, local.big]'],
+      [0, '[var.v, local.big]', '[var.v, local.big]'],
+      [0, 'local.y'],
+      [0, 'local.y', 'concat(local.big, local.big)'],
+      [0, ''],
+    ];
+    const index = new WorkspaceIndex();
+    for (const [i, [levels, v, w]] of modules.entries()) {
+      const variables =
+        i === 0
+          ? 'variable "v" {\n  default = "rv"\n}\nvariable "w" {\n  default = ["r1", "r2"]\n}\n'
+          : 'variable "v" {}\nvariable "w" {\n  default = "dw"\n}\n';
+      const locals = `locals {\n  x = "x${i}"\n  y = [local.x, var.w]\n${
+        levels > 0 ? ladder(levels) : '  big = "small"'
+      }\n}\n`;
+      const call = v
+        ? `module "n" {\n  source = "../m${i + 1}"\n  v = ${v}\n${w ? `  w = ${w}\n` : ''}}\n`
+        : '';
+      await index.updateFile(`/depth/m${i}/main.tf`, variables + locals + call);
+    }
+    const twice = '[var.v, var.w, local.y, var.v, local.big, var.w]';
+    expect(resolveExpr(twice, { index, moduleDir: '/depth/m9' })).toBe(
+      `[${UNKNOWN}, ${UNKNOWN}, [x9, [x8, ${UNKNOWN}]], ${UNKNOWN}, small, [x8, ${UNKNOWN}]]`,
+    );
+  });
+
+  /** Remembering a give-up must also leave the same trail a second evaluation
+   *  would have: `used.calls` is rendered in the hover as `via module …`. Read at a
+   *  shallower depth than the first time, a variable ran the budget out; read
+   *  deeper, the module-hop limit would have cut it first and the walk back up
+   *  would have recorded each call it passed through. */
+  it('records the same module calls for a variable read at two different depths', async () => {
+    const index = new WorkspaceIndex();
+    const twenty = `[${Array.from({ length: 20 }, () => '"z"').join(', ')}]`;
+    await index.updateFile(
+      '/r/m1/main.tf',
+      `module "n1" {\n  source = "../m2"\n  a = ${twenty}\n}\n`,
+    );
+    for (const i of [2, 3, 4]) {
+      await index.updateFile(
+        `/r/m${i}/main.tf`,
+        `variable "a" {}\nmodule "n${i}" {\n  source = "../m${i + 1}"\n  a = var.a\n}\n`,
+      );
+    }
+    await index.updateFile(
+      '/r/m5/main.tf',
+      'variable "a" {}\nlocals {\n  r = var.a\n}\nmodule "n5" {\n  source = "../m6"\n  b6 = local.r\n  f6 = var.a\n}\n',
+    );
+    await index.updateFile(
+      '/r/m6/main.tf',
+      'variable "b6" {}\nvariable "f6" {}\nlocals {\n  q = var.b6\n}\nmodule "n6" {\n  source = "../m7"\n  c = local.q\n  e = var.f6\n}\n',
+    );
+    await index.updateFile('/r/m7/main.tf', 'variable "c" {}\nvariable "e" {}\n');
+    // enough elements to leave no budget for what is read after them
+    const drain = `[${Array.from({ length: 99_990 }, () => '1').join(',')}]`;
+    const used = emptyUsage();
+    resolveExpr(`[${drain}, var.c, var.e]`, { index, moduleDir: '/r/m7', used });
+    expect([...used.calls]).toEqual([1, 2, 3, 4, 5, 6].map((n) => `module "n${n}" (main.tf)`));
+  });
+
+  /** The same trail where the walk comes back round on itself: two modules that
+   *  call each other, and a chain of locals long enough to hit the hop limit before
+   *  the loop closes. Read again from inside the other chain, the loop is closed by
+   *  a reference already in progress, which counts for nothing, and the calls were
+   *  recorded all the same. */
+  it('records the same module calls when the second read is inside a loop', async () => {
+    const index = new WorkspaceIndex();
+    const chain = (prefix: string, length: number, end: string): string =>
+      Array.from(
+        { length },
+        (_, i) => `  ${prefix}${i} = ${i + 1 < length ? `local.${prefix}${i + 1}` : end}`,
+      ).join('\n');
+    await index.updateFile(
+      '/loop/m1/main.tf',
+      `variable "b" {}\nlocals {\n${chain('c', 100, 'var.b')}\n}\nmodule "to2" {\n  source = "../m2"\n  a = local.c0\n}\n`,
+    );
+    await index.updateFile(
+      '/loop/m2/main.tf',
+      `variable "a" {}\nlocals {\n${chain('d', 100, 'var.a')}\n${chain('x', 100, 'var.a')}\n}\nmodule "to1" {\n  source = "../m1"\n  b = local.d0\n}\n`,
+    );
+    const used = emptyUsage();
+    resolveExpr('[local.x0, local.d0]', { index, moduleDir: '/loop/m2', used });
+    expect([...used.calls]).toEqual(['module "to1" (main.tf)', 'module "to2" (main.tf)']);
+  });
+
+  /** What is remembered must be what a second evaluation would have said. A give-up
+   *  that came from where the walk stood (this chain is longer than the hop limit
+   *  only when read from its top) says nothing about the reference itself, and a
+   *  later lookup from nearer must still resolve it. */
+  it('does not remember a give-up that depended on how deep the lookup was', async () => {
+    const index = new WorkspaceIndex();
+    const lines = ['locals {'];
+    for (let i = 0; i < 299; i++) lines.push(`  c${i} = local.c${i + 1}`);
+    lines.push('  c299 = "leaf"', '  both = [local.c0, local.c100]', '}', '');
+    await index.updateFile('/gaveup/depth.tf', lines.join('\n'));
+    expect(resolveRef(['local', 'both'], { index, moduleDir: '/gaveup' })).toBe(
+      `[${UNKNOWN}, leaf]`,
+    );
   });
 });
 

@@ -91,6 +91,74 @@ interface EvalState {
   gaveUp: boolean;
   /** Live `evalNode` frames. See MAX_NEST. */
   nest: number;
+  /** References whose evaluation ended in `undefined` because a budget ran out,
+   *  and that nothing about where they were reached can have caused — the memo's
+   *  other half.
+   *
+   *  `cache` cannot hold these: a budget give-up bumps `spends`, which is what
+   *  keeps a context-dependent `undefined` out of it. But the element budget and
+   *  the size caps only ever go one way — what is spent stays spent, and a value
+   *  too long for them stays too long — so asking again cannot answer better than
+   *  asking the first time did. Forgetting them made every later lookup run the
+   *  whole evaluation again, and a ladder whose levels each read the one below
+   *  twice doubled the work at every level past the budget: 30 levels was tens of
+   *  thousands of parses, and 40 was still running after minutes. A hit counts as
+   *  a spend, so the callers that read `spends` still see the budget give up.
+   *
+   *  Only while the cache is as it was: an evaluation also reads what has been
+   *  resolved since, and a subtree that gave up on the way down to something now
+   *  cached would stop there and answer. `writes` is the count at the time, and an
+   *  entry is used only while that is still the count — see `deepFailed`, which
+   *  has the same condition.
+   *
+   *  And only from no deeper than the first time (`hops`, `nest`, `depth`, as in
+   *  `deepFailed`): reached from deeper, the evaluation could run into one of those
+   *  limits where it did not before, and would leave a different trail behind —
+   *  the module calls it passed through on the way back up, for one. */
+  failed: Map<string, { hops: number; nest: number; depth: number; writes: number }>;
+  /** How many of the give-ups depended on where in the walk they were reached —
+   *  the chain length at the time, the live frames, or the module call hops. A key
+   *  that gave up for one of those reasons may resolve when reached from nearer,
+   *  so it must not go in `failed`. */
+  contextual: number;
+  /** References that gave up for one of those reasons, with how deep the walk
+   *  stood when it first looked them up: the chain length, the live frames and the
+   *  module call hops.
+   *
+   *  They are remembered for the depth they were seen at and every depth below it,
+   *  not outright. Reached from nearer the top, a reference has more room and may
+   *  resolve (`both = [local.c0, local.c100]` over a chain longer than the hop
+   *  limit), so that lookup is evaluated as before. Reached from as deep or deeper,
+   *  every limit it ran into is met no later, and evaluating it again could only
+   *  end the same way — which is what a ladder over a chain past the hop limit
+   *  paid for at every level instead: it doubled the work as `failed` does for the
+   *  budget, with nothing remembered at all.
+   *
+   *  `writes` is how many results `cache` held when this was looked up. An entry
+   *  is kept only if that did not move during the evaluation, and used only while
+   *  it still has not: a reference resolved in the meantime is cached, and a chain
+   *  that gave up on the way down to it would now stop there and resolve.
+   *
+   *  And only from the very frame it was first looked up from, which is what makes
+   *  the walk's stack the same: a reference that is in progress is cut off the
+   *  moment it is read again, and the first evaluation, stopped by a limit before
+   *  the loop closed, never met it. */
+  deepFailed: Map<
+    string,
+    { hops: number; nest: number; depth: number; writes: number; frame: number }
+  >;
+  /** Results written to `cache` so far; see `deepFailed`. */
+  writes: number;
+  /** The reference being evaluated at the moment, as the number of its evaluation
+   *  (0 outside any): two lookups made from one evaluation see one stack. */
+  frame: number;
+  /** Evaluations of references begun so far; what `frame` numbers come from. */
+  frames: number;
+  /** References found already in progress, which answer `undefined` for no reason
+   *  of their own: it is the walk that closed a loop, so what a subtree that met
+   *  one gave up on says nothing about the subtree. Neither `failed` nor
+   *  `deepFailed` remembers such a subtree. */
+  cuts: number;
 }
 
 /** Structural nesting one *expression* may have.
@@ -627,7 +695,11 @@ function evalNode(node: Node, scope: EvalScope, depth: number, struct = 0): Valu
   // difference `shapeUnusable` reads to decide whether the destructive
   // count→for_each rewrite is allowed. ~5 module hops is enough to reach it.
   if (depth > MAX_DEPTH) {
-    if (state) state.gaveUp = true;
+    if (state) {
+      state.gaveUp = true;
+      // module call hops so far: the same reference reached with fewer is not over
+      state.contextual++;
+    }
     return undefined;
   }
   if (state) {
@@ -636,6 +708,9 @@ function evalNode(node: Node, scope: EvalScope, depth: number, struct = 0): Valu
       // reading "too deep to evaluate" as "nothing here to object to" and
       // certifying a destructive rewrite on it
       state.spends++;
+      // the live frames depend on the path that got here, not on the node; the
+      // structural depth does not, and is counted with it only to stay simple
+      state.contextual++;
       return undefined;
     }
     state.nest++;
@@ -872,18 +947,61 @@ function resolveRefValue(parts: string[], scope: EvalScope, depth: number): Valu
   const state = scope.state;
   if (state) {
     if (state.cache.has(key)) return walkPath(state.cache.get(key), path);
+    // already ran out of budget once: it would again, and a spend is what the
+    // callers that read `spends` are told. See EvalState.failed
+    const gaveUp = state.failed.get(key);
+    if (
+      gaveUp &&
+      gaveUp.writes === state.writes &&
+      state.inProgress.size <= gaveUp.hops &&
+      state.nest <= gaveUp.nest &&
+      depth <= gaveUp.depth
+    ) {
+      state.spends++;
+      return undefined;
+    }
     // a reference that is already being resolved is a cycle, whatever its
     // shape: a local reading itself, or two modules calling each other
-    if (state.inProgress.has(key)) return undefined;
+    if (state.inProgress.has(key)) {
+      state.cuts++;
+      return undefined;
+    }
+    // gave up from this deep or deeper before, so it does again; see
+    // EvalState.deepFailed. Counted exactly as the give-up it stands for
+    const seen = state.deepFailed.get(key);
+    if (
+      seen &&
+      seen.writes === state.writes &&
+      seen.frame === state.frame &&
+      state.nest >= seen.nest &&
+      depth >= seen.depth
+    ) {
+      state.spends++;
+      state.contextual++;
+      return undefined;
+    }
     // inProgress is exactly the DFS ancestor set, so its size is the chain
     // depth — and depth here is JS stack frames, four per hop. See MAX_REF_HOPS.
     if (state.inProgress.size >= MAX_REF_HOPS) {
       state.spends++;
+      // the same reference reached from nearer the top is not over the limit
+      state.contextual++;
       return undefined;
     }
     state.inProgress.add(key);
   }
+  // the frame this was looked up from; this reference's own evaluation is a frame
+  // of its own for everything it reads
+  const frameAtLookup = state?.frame ?? 0;
+  if (state) state.frame = ++state.frames;
   const spendsBefore = state?.spends ?? 0;
+  const contextualBefore = state?.contextual ?? 0;
+  const cutsBefore = state?.cuts ?? 0;
+  // where the walk stood when it reached this reference: `inProgress` already
+  // holds it by now, and the chain length is what it was before
+  const hopsAtLookup = (state?.inProgress.size ?? 1) - 1;
+  const nestAtLookup = state?.nest ?? 0;
+  const writesAtLookup = state?.writes ?? 0;
   let value: Value;
   if (head === 'var') {
     value = resolveVar(name, scope, depth);
@@ -895,12 +1013,24 @@ function resolveRefValue(parts: string[], scope: EvalScope, depth: number): Valu
   }
   if (state) {
     state.inProgress.delete(key);
+    state.frame = frameAtLookup;
     // An `undefined` produced because *this* subtree ran out of budget is not
     // an answer about this reference, and caching it would hand the same
     // ⟨unknown⟩ to an unrelated lookup that would have resolved fine. Scoped to
     // this key's own evaluation, so the memo still stops the fan-out blowup it
     // exists for — only the chain that actually gave up goes uncached.
-    if (value !== undefined || state.spends === spendsBefore) state.cache.set(key, value);
+    //
+    // Uncached is not the same as forgotten: unless the give-up was about where
+    // the walk stood, it is remembered apart (see EvalState.failed), or every
+    // later lookup would evaluate it again.
+    if (value !== undefined || state.spends === spendsBefore) {
+      state.cache.set(key, value);
+      state.writes++;
+    } else if (state.cuts === cutsBefore && state.writes === writesAtLookup) {
+      const at = { hops: hopsAtLookup, nest: nestAtLookup, depth, writes: state.writes };
+      if (state.contextual === contextualBefore) state.failed.set(key, at);
+      else state.deepFailed.set(key, { ...at, frame: frameAtLookup });
+    }
   }
   return walkPath(value, path);
 }
@@ -1117,6 +1247,13 @@ function withState(scope: EvalScope): EvalScope {
       spends: 0,
       gaveUp: false,
       nest: 0,
+      failed: new Map(),
+      contextual: 0,
+      deepFailed: new Map(),
+      writes: 0,
+      frame: 0,
+      frames: 0,
+      cuts: 0,
     },
   };
 }
