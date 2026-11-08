@@ -2,6 +2,38 @@
 
 Notable changes to Terraform Companion. Versions follow semver; dates are ISO (YYYY-MM-DD).
 
+## [1.3.0](https://github.com/Federico-Baldan/terraform-companion/compare/v1.2.5...v1.3.0) (2026-11-08)
+
+
+### Features
+
+* cleanup of the shared Terraform provider cache ([#90](https://github.com/Federico-Baldan/terraform-companion/issues/90)) ([a01724e](https://github.com/Federico-Baldan/terraform-companion/commit/a01724e3ca81284f59d716ccf6e08ce3bf47f147))
+* context-aware resolved hover ([#89](https://github.com/Federico-Baldan/terraform-companion/issues/89)) ([55d9df2](https://github.com/Federico-Baldan/terraform-companion/commit/55d9df2fb9635e34e21933af6c691799495cbbd4))
+
+
+### Bug Fixes
+
+* a file past the parse limit also withholds across modules ([10abbc3](https://github.com/Federico-Baldan/terraform-companion/commit/10abbc3199a245f48a1792341510ee7f69e920e0))
+* **deps:** update dependency semver to ^7.8.6 ([#87](https://github.com/Federico-Baldan/terraform-companion/issues/87)) ([af93eee](https://github.com/Federico-Baldan/terraform-companion/commit/af93eeeda6e38aebd4b40c689546f9002329e1e6))
+* do not certify a list when a budget gave up on one of its elements ([c1c7fe0](https://github.com/Federico-Baldan/terraform-companion/commit/c1c7fe09b900f6a514eeb011eb3ee01161ca37db))
+* do not hand a file past 1 MiB to the parser ([70ed9cf](https://github.com/Federico-Baldan/terraform-companion/commit/70ed9cf98ca4507a28bb9ab787de52c90b31d566))
+* name a too-large file from whichever path indexes it, and again if it returns ([fe3d8a5](https://github.com/Federico-Baldan/terraform-companion/commit/fe3d8a5ad89adfec9836dbd313552f29237f1213))
+* note an unread caller on path.* too, and keep "no value" next to an assumption ([11d2e4b](https://github.com/Federico-Baldan/terraform-companion/commit/11d2e4b922105e101567ae0877df7c09ef78ea43))
+* remember the references that gave up, so a doubling ladder stops freezing the host ([0e0371d](https://github.com/Federico-Baldan/terraform-companion/commit/0e0371d861562e52e30ac9b3bf80a542b57a8833))
+* scan for the callee and for lock-file providers in one pass, not from every position ([6cdb2a2](https://github.com/Federico-Baldan/terraform-companion/commit/6cdb2a210b001e17eb2c55165b85aa56b3e6492b))
+* stop the count -&gt; for_each safety check pinning a call site it already pinned ([94ca7df](https://github.com/Federico-Baldan/terraform-companion/commit/94ca7dfe1e9301a23c90fef912027a04860e5263))
+
+
+### Performance Improvements
+
+* bound the disk reads a burst of file events starts, and skip the superseded ones ([bb2c245](https://github.com/Federico-Baldan/terraform-companion/commit/bb2c2455c2d1f9d669d288d545907277bc23baae))
+* bound the parse memo by the text it holds, not only by how many files ([aced408](https://github.com/Federico-Baldan/terraform-companion/commit/aced4082c8c90b2b4238b745fce3bc7faead71c8))
+* bound the text a resolve parses, and list a module's locals once ([af011b4](https://github.com/Federico-Baldan/terraform-companion/commit/af011b4d3324d0a3ee122cbfb43f5b7fa2c08a74))
+* cap the reference evaluations one resolve may start ([a36377e](https://github.com/Federico-Baldan/terraform-companion/commit/a36377ee068610f2cb52d6a4685b4636803402ca))
+* share one parse of a buffer between the providers that ask about it ([ea7c99d](https://github.com/Federico-Baldan/terraform-companion/commit/ea7c99d4f4411185df9f78bdbe9feecbcf0b322a))
+* skip the cache cleaner's lock-file walk when no shared plugin cache exists ([fd741c0](https://github.com/Federico-Baldan/terraform-companion/commit/fd741c0f82700bf49b6734bc9ef2c4efea3f0ccb))
+* stop scanning the whole workspace to answer questions about one module ([2aa5fbf](https://github.com/Federico-Baldan/terraform-companion/commit/2aa5fbf3225fbe3e01cd66bad5985a9bbba4ab18))
+
 ## [1.2.5](https://github.com/Federico-Baldan/terraform-companion/compare/v1.2.4...v1.2.5) (2026-10-23)
 
 
