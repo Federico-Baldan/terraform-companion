@@ -112,7 +112,7 @@ The action is hidden when the rewrite could change what Terraform builds:
 
 - `count.index` is used elsewhere in the block.
 - Something else in the module refers to the resource (`web[0]`, `web[*]`, a `depends_on` in another file).
-- The elements are read as objects, or the variable is not declared `list(string)` or `set(string)`.
+- The elements are read as objects, or the variable declares a `type` other than `list(string)` or `set(string)`. A variable with no `type` still gets the action.
 - The values are duplicates or not strings.
 
 The warning stays. Resources already in state need `terraform state mv`, because their addresses change from the index to the value.
