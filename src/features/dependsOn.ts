@@ -1,4 +1,11 @@
-import { attrOf, spanContains, stripComments, stripQuotes, walkBlocks } from '../core/hcl';
+import {
+  attrOf,
+  refsStartingIn,
+  spanContains,
+  stripComments,
+  stripQuotes,
+  walkBlocks,
+} from '../core/hcl';
 import type { LintFinding, ParsedFile, Span, TfRef } from '../core/model';
 
 const DEPENDABLE = new Set(['resource', 'data', 'module', 'output']);
@@ -144,9 +151,11 @@ export function detectRedundantDependsOn(file: ParsedFile): LintFinding[] {
     const entries = parseEntries(attr.valueText);
     if (entries.length === 0) return;
 
-    // block references, excluding the depends_on tuple itself
-    const bodyRefs = file.refs.filter(
-      (r) => spanContains(block.bodySpan, r.span.start) && !spanContains(attr.span, r.span.start),
+    // block references, excluding the depends_on tuple itself. Narrowed to the
+    // body first, not filtered from every reference in the file per block: that
+    // made the rule quadratic in file size (131ms at 8000 lines).
+    const bodyRefs = refsStartingIn(file.refs, block.bodySpan).filter(
+      (r) => !spanContains(attr.span, r.span.start),
     );
     // module addresses are never redundant — [module.x] waits for everything
     // in it, while module.x.output waits only for what that output needs

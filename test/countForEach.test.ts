@@ -722,9 +722,11 @@ describe('safeToRefactor is computed only when read', () => {
     });
     let scans = 0;
     const spy = Object.create(index) as WorkspaceIndex;
-    spy.refsTo = (parts: string[]) => {
+    // the safety analysis asks the index for the references to this block's
+    // address, restricted to its module — that query is what marks the scan
+    spy.refsToInDir = (parts: string[], dir: string) => {
       scans++;
-      return index.refsTo(parts);
+      return index.refsToInDir(parts, dir);
     };
 
     const patterns = detectCountLength(parseFile('/w/main.tf', SRC), spy);

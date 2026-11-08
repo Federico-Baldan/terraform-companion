@@ -35,9 +35,19 @@ export function planRelint(
 ): RelintPlan {
   const paths = new Set(changed.map(normalizePath));
   const drop = [...paths].filter((p) => !index.file(p));
-  const dirs = moduleScoped ? new Set([...paths].map((p) => index.moduleDirOf(p))) : undefined;
-  const publish = index
-    .files()
-    .filter((f) => (dirs ? dirs.has(index.moduleDirOf(f.path)) : paths.has(f.path)));
+  // Looked up by directory (or by path), not found by filtering a copy of every
+  // indexed file: that was O(workspace) on each debounced keystroke, for an edit
+  // that reaches a handful of files.
+  //
+  // In the module-scoped case that is the directory's .tf files. A tfvars sibling
+  // used to be republished too, but no rule applies to one, so it only ever
+  // overwrote an empty set of diagnostics with an empty set — and one that was
+  // deleted is already in `drop`.
+  const publish = moduleScoped
+    ? [...new Set([...paths].map((p) => index.moduleDirOf(p)))].flatMap((dir) => index.filesIn(dir))
+    : [...paths].flatMap((p) => {
+        const file = index.file(p);
+        return file ? [file] : [];
+      });
   return { publish, drop };
 }

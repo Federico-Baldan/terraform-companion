@@ -8,7 +8,12 @@ export interface IndexHost {
 }
 
 function norm(p: string): string {
-  return p.replace(/\\/g, '/');
+  // Almost every path is already POSIX-spelled, and this runs per reference and
+  // per file on the lint path — a CPU profile of a 1000-module workspace put a
+  // quarter of all self time here, in a regex that rewrites nothing. `includes`
+  // answers the same question without running one, and returns the very same
+  // string when there is nothing to change.
+  return p.includes('\\') ? p.replace(/\\/g, '/') : p;
 }
 
 /** Live buffers parsed outside the index must apply this too, or path
@@ -398,6 +403,22 @@ export class WorkspaceIndex {
     return dirOf(file);
   }
 
+  /** The indexed .tf files of one module directory — not its subdirectories, and
+   *  not tfvars, which belong to no module until a hover resolves them.
+   *
+   *  What "re-lint this directory" needs. Asking `files()` and filtering by
+   *  `moduleDirOf` instead is O(every file in the workspace) per edit: a copy of
+   *  the whole index and a path split per entry, on every debounced keystroke —
+   *  2.8ms at 10000 files for an edit that reaches five of them. */
+  filesIn(moduleDir: string): ParsedFile[] {
+    const out: ParsedFile[] = [];
+    for (const path of this.filesByDir.get(norm(moduleDir)) ?? []) {
+      const file = this.parsed.get(path);
+      if (file) out.push(file);
+    }
+    return out;
+  }
+
   /** Whether any indexed file in this directory needed error recovery to parse.
    *
    *  `refs` is a floor, not the whole truth, whenever that happened: a file
@@ -455,6 +476,58 @@ export class WorkspaceIndex {
       for (const ref of f.refs) {
         if (parts.every((p, i) => ref.parts[i] === p)) out.push({ file: f.path, ref });
       }
+    }
+    return out;
+  }
+
+  /** `refsTo`, restricted to the .tf files of one module directory.
+   *
+   *  The question every module-scoped caller really asks. Answering it as
+   *  `refsTo(...).filter(dirOf(file) === dir)` hands back a copy of the
+   *  *workspace-wide* bucket first, and those buckets are keyed on only the first
+   *  two address parts: `local.tags`, `local.name_prefix` or `aws_vpc.main` is the
+   *  same key in every module that spells it, so the bucket grows with the
+   *  workspace while the directory being asked about does not. Asked once per
+   *  local per directory, that was quadratic — measured at 1.9s of blocked
+   *  extension host at 500 modules and 27s at 2000, with a normalising regex run
+   *  on every reference of every copy.
+   *
+   *  Going through the directory's own files instead costs what the directory
+   *  holds: one lookup per file, whatever else the workspace contains. The result
+   *  is what the filter produced, as a fresh array the caller may keep. */
+  refsToInDir(parts: string[], moduleDir: string): { file: string; ref: TfRef }[] {
+    const files = this.filesByDir.get(norm(moduleDir));
+    if (!files) return [];
+    const matches = (ref: TfRef): boolean => parts.every((p, i) => ref.parts[i] === p);
+    const out: { file: string; ref: TfRef }[] = [];
+    if (parts.length >= 2) {
+      const bucket = this.idx().refsByAddress.get(`${parts[0]}.${parts[1]}`);
+      if (!bucket) return out;
+      const take = (file: string, refs: TfRef[]): void => {
+        // a two-part address is the bucket key, so everything in it matches
+        for (const ref of refs) if (parts.length === 2 || matches(ref)) out.push({ file, ref });
+      };
+      if (bucket.byFile.size < files.length) {
+        // Few files mention this address: walk those and keep the ones in this
+        // directory. Looking each of the directory's files up instead costs a
+        // lookup per file — in a flat directory of a thousand files, asked once
+        // per local, that was slower than the workspace-wide filter this
+        // replaced (16ms against 4.5ms per keystroke).
+        const dir = norm(moduleDir);
+        for (const [file, refs] of bucket.byFile) if (dirOf(file) === dir) take(file, refs);
+      } else {
+        for (const file of files) {
+          const refs = bucket.byFile.get(file);
+          if (refs) take(file, refs);
+        }
+      }
+      return out;
+    }
+    // fewer than two parts has no bucket: scan, but only this directory's files
+    for (const file of files) {
+      const parsed = this.parsed.get(file);
+      if (!parsed) continue;
+      for (const ref of parsed.refs) if (matches(ref)) out.push({ file, ref });
     }
     return out;
   }

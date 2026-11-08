@@ -5,7 +5,7 @@ import {
   listShape,
   type TfvarsValue,
 } from '../core/evaluator';
-import { attrOf, spanContains, stripComments, type TextEdit } from '../core/hcl';
+import { attrOf, refsStartingIn, spanContains, stripComments, type TextEdit } from '../core/hcl';
 import type { LintFinding, ParsedFile, Span, TfAttr, TfBlock } from '../core/model';
 import type { ModuleCallSite, WorkspaceIndex } from '../core/workspaceIndex';
 
@@ -244,18 +244,17 @@ function referencedOutsideBlock(
   // the typo is fixed the config breaks with "Invalid index" in a different
   // file, well past the undo horizon.
   if (index.moduleHasParseError(moduleDir)) return true;
-  // Ask for the two-part address and narrow here. `refsTo` only uses its
-  // precomputed bucket when given exactly two parts, and a data source's
-  // address is three (`data.type.name`) — so this fell through to a scan of
-  // every reference in every indexed file, on the code-action path, which VS
-  // Code drives from cursor movement. Resources and modules were already
-  // bucketed; only data blocks went off the cliff.
+  // Ask for the two-part address and narrow here: the index only buckets on two
+  // parts, and a data source's address is three (`data.type.name`), so asking
+  // for all three used to fall through to a scan of every reference in every
+  // indexed file, on the code-action path, which VS Code drives from cursor
+  // movement. Restricted to this module's files as well: `aws_vpc.main` or
+  // `module.vpc` is one bucket across every module that spells it, and fetching
+  // that bucket to filter it by directory cost O(modules) for a question about
+  // one directory.
   return index
-    .refsTo(addr.slice(0, 2))
-    .some(
-      (u) =>
-        matches(u.ref.parts) && u.file !== file.path && index.moduleDirOf(u.file) === moduleDir,
-    );
+    .refsToInDir(addr.slice(0, 2), moduleDir)
+    .some((u) => matches(u.ref.parts) && u.file !== file.path);
 }
 
 export function detectCountLength(
@@ -274,8 +273,10 @@ export function detectCountLength(
     const refText = m[1];
     const listRef = refText.split('.');
     const indexUses: Span[] = [];
-    for (const ref of file.refs) {
-      if (!spanContains(block.span, ref.span.start)) continue;
+    // only this block's references: scanning every one in the file for each
+    // counted block made detection quadratic in file size (60ms at 8000 lines),
+    // on every debounced keystroke and every cursor move
+    for (const ref of refsStartingIn(file.refs, block.span)) {
       if (ref.parts.length !== listRef.length || !ref.parts.every((p, i) => p === listRef[i])) {
         continue;
       }
@@ -303,11 +304,10 @@ export function detectCountLength(
         indexUses,
         get safeToRefactor(): boolean {
           if (safety === undefined) {
-            const orphanedIndexUse = file.refs.some(
+            const orphanedIndexUse = refsStartingIn(file.refs, currentBlock.span).some(
               (ref) =>
                 ref.parts[0] === 'count' &&
                 ref.parts[1] === 'index' &&
-                spanContains(currentBlock.span, ref.span.start) &&
                 !indexUses.some((use) => spanContains(use, ref.span.start)),
             );
             safety =

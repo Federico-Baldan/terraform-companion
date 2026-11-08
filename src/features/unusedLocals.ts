@@ -12,11 +12,12 @@ export function detectUnusedLocals(index: WorkspaceIndex, moduleDir: string): Li
   if (index.moduleHasParseError(moduleDir)) return [];
   const findings: LintFinding[] = [];
   for (const def of index.localsOf(moduleDir)) {
-    const uses = index.refsTo(['local', def.name]).filter(
-      (u) =>
-        index.moduleDirOf(u.file) === moduleDir &&
-        // a reference inside its own definition does not make it "used"
-        !(u.file === def.file && spanContains(def.attr.span, u.ref.span.start)),
+    // Asked of this module's own files, not of the whole workspace: `local.tags`
+    // is one bucket across every module that spells it, so filtering that bucket
+    // by directory was O(modules) per local and quadratic over a workspace.
+    const uses = index.refsToInDir(['local', def.name], moduleDir).filter(
+      // a reference inside its own definition does not make it "used"
+      (u) => !(u.file === def.file && spanContains(def.attr.span, u.ref.span.start)),
     );
     if (uses.length === 0) {
       findings.push({
