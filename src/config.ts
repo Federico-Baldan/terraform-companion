@@ -57,3 +57,11 @@ export function cacheCleanerStaleDays(): number {
 export function cacheCleanerAutoDelete(): boolean {
   return bool('cacheCleaner.autoDelete', false);
 }
+
+/** On by default, but it never deletes without asking, and deliberately a
+ *  separate switch from `autoDelete`: the shared plugin cache belongs to every
+ *  Terraform project on the machine, not to the workspace, so enabling silent
+ *  deletion of a workspace's own `.terraform` must not extend to it. */
+export function cacheCleanerSharedPluginCache(): boolean {
+  return bool('cacheCleaner.sharedPluginCache', true);
+}

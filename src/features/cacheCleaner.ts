@@ -1,6 +1,13 @@
 import type { Dirent } from 'node:fs';
-import { lstat, readdir, realpath, rm } from 'node:fs/promises';
-import { basename, isAbsolute, join, relative, sep } from 'node:path';
+import { lstat, readdir, readFile, realpath, rm, stat } from 'node:fs/promises';
+import { homedir, platform } from 'node:os';
+import { basename, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import * as semver from 'semver';
+
+// The shared provider cache below is deliberately modelled on what Terraform
+// itself does with it (internal/command/cliconfig, internal/providercache):
+// it links a cached provider into a project with a symlink and never writes to
+// the cache entry again, and it never deletes anything from the cache itself.
 
 export interface StaleCache {
   dir: string;
@@ -10,6 +17,297 @@ export interface StaleCache {
    *  `modules`, `plugins/<entry>`. Carried on the scan result so the prompt can
    *  name the directories instead of asking for a blanket yes to a number. */
   entries: string[];
+}
+
+export interface ProviderCacheEntry {
+  dir: string;
+  source: string;
+  sizeBytes: number;
+  lastActivityMs: number;
+}
+
+const LOCK_PROVIDER = /^\s*provider\s+"([^"]+)"\s*\{/gm;
+/** `key = "value"`, the key bare or quoted as HCL allows. Sticky, so it matches
+ *  at exactly the position it is given. */
+const STRING_ASSIGNMENT = /"?([A-Za-z_][\w-]*)"?[ \t]*=[ \t]*"([^"\r\n]*)"/y;
+/** `name {` or `name "label" {`: the start of a block. */
+const BLOCK_OPEN = /"?([A-Za-z_][\w-]*)"?(?:[ \t]+"[^"\r\n]*")*[ \t]*\{/y;
+
+/** Provider sources named by lock files. A lock file identifies a provider
+ * source, not a single version, so protecting the whole source is the only
+ * safe operation without guessing from constraints or checksums. */
+export function providerSourcesFromLockFile(contents: string): Set<string> {
+  return new Set(
+    [...contents.matchAll(LOCK_PROVIDER)]
+      .map((match) => match[1])
+      .filter((source): source is string => Boolean(source)),
+  );
+}
+
+interface StringAssignment {
+  /** the names of the blocks it sits in, outermost first */
+  blocks: readonly string[];
+  key: string;
+  value: string;
+}
+
+/** Every `key = "string"` of a Terraform CLI config, with the blocks around it.
+ *  Terraform parses that file as HCL, where an assignment only means something
+ *  in the block it is in, and a comment (`#`, `//`, `/* *​/`) says nothing. A
+ *  pattern on the raw text could not tell `provider_installation {
+ *  plugin_cache_dir = ... }` or a commented-out line from the real thing, so the
+ *  text is walked instead: comments and strings are skipped, blocks are named as
+ *  they open and close, and an assignment is read only where a statement starts,
+ *  which is a new line or the `{` of a block (`filesystem_mirror { path = "/x" }`
+ *  is one line). */
+function stringAssignmentsOf(text: string): StringAssignment[] {
+  const found: StringAssignment[] = [];
+  const blocks: string[] = [];
+  let statementStart = true;
+  for (let i = 0; i < text.length; ) {
+    const c = text.charAt(i);
+    if (c === '\n') {
+      statementStart = true;
+      i++;
+    } else if (c === ' ' || c === '\t' || c === '\r') {
+      i++;
+    } else if (c === '#' || (c === '/' && text.charAt(i + 1) === '/')) {
+      const end = text.indexOf('\n', i);
+      i = end < 0 ? text.length : end;
+    } else if (c === '/' && text.charAt(i + 1) === '*') {
+      const end = text.indexOf('*/', i + 2);
+      i = end < 0 ? text.length : end + 2;
+    } else {
+      if (statementStart) {
+        BLOCK_OPEN.lastIndex = i;
+        const open = BLOCK_OPEN.exec(text);
+        if (open?.[1]) {
+          blocks.push(open[1]);
+          i = BLOCK_OPEN.lastIndex;
+          continue;
+        }
+        STRING_ASSIGNMENT.lastIndex = i;
+        const assignment = STRING_ASSIGNMENT.exec(text);
+        if (assignment?.[1] !== undefined && assignment[2] !== undefined)
+          found.push({ blocks: [...blocks], key: assignment[1], value: assignment[2] });
+      }
+      statementStart = c === '{';
+      if (c === '"') {
+        i++;
+        while (i < text.length && text.charAt(i) !== '"' && text.charAt(i) !== '\n')
+          i += text.charAt(i) === '\\' ? 2 : 1;
+        i++;
+      } else {
+        if (c === '{') blocks.push('');
+        else if (c === '}') blocks.pop();
+        i++;
+      }
+    }
+  }
+  return found;
+}
+
+/** The top-level `plugin_cache_dir` of a Terraform CLI config. */
+export function pluginCacheDirOf(text: string): string | undefined {
+  return stringAssignmentsOf(text).find(
+    (a) => a.blocks.length === 0 && a.key === 'plugin_cache_dir' && a.value !== '',
+  )?.value;
+}
+
+/** The `path` of every `filesystem_mirror` block of a Terraform CLI config. */
+export function filesystemMirrorPathsOf(text: string): string[] {
+  return stringAssignmentsOf(text)
+    .filter(
+      (a) =>
+        a.key === 'path' &&
+        a.blocks.length === 2 &&
+        a.blocks[0] === 'provider_installation' &&
+        a.blocks[1] === 'filesystem_mirror' &&
+        a.value !== '',
+    )
+    .map((a) => a.value);
+}
+
+/** Whether `path` is absolute on `os`. On Windows a rooted path with no drive,
+ *  such as `/x` — what `$HOME/x` becomes when `HOME` is unset, the usual case
+ *  there — passes `path.isAbsolute` yet resolves against the current drive. */
+export function isAbsoluteFsPath(path: string, os: NodeJS.Platform = platform()): boolean {
+  return os === 'win32' ? /^(?:[a-zA-Z]:[\\/]|\\\\)/.test(path) : isAbsolute(path);
+}
+
+/** `~/.terraform.d/plugins` and its siblings are Terraform's implied local
+ *  provider mirrors: the layout of a plugin cache, but holding providers placed
+ *  by hand, which nothing can restore. HashiCorp's docs say the cache directory
+ *  must not be one, and a sweep that took it for one would delete them. */
+const LOCAL_MIRROR_DIR =
+  /(?:^|[\\/])(?:\.?terraform\.d|terraform|io\.terraform)[\\/]plugins[\\/]*$/i;
+
+/** Go's `os.ExpandEnv`, which Terraform applies to the `plugin_cache_dir` value
+ *  of the CLI config file — so `$HOME/.terraform.d/plugin-cache`, the example in
+ *  HashiCorp's own docs, names a real directory. An unset variable expands to
+ *  nothing, as it does there. Terraform does not expand `~`, and neither do we. */
+export function expandEnv(value: string): string {
+  return value.replace(
+    /\$(?:\{(\w+)\}|(\w+))/g,
+    (_match, braced?: string, bare?: string) => process.env[braced ?? bare ?? ''] ?? '',
+  );
+}
+
+/** The CLI config files Terraform reads, in the order it prefers them
+ *  (internal/command/cliconfig): one named by `TF_CLI_CONFIG_FILE`, else
+ *  `TERRAFORM_CONFIG`, and nothing else; otherwise `~/.terraformrc` (on Windows
+ *  `%APPDATA%\\terraform.rc`) and then the `*.tfrc` files in `~/.terraform.d`
+ *  (`%APPDATA%\\terraform.d`), `*.tfrc.json` ones included, in file name order. */
+async function cliConfigFiles(): Promise<string[]> {
+  const override = process.env.TF_CLI_CONFIG_FILE || process.env.TERRAFORM_CONFIG;
+  if (override) return [override];
+  const win = platform() === 'win32';
+  const base = win ? (process.env.APPDATA ?? homedir()) : homedir();
+  const dir = join(base, win ? 'terraform.d' : '.terraform.d');
+  let names: string[] = [];
+  try {
+    names = (await readdir(dir))
+      .filter((name) => name.endsWith('.tfrc') || name.endsWith('.tfrc.json'))
+      .sort();
+  } catch {
+    // no config directory is normal
+  }
+  return [
+    join(base, win ? 'terraform.rc' : '.terraformrc'),
+    ...names.map((name) => join(dir, name)),
+  ];
+}
+
+/** The `path` of every `filesystem_mirror` of a `*.tfrc.json` CLI config. HCL's
+ *  JSON syntax lets a block be an object or an array of them, at both levels. */
+function filesystemMirrorPathsOfJson(text: string): string[] {
+  const objects = (value: unknown): Record<string, unknown>[] =>
+    (Array.isArray(value) ? value : [value]).filter(
+      (item): item is Record<string, unknown> => typeof item === 'object' && item !== null,
+    );
+  const paths: string[] = [];
+  const root = objects(JSON.parse(text) as unknown);
+  for (const config of root)
+    for (const installation of objects(config.provider_installation))
+      for (const mirror of objects(installation.filesystem_mirror))
+        if (typeof mirror.path === 'string' && mirror.path !== '') paths.push(mirror.path);
+  return paths;
+}
+
+/** Every `filesystem_mirror` path of every CLI config file, not only the one that
+ *  names the cache: Terraform appends the `provider_installation` blocks of all of
+ *  them, and the cache may come from `TF_PLUGIN_CACHE_DIR`. Taken as written,
+ *  since Terraform neither expands nor checks it. */
+async function filesystemMirrorPaths(log?: (m: string) => void): Promise<string[]> {
+  const paths: string[] = [];
+  for (const candidate of await cliConfigFiles()) {
+    try {
+      const text = await readFile(candidate, 'utf8');
+      paths.push(
+        ...(isJsonConfig(text) ? filesystemMirrorPathsOfJson(text) : filesystemMirrorPathsOf(text)),
+      );
+    } catch (e) {
+      skippedConfig(candidate, e, log);
+    }
+  }
+  return paths;
+}
+
+/** HCL v1 takes a file for JSON when its first non-blank character is `{`,
+ *  whatever the file is called. */
+function isJsonConfig(text: string): boolean {
+  return text.trimStart().startsWith('{');
+}
+
+/** An absent CLI config is normal. One that is there and could not be read or
+ *  parsed is skipped, which Terraform itself would not do, so it is said. */
+function skippedConfig(file: string, error: unknown, log?: (m: string) => void): void {
+  if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+  log?.(`cacheCleaner: CLI config ${file} skipped: ${error}`);
+}
+
+/** Whether two paths are one directory: through links, trailing separators and,
+ *  where the file system ignores case, case. A path that does not exist is
+ *  compared as written. */
+async function sameDirectory(a: string, b: string): Promise<boolean> {
+  const canonical = async (path: string): Promise<string> => {
+    let real = resolve(path);
+    try {
+      real = await realpath(path);
+    } catch {
+      // not there: the written path is all there is to compare
+    }
+    return platform() === 'win32' ? real.toLowerCase() : real;
+  };
+  return (await canonical(a)) === (await canonical(b));
+}
+
+/** The `plugin_cache_dir` of a `*.tfrc.json` CLI config, which Terraform reads
+ *  as JSON. */
+function pluginCacheDirOfJson(text: string): string | undefined {
+  const value: unknown = (JSON.parse(text) as { plugin_cache_dir?: unknown } | null)
+    ?.plugin_cache_dir;
+  return typeof value === 'string' && value ? value : undefined;
+}
+
+/** Where Terraform keeps its shared plugin cache, or nothing when none is
+ *  configured. Resolved the way Terraform resolves it: `TF_PLUGIN_CACHE_DIR`
+ *  wins and is used verbatim, otherwise the first CLI config file that sets it,
+ *  after `$VAR` expansion. A relative path is refused: Terraform resolves it
+ *  against its own working directory, which the extension host cannot know, so
+ *  any guess could point the scan at the wrong tree. So is a local provider
+ *  mirror (see `LOCAL_MIRROR_DIR`), by the name it was given and by where it
+ *  really is. Each refusal is logged, so a cache that is never swept can be told
+ *  apart from one that is not configured. */
+export async function configuredProviderCache(
+  log?: (m: string) => void,
+): Promise<string | undefined> {
+  const usable = async (dir: string): Promise<string | undefined> => {
+    if (!isAbsoluteFsPath(dir)) {
+      log?.(`cacheCleaner: shared plugin cache ${dir} ignored, the path must be absolute`);
+      return undefined;
+    }
+    let real = dir;
+    try {
+      real = await realpath(dir);
+    } catch {
+      // not there yet: only the name can be judged
+    }
+    if (LOCAL_MIRROR_DIR.test(dir) || LOCAL_MIRROR_DIR.test(real)) {
+      log?.(`cacheCleaner: shared plugin cache ${dir} ignored, it is a local provider mirror`);
+      return undefined;
+    }
+    // a mirror declared in the CLI config: Terraform says the cache must not be one
+    for (const mirror of await filesystemMirrorPaths(log)) {
+      if (!isAbsoluteFsPath(mirror)) {
+        // Terraform resolves it against its own working directory, which could
+        // make it this very directory, and nothing here can tell
+        log?.(
+          `cacheCleaner: shared plugin cache ${dir} ignored, filesystem_mirror path ${mirror} is relative so it cannot be told apart from the cache`,
+        );
+        return undefined;
+      }
+      if (await sameDirectory(dir, mirror)) {
+        log?.(
+          `cacheCleaner: shared plugin cache ${dir} ignored, the CLI config names it as a filesystem_mirror, which holds providers placed by hand`,
+        );
+        return undefined;
+      }
+    }
+    return dir;
+  };
+  const fromEnv = process.env.TF_PLUGIN_CACHE_DIR;
+  if (fromEnv) return usable(fromEnv);
+  for (const candidate of await cliConfigFiles()) {
+    try {
+      const text = await readFile(candidate, 'utf8');
+      const configured = isJsonConfig(text) ? pluginCacheDirOfJson(text) : pluginCacheDirOf(text);
+      if (configured) return usable(expandEnv(configured));
+    } catch (e) {
+      skippedConfig(candidate, e, log);
+    }
+  }
+  return undefined;
 }
 
 /** Dependency and VCS trees only — dist, build, target, vendor stay out since
@@ -76,6 +374,12 @@ export const CACHE_SUBDIRS = ['providers', 'plugins', 'modules'] as const;
  *  in a notification, so it is not worth an unbounded walk: past the budget the
  *  figure is an undercount, which `formatSize` already tolerates. */
 const MAX_SIZE_ENTRIES = 50_000;
+
+/** Entries the lock-file walk may read in one workspace folder. It follows
+ *  symlinks, so a link to `/usr` would otherwise cost every scan, and the second
+ *  one after the prompt, half a minute. Past the budget the scan reports itself
+ *  incomplete, which switches the shared-cache sweep off. */
+export const MAX_LOCK_WALK_ENTRIES = 200_000;
 
 /** Bounded and cancellable: this recurses into a module checkout, which for a
  *  git-sourced module is a full clone, and the total exists only to render a
@@ -332,6 +636,330 @@ export async function findStaleTerraformDirs(
   };
   await visit(root, 0);
   return out;
+}
+
+export interface ProviderSourceScan {
+  sources: Set<string>;
+  /** False when anything that could name a provider went unread: a directory
+   *  that would not list, a lock file that would not open, the depth limit, or a
+   *  cancelled walk. The sources are what *protects* cache entries, so an
+   *  incomplete set means "unprotected" for exactly the providers a missed lock
+   *  file would have named — the caller must not delete on it. */
+  complete: boolean;
+  /** True when the walk stopped because the workspace holds more entries than
+   *  `MAX_LOCK_WALK_ENTRIES`. `complete` is false then too; this says why. */
+  limited: boolean;
+}
+
+/** `SKIP` minus `.terragrunt-cache`. The sweep for stale `.terraform` folders
+ *  skips it because its mtimes belong to the checkout; a *lock file* there is the
+ *  opposite case, a real project that really links providers from the cache. */
+const LOCK_SKIP = new Set([...SKIP].filter((name) => name !== '.terragrunt-cache'));
+
+/** `<host>/<namespace>/<type>` of each provider an initialised project has under
+ *  `.terraform/providers`. That is what the project links from the cache, whether
+ *  or not its lock file exists or was found. */
+async function providerSourcesFromDotTerraform(
+  tfDir: string,
+): Promise<{ sources: string[]; complete: boolean }> {
+  const sources: string[] = [];
+  let complete = true;
+  const dirs = async (dir: string): Promise<string[]> => {
+    try {
+      return (await readdir(dir, { withFileTypes: true }))
+        .filter((d) => d.isDirectory())
+        .map((d) => d.name);
+    } catch (e) {
+      const code = (e as NodeJS.ErrnoException).code;
+      if (code !== 'ENOENT' && code !== 'ENOTDIR') complete = false;
+      return [];
+    }
+  };
+  const base = join(tfDir, 'providers');
+  for (const host of await dirs(base))
+    for (const namespace of await dirs(join(base, host)))
+      for (const type of await dirs(join(base, host, namespace)))
+        sources.push(`${host}/${namespace}/${type}`);
+  return { sources, complete };
+}
+
+/** Collects the provider sources a workspace folder still needs: those named by
+ * a lock file, and those an initialised project links under `.terraform`.
+ * Sources, rather than versions, are protected because Terraform lock files do
+ * not record a standalone selected-version field.
+ *
+ * Everything that could hide a project is followed or counted against
+ * `complete`: a symlinked `.terraform.lock.hcl` (monorepos share one that way;
+ * `Dirent.isFile()` is false for a link), a symlinked directory (guarded by the
+ * real path, so a loop ends), and `.terragrunt-cache`. */
+export async function collectProviderSources(
+  root: string,
+  cancelled?: () => boolean,
+  maxEntries: number = MAX_LOCK_WALK_ENTRIES,
+): Promise<ProviderSourceScan> {
+  const sources = new Set<string>();
+  let complete = true;
+  let limited = false;
+  let left = maxEntries;
+  const seen = new Set<string>();
+  const visit = async (dir: string, real: string, depth: number): Promise<void> => {
+    if (cancelled?.()) {
+      complete = false;
+      return;
+    }
+    // out of budget: `complete` is already false, and reading on would only cost time
+    if (depth > MAX_DEPTH || left < 0) {
+      complete = false;
+      return;
+    }
+    if (seen.has(real)) return;
+    seen.add(real);
+    let entries: Dirent[];
+    try {
+      entries = await readdir(dir, { withFileTypes: true });
+    } catch {
+      complete = false;
+      return;
+    }
+    // a link may lead anywhere, so a tree has to be bounded by what it holds
+    left -= entries.length;
+    if (left < 0) {
+      complete = false;
+      limited = true;
+      return;
+    }
+    for (const de of entries) {
+      if (cancelled?.()) {
+        complete = false;
+        return;
+      }
+      const path = join(dir, de.name);
+      if (de.name === '.terraform.lock.hcl' && (de.isFile() || de.isSymbolicLink())) {
+        try {
+          for (const source of providerSourcesFromLockFile(await readFile(path, 'utf8')))
+            sources.add(source);
+        } catch {
+          // Gone mid-walk, or a dangling link: either way this project's providers
+          // are unknown, which is not the same as "uses none".
+          complete = false;
+        }
+      } else if (de.isDirectory()) {
+        if (LOCK_SKIP.has(de.name)) continue;
+        // what the project links in is already read from the directory names; the
+        // links themselves lead into the shared cache, which is no place to walk
+        // `modules` holds what the project downloaded: somebody else's code, whose
+        // lock files Terraform never reads, and the bulk of a terragrunt tree
+        if ((de.name === 'providers' || de.name === 'modules') && basename(dir) === '.terraform')
+          continue;
+        if (de.name === '.terraform') {
+          const linked = await providerSourcesFromDotTerraform(path);
+          for (const source of linked.sources) sources.add(source);
+          if (!linked.complete) complete = false;
+        }
+        await visit(path, join(real, de.name), depth + 1);
+      } else if (de.isSymbolicLink() && !LOCK_SKIP.has(de.name)) {
+        let target: string;
+        try {
+          if (!(await stat(path)).isDirectory()) continue;
+          target = await realpath(path);
+        } catch (e) {
+          // a link to nothing, or in a loop, has no lock file to find; one that
+          // could not be reached (permissions, a stale mount) may have had one
+          const code = (e as NodeJS.ErrnoException).code;
+          if (code !== 'ENOENT' && code !== 'ELOOP' && code !== 'ENOTDIR') complete = false;
+          continue;
+        }
+        if (de.name === '.terraform') {
+          const linked = await providerSourcesFromDotTerraform(path);
+          for (const source of linked.sources) sources.add(source);
+          if (!linked.complete) complete = false;
+        }
+        await visit(path, target, depth + 1);
+      }
+    }
+  };
+  let rootReal = root;
+  try {
+    rootReal = await realpath(root);
+  } catch {
+    complete = false;
+  }
+  await visit(root, rootReal, 0);
+  return { sources, complete, limited };
+}
+
+/** Newest mtime among the descendants of `dir` (not `dir` itself), with the
+ *  same bounds, and the same refusal to follow links, as `dirSize`. */
+async function newestBelow(
+  dir: string,
+  depth = 0,
+  cancelled?: () => boolean,
+  budget: { left: number } = { left: MAX_SIZE_ENTRIES },
+): Promise<number> {
+  if (depth > MAX_DEPTH || budget.left <= 0 || cancelled?.()) return 0;
+  let newest = 0;
+  let entries: Dirent[];
+  try {
+    entries = await readdir(dir, { withFileTypes: true });
+  } catch {
+    return 0;
+  }
+  for (const de of entries) {
+    if (cancelled?.() || budget.left <= 0) return newest;
+    const p = join(dir, de.name);
+    try {
+      budget.left--;
+      newest = Math.max(newest, (await lstat(p)).mtimeMs);
+      if (de.isDirectory())
+        newest = Math.max(newest, await newestBelow(p, depth + 1, cancelled, budget));
+    } catch {
+      // unreadable entry: it says nothing about activity
+    }
+  }
+  return newest;
+}
+
+/** Last sign of life of a provider version directory. Terraform links a cached
+ *  provider into a project and never writes to the cache entry again, so the
+ *  directory's own mtime is when it was installed — a provider used every day
+ *  still looks months old by that measure. Anything written beneath it (an
+ *  install finishing, a binary being replaced) is the only activity there is to
+ *  see, which is why it is counted. */
+async function providerActivity(
+  dir: string,
+  ownMtimeMs: number,
+  cancelled?: () => boolean,
+): Promise<number> {
+  return Math.max(ownMtimeMs, await newestBelow(dir, 0, cancelled));
+}
+
+/** A registry host: a name with a dot, or `localhost`. */
+const REGISTRY_HOST = /^(?:[^\\/\s]+\.[^\\/\s]+|localhost)$/i;
+const OS_ARCH_DIR = /^[a-z0-9]+_[a-z0-9]+$/i;
+
+/** Whether `versionDir` is what `terraform init` leaves: a semantic version with
+ *  an `<os>_<arch>` directory inside. Terraform checks only that
+ *  `plugin_cache_dir` exists, so without this any tree four levels deep is
+ *  "a provider". */
+async function isInstalledProvider(versionDir: string, versionName: string): Promise<boolean> {
+  if (semver.valid(versionName) === null) return false;
+  try {
+    return (await readdir(versionDir, { withFileTypes: true })).some(
+      (d) => d.isDirectory() && OS_ARCH_DIR.test(d.name),
+    );
+  } catch {
+    return false;
+  }
+}
+
+export async function findStaleProviderCacheEntries(
+  cacheRoot: string,
+  protectedSources: ReadonlySet<string>,
+  staleDays: number,
+  now: number = Date.now(),
+  cancelled?: () => boolean,
+): Promise<ProviderCacheEntry[]> {
+  const out: ProviderCacheEntry[] = [];
+  const cutoff = staleCutoff(staleDays, now);
+  let hosts: Dirent[];
+  try {
+    hosts = await readdir(cacheRoot, { withFileTypes: true });
+  } catch {
+    return out;
+  }
+  for (const host of hosts) {
+    if (cancelled?.() || !host.isDirectory() || !REGISTRY_HOST.test(host.name)) continue;
+    let namespaces: Dirent[];
+    try {
+      namespaces = await readdir(join(cacheRoot, host.name), { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const namespace of namespaces) {
+      if (cancelled?.() || !namespace.isDirectory()) continue;
+      let providers: Dirent[];
+      try {
+        providers = await readdir(join(cacheRoot, host.name, namespace.name), {
+          withFileTypes: true,
+        });
+      } catch {
+        continue;
+      }
+      for (const provider of providers) {
+        if (cancelled?.() || !provider.isDirectory()) continue;
+        const source = `${host.name}/${namespace.name}/${provider.name}`;
+        if (protectedSources.has(source)) continue;
+        const providerDir = join(cacheRoot, host.name, namespace.name, provider.name);
+        let versions: Dirent[];
+        try {
+          versions = await readdir(providerDir, { withFileTypes: true });
+        } catch {
+          continue;
+        }
+        for (const version of versions) {
+          if (cancelled?.() || !version.isDirectory()) continue;
+          const dir = join(providerDir, version.name);
+          if (!(await isInstalledProvider(dir, version.name))) continue;
+          let st: Awaited<ReturnType<typeof lstat>>;
+          try {
+            st = await lstat(dir);
+          } catch {
+            continue;
+          }
+          const activity = await providerActivity(dir, st.mtimeMs, cancelled);
+          if (activity >= cutoff) continue;
+          out.push({
+            dir,
+            source,
+            sizeBytes: await dirSize(dir, 0, cancelled),
+            lastActivityMs: activity,
+          });
+        }
+      }
+    }
+  }
+  return out;
+}
+
+export async function deleteProviderCacheEntry(
+  entry: ProviderCacheEntry,
+  cacheRoot: string,
+): Promise<CleanResult> {
+  try {
+    const realRoot = await realpath(cacheRoot);
+    const realEntry = await realpath(entry.dir);
+    // The scan found this entry at <root>/<relative>. Anywhere else it now
+    // resolves to means a level was swapped for a link since: the prompt can sit
+    // open for hours, and being inside the root is not enough, since the other
+    // end of the link may be an entry the user never saw, or one a lock file names.
+    const expected = join(realRoot, relative(cacheRoot, entry.dir));
+    if (realEntry === realRoot || realEntry !== expected || !isInside(realRoot, realEntry)) {
+      return { ok: false, reason: 'provider cache path is not where the scan found it' };
+    }
+    if (!(await lstat(entry.dir)).isDirectory()) return { ok: false, reason: 'not a directory' };
+    await rm(realEntry, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+    return { ok: true, removed: [entry.dir] };
+  } catch (e) {
+    return { ok: false, reason: `${e}` };
+  }
+}
+
+/** The provider-cache counterpart of `isStillStale`: the prompt can sit open
+ *  indefinitely, and the shared cache is exactly where a `terraform init` in
+ *  another project writes while it waits. A directory that is gone counts as
+ *  not stale, since there is nothing left to delete. */
+export async function isProviderEntryStillStale(
+  dir: string,
+  staleDays: number,
+  now: number = Date.now(),
+): Promise<boolean> {
+  let own: number;
+  try {
+    own = (await lstat(dir)).mtimeMs;
+  } catch {
+    return false;
+  }
+  return (await providerActivity(dir, own)) < staleCutoff(staleDays, now);
 }
 
 /** The prompt can sit open indefinitely, so a `terraform init` run while
