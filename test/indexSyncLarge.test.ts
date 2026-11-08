@@ -37,7 +37,7 @@ describe('a file too large to parse', () => {
     };
     const notices = (path: string) =>
       messages.filter((m) => m.includes(path) && m.includes('larger than 1 MiB'));
-    return { index, change, notices };
+    return { index, change, notices, watcher };
   }
 
   it('is named in the log, once however often it changes', async () => {
@@ -67,6 +67,30 @@ describe('a file too large to parse', () => {
     expect(notices('/big/a.tf')).toHaveLength(1);
     await change('/big/a.tf', over('2'));
     expect(notices('/big/a.tf')).toHaveLength(2);
+  });
+
+  it('is named again when it is deleted and comes back', async () => {
+    const { index, change, notices, watcher } = start();
+    await change('/big/a.tf', over('1'));
+    watcher.fire('delete', '/big/a.tf');
+    await expect.poll(() => index.file('/big/a.tf')).toBeUndefined();
+    await change('/big/a.tf', over('2'));
+    expect(notices('/big/a.tf')).toHaveLength(2);
+  });
+
+  it('is named when the index starts out holding it, once', async () => {
+    const index = new WorkspaceIndex();
+    await index.updateFile('/big/scan.tf', over('1'));
+    const messages: string[] = [];
+    const context = { subscriptions: [] as { dispose(): void }[] };
+    registerIndexSync(
+      context as never,
+      index,
+      () => {},
+      (m) => messages.push(m),
+    );
+    expect(messages.filter((m) => m.includes('/big/scan.tf'))).toHaveLength(1);
+    expect(messages[0]).toContain('larger than 1 MiB');
   });
 
   it('says nothing about a file that parses', async () => {

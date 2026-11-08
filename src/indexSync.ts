@@ -94,26 +94,20 @@ export function registerIndexSync(
   const tracked = new TrackedDirs();
   for (const file of index.files()) tracked.add(file.path);
 
-  /** Files already named in the log as too large to parse, so an edit of one does
-   *  not repeat it on every pause. Leaves the set when the file is read below the
-   *  limit again, so growing past it a second time is named a second time. Seeded
-   *  from the initial scan, whose files are named here at registration. */
-  const namedTooLarge = new Set<string>();
-  for (const file of index.files()) {
-    if (!file.tooLarge) continue;
-    namedTooLarge.add(normalizePath(file.path));
-    log?.(tooLargeNotice(file.path));
-  }
-  const noteTooLarge = (path: string): void => {
-    const key = normalizePath(path);
-    if (!index.file(path)?.tooLarge) {
-      namedTooLarge.delete(key);
-      return;
-    }
-    if (namedTooLarge.has(key)) return;
-    namedTooLarge.add(key);
-    log?.(tooLargeNotice(path));
+  /** Every path into the index goes through here, so a file past the parse limit
+   *  is named in the log by whichever of them finds it. Said when a file turns
+   *  too large, not on every edit while it stays so: the state before the update
+   *  is the memory, which also means a file deleted and brought back is named
+   *  again, as is one that shrinks and grows past the limit a second time. */
+  const updateIndex = async (path: string, text: string): Promise<boolean> => {
+    const wasTooLarge = index.file(path)?.tooLarge === true;
+    const changed = await index.updateFile(path, text);
+    // after the teardown the output channel is gone, and writing to it throws
+    if (!disposed && !wasTooLarge && index.file(path)?.tooLarge) log?.(tooLargeNotice(path));
+    return changed;
   };
+  // the files the initial scan found are named once, here
+  for (const file of index.files()) if (file.tooLarge) log?.(tooLargeNotice(file.path));
 
   /** Changed paths waiting to be announced.
    *
@@ -173,12 +167,11 @@ export function registerIndexSync(
         // every keystroke while the file stayed open.
         let changed: boolean;
         try {
-          changed = await index.updateFile(path, doc.getText());
+          changed = await updateIndex(path, doc.getText());
         } catch (e) {
           log?.(`Not indexed (parse failed): ${path}: ${e}`);
           return;
         }
-        if (!disposed) noteTooLarge(path);
         // Identical bytes are the common case here, not the exception: opening
         // a file, and typing a character then deleting it, both land on text the
         // index already holds. Announcing anyway re-lints every file in the
@@ -249,9 +242,7 @@ export function registerIndexSync(
       if (disposed || tokenOf(uri.fsPath) !== token) return;
       // a save makes this re-read what the 500ms buffer debounce already
       // parsed, so without the guard every save costs two full refresh rounds
-      const changed = await index.updateFile(uri.fsPath, text);
-      if (!disposed) noteTooLarge(uri.fsPath);
-      if (changed) announce([uri.fsPath]);
+      if (await updateIndex(uri.fsPath, text)) announce([uri.fsPath]);
     } catch (e) {
       // After the teardown the output channel is gone, and writing to it throws
       // from a promise nothing awaits. A read given up on late lands here too.
@@ -323,9 +314,7 @@ export function registerIndexSync(
         const text = new TextDecoder().decode(await vscode.workspace.fs.readFile(uri));
         // the folder can be removed again while this scan is still running
         if (disposed || tokenOf(uri.fsPath) !== token) continue;
-        const changed = await index.updateFile(uri.fsPath, text);
-        if (!disposed) noteTooLarge(uri.fsPath);
-        if (changed) added.push(uri.fsPath);
+        if (await updateIndex(uri.fsPath, text)) added.push(uri.fsPath);
       } catch (e) {
         log?.(`Not indexed (unreadable or parse failed): ${uri.fsPath}: ${e}`);
       }
