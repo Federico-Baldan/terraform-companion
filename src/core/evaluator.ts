@@ -940,26 +940,46 @@ function rootDirOf(scope: EvalScope): string | undefined {
   return roots.size === 1 ? [...roots][0] : undefined;
 }
 
-/** A setting and the index can spell one directory differently in exactly one
- *  way that matters: VS Code lowers a Windows drive letter, a typed path may not. */
+/** A setting and the index can spell one directory differently in two ways that
+ *  matter: VS Code lowers a Windows drive letter and a typed path may not, and
+ *  the index drops the separator after a root (`dirOf('/main.tf')` is `''`,
+ *  `dirOf('c:/main.tf')` is `c:`) where a setting keeps it. */
 function dirKey(path: string): string {
-  return /^[a-zA-Z]:/.test(path) ? path.charAt(0).toLowerCase() + path.slice(1) : path;
+  const folded = /^[a-zA-Z]:/.test(path) ? path.charAt(0).toLowerCase() + path.slice(1) : path;
+  return folded.replace(/\/+$/, '');
 }
 
 function sameDir(a: string, b: string): boolean {
   return dirKey(a) === dirKey(b);
 }
 
-/** Whether the window holds more than one root module: directories with
- *  Terraform files that no `module` block calls. */
-function hasSeveralRoots(index: WorkspaceIndex): boolean {
-  const dirs = new Set(index.files().map((file) => index.moduleDirOf(file.path)));
-  let roots = 0;
-  for (const dir of dirs)
-    if (index.externalCallSitesOf(dir).length === 0 && ++roots > 1) return true;
-  return false;
-}
+const rootCounts = new WeakMap<WorkspaceIndex, { generation: number; several: boolean }>();
 
+/** Whether the window holds more than one root module: directories with
+ *  Terraform files that no `module` block calls. A directory with only a
+ *  `.tfvars` file is not a module. Counted once per state of the index, since a
+ *  hover can ask once per row and the count walks every file. */
+function hasSeveralRoots(index: WorkspaceIndex): boolean {
+  const generation = index.generation();
+  const known = rootCounts.get(index);
+  if (known?.generation === generation) return known.several;
+  const dirs = new Set(
+    index
+      .files()
+      .filter((file) => file.path.endsWith('.tf'))
+      .map((file) => index.moduleDirOf(file.path)),
+  );
+  let roots = 0;
+  let several = false;
+  for (const dir of dirs) {
+    if (index.externalCallSitesOf(dir).length === 0 && ++roots > 1) {
+      several = true;
+      break;
+    }
+  }
+  rootCounts.set(index, { generation, several });
+  return several;
+}
 /** Module name + shortest path suffix that disambiguates sites — basenames
  *  alone would collapse envs/dev/main.tf and envs/prod/main.tf into one. */
 function siteLabels(sites: ModuleCallSite[]): string[] {

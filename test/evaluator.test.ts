@@ -1,4 +1,4 @@
-import { beforeAll, describe, expect, it } from 'vitest';
+import { beforeAll, describe, expect, it, vi } from 'vitest';
 import {
   type EvalScope,
   emptyUsage,
@@ -747,6 +747,93 @@ describe('context values', () => {
         rootDir: '/repo/envs/prod',
       };
       expect(resolveRef(['path', 'module'], scope)).toBe('../../modules/vpc');
+    });
+  });
+
+  /** The note is for a window that really holds several roots. A directory that
+   *  has only a .tfvars file is not a module, so it is not one. */
+  it('does not count a directory holding only tfvars as a second root', async () => {
+    const index = new WorkspaceIndex();
+    await index.updateFile('/repo/main.tf', 'locals {}\n');
+    await index.updateFile('/repo/environments/prod.tfvars', 'x = 1\n');
+    const used = emptyUsage();
+    const scope: EvalScope = { index, moduleDir: '/repo', cwd: '/run', used };
+    expect(resolveRef(['path', 'cwd'], scope)).toBe('/run');
+    expect(used.assumes.size).toBe(0);
+  });
+
+  /** An example that calls the module it sits in is a root of its own: it is run
+   *  from its own directory. Roots are told apart the way `rootDirOf` tells them,
+   *  by the calls from outside a module's own tree. */
+  it('counts an example that calls its own module as a second root', async () => {
+    const index = new WorkspaceIndex();
+    await index.updateFile('/lib/main.tf', 'locals {}\n');
+    await index.updateFile(
+      '/lib/examples/basic/main.tf',
+      'module "lib" {\n  source = "../.."\n}\n',
+    );
+    const used = emptyUsage();
+    expect(resolveRef(['path', 'cwd'], { index, moduleDir: '/lib', cwd: '/run', used })).toBe(
+      '/run',
+    );
+    expect([...used.assumes].join()).toContain('terraformCwd');
+  });
+
+  /** A hover can evaluate path.cwd once per row, and counting the roots walks the
+   *  whole index. */
+  it('counts the roots once for as long as the index does not change', async () => {
+    const index = new WorkspaceIndex();
+    await index.updateFile('/ws/a/main.tf', 'locals {}\n');
+    await index.updateFile('/ws/b/main.tf', 'locals {}\n');
+    const files = vi.spyOn(index, 'files');
+    const scope: EvalScope = { index, moduleDir: '/ws/a', cwd: '/run', used: emptyUsage() };
+    resolveRef(['path', 'cwd'], scope);
+    resolveRef(['path', 'cwd'], scope);
+    expect(files).toHaveBeenCalledTimes(1);
+    await index.updateFile('/ws/c/main.tf', 'locals {}\n');
+    resolveRef(['path', 'cwd'], scope);
+    expect(files).toHaveBeenCalledTimes(2);
+  });
+
+  describe('configured directories against the index', () => {
+    const matches = async (indexed: string, rootDir: string): Promise<boolean> => {
+      const index = new WorkspaceIndex();
+      await index.updateFile(`${indexed}/main.tf`.replace(/^\/\//, '/'), 'locals {}\n');
+      const used = emptyUsage();
+      const scope: EvalScope = {
+        index,
+        moduleDir: index.moduleDirOf(`${indexed}/main.tf`.replace(/^\/\//, '/')),
+        rootDir,
+        cwd: '/run',
+        used,
+      };
+      const value = resolveRef(['path', 'cwd'], scope);
+      return value === '/run' && used.assumes.size === 0;
+    };
+
+    it('matches a root at the root of the file system, which the index spells empty', async () => {
+      expect(await matches('', '/')).toBe(true);
+      expect(await matches('c:', 'C:/')).toBe(true);
+    });
+
+    it('keeps two directories that differ only in case apart', async () => {
+      expect(await matches('/ws/envs/prod', '/WS/envs/prod')).toBe(false);
+      expect(await matches('/ws/envs/prod', '/ws/envs/prod')).toBe(true);
+    });
+
+    it('stops the climb at an explicit root that another module calls', async () => {
+      const index = new WorkspaceIndex();
+      await index.updateFile(
+        'c:/ws/envs/prod/main.tf',
+        'module "m" {\n  source = "../../modules/m"\n}\n',
+      );
+      await index.updateFile('c:/ws/modules/m/main.tf', 'locals {}\n');
+      const scope: EvalScope = {
+        index,
+        moduleDir: 'c:/ws/modules/m',
+        rootDir: 'C:/ws/modules/m',
+      };
+      expect(resolveRef(['path', 'module'], scope)).toBe('.');
     });
   });
 });
