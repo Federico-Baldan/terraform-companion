@@ -722,10 +722,15 @@ describe('Terraform context hover', () => {
     );
     // module and root are relative to the root module, cwd is the absolute run directory
     expect(md).toContain('.|.|/terraform-run');
-    const noRoot = await hover('resource "x" "item" { name = path.root }\n', 0, 35);
-    expect(noRoot).toContain('⟨unknown⟩');
-    const unknown = await hover('resource "x" "item" { name = path.cwd }\n', 0, 35);
-    expect(unknown).toContain('⟨unknown⟩');
+    // no terraformRoot: a module nothing calls is the root, so it needs no setting
+    const found = await hover('resource "x" "item" { name = path.root }\n', 0, 35);
+    expect(found).toContain('**path.root** = `.`');
+    // the run directory is not in any file: without terraformCwd it is the root
+    // module directory, and the hover says that is an assumption
+    const assumed = await hover('resource "x" "item" { name = path.cwd }\n', 0, 35);
+    expect(assumed).toContain('**path.cwd** = `/context`');
+    expect(assumed).toContain('assumes terraform runs in the root module directory');
+    expect(md).not.toContain('assumes');
   });
 
   it('does not inherit context into nested blocks', async () => {

@@ -1,6 +1,7 @@
 import { beforeAll, describe, expect, it } from 'vitest';
 import {
   type EvalScope,
+  emptyUsage,
   resolveContext,
   resolveExpr,
   resolveRef,
@@ -109,15 +110,115 @@ describe('F7 evaluator', () => {
     );
   });
 
-  it('leaves path.module and path.root unknown when the root module is not known', () => {
-    const noRoot: EvalScope = { index: scope.index, moduleDir: '/work/infra' };
-    expect(resolveRef(['path', 'module'], noRoot)).toBe(UNKNOWN);
-    expect(resolveRef(['path', 'root'], noRoot)).toBe(UNKNOWN);
+  /** With no `terraformRoot` set the root is found the way `var` resolution
+   *  already finds it: a directory nothing calls is a root, and a called module
+   *  climbs through its callers. */
+  describe('path.* with no configured root', () => {
+    async function workspace(files: Record<string, string>): Promise<WorkspaceIndex> {
+      const index = new WorkspaceIndex();
+      for (const [file, text] of Object.entries(files)) await index.updateFile(file, text);
+      return index;
+    }
+    const call = (name: string, source: string) =>
+      `module "${name}" {\n  source = "${source}"\n}\n`;
+
+    it('treats a module nothing calls as the root', async () => {
+      const index = await workspace({ '/ws/main.tf': 'locals {}\n' });
+      expect(resolveRef(['path', 'root'], { index, moduleDir: '/ws' })).toBe('.');
+      expect(resolveRef(['path', 'module'], { index, moduleDir: '/ws' })).toBe('.');
+    });
+
+    it('climbs the module calls to the root, through a chain', async () => {
+      const index = await workspace({
+        '/ws/main.tf': call('mid', './mid'),
+        '/ws/mid/main.tf': call('leaf', './leaf'),
+        '/ws/mid/leaf/main.tf': 'locals {}\n',
+      });
+      expect(resolveRef(['path', 'module'], { index, moduleDir: '/ws/mid' })).toBe('mid');
+      expect(resolveRef(['path', 'module'], { index, moduleDir: '/ws/mid/leaf' })).toBe('mid/leaf');
+      expect(resolveRef(['path', 'root'], { index, moduleDir: '/ws/mid/leaf' })).toBe('.');
+    });
+
+    it('stays unknown when the module is reached from more than one root', async () => {
+      const index = await workspace({
+        '/ws/a/main.tf': call('shared', '../shared'),
+        '/ws/b/main.tf': call('shared', '../shared'),
+        '/ws/shared/main.tf': 'locals {}\n',
+      });
+      const s: EvalScope = { index, moduleDir: '/ws/shared' };
+      expect(resolveRef(['path', 'module'], s)).toBe(UNKNOWN);
+      expect(resolveRef(['path', 'root'], s)).toBe(UNKNOWN);
+    });
+
+    it('follows the call site the hover is pinned to, so one root of two can be named', async () => {
+      const index = await workspace({
+        '/ws/a/main.tf': call('shared', '../shared'),
+        '/ws/b/main.tf': call('shared', '../shared'),
+        '/ws/shared/main.tf': 'locals {}\n',
+      });
+      const [site] = index.externalCallSitesOf('/ws/shared').filter((s) => s.callerDir === '/ws/b');
+      if (!site) throw new Error('fixture did not index the call from /ws/b');
+      const s: EvalScope = {
+        index,
+        moduleDir: '/ws/shared',
+        pinnedSites: new Map([['/ws/shared', site]]),
+      };
+      expect(resolveRef(['path', 'module'], s)).toBe('../shared');
+    });
+
+    it('gives up on modules that only call each other', async () => {
+      const index = await workspace({
+        '/ws/a/main.tf': call('b', '../b'),
+        '/ws/b/main.tf': call('a', '../a'),
+      });
+      expect(resolveRef(['path', 'root'], { index, moduleDir: '/ws/a' })).toBe(UNKNOWN);
+    });
+
+    /** The run directory is not in any file: `cd infra && terraform plan` and
+     *  `terraform -chdir=infra plan` from the repo root give different answers
+     *  (HashiCorp: path.cwd is the original directory, before -chdir). The usual
+     *  workflow is the first, so that is the value, and the usage says so. */
+    it('takes path.cwd from the setting, else assumes the root module directory and says so', async () => {
+      const index = await workspace({
+        '/ws/main.tf': call('mid', './mid'),
+        '/ws/mid/main.tf': 'locals {}\n',
+      });
+      const assumed = emptyUsage();
+      expect(resolveRef(['path', 'cwd'], { index, moduleDir: '/ws/mid', used: assumed })).toBe(
+        '/ws',
+      );
+      expect([...assumed.assumes]).toEqual(['terraform runs in the root module directory']);
+
+      const configured = emptyUsage();
+      expect(
+        resolveRef(['path', 'cwd'], { index, moduleDir: '/ws/mid', cwd: '/run', used: configured }),
+      ).toBe('/run');
+      expect(configured.assumes.size).toBe(0);
+    });
+
+    it('has no path.cwd to assume when the root is ambiguous', async () => {
+      const index = await workspace({
+        '/ws/a/main.tf': call('shared', '../shared'),
+        '/ws/b/main.tf': call('shared', '../shared'),
+        '/ws/shared/main.tf': 'locals {}\n',
+      });
+      expect(resolveRef(['path', 'cwd'], { index, moduleDir: '/ws/shared' })).toBe(UNKNOWN);
+    });
+
+    it('lets an explicit root win over the one it would find', async () => {
+      const index = await workspace({
+        '/ws/main.tf': call('mid', './mid'),
+        '/ws/mid/main.tf': 'locals {}\n',
+      });
+      expect(resolveRef(['path', 'module'], { index, moduleDir: '/ws/mid' })).toBe('mid');
+      expect(
+        resolveRef(['path', 'module'], { index, moduleDir: '/ws/mid', rootDir: '/ws/mid' }),
+      ).toBe('.');
+    });
   });
 
-  it('keeps path.cwd absolute and only when it is configured', () => {
+  it('keeps a configured path.cwd as given, absolute', () => {
     expect(resolveRef(['path', 'cwd'], { ...scope, cwd: '/terraform-run' })).toBe('/terraform-run');
-    expect(resolveRef(['path', 'cwd'], scope)).toBe(UNKNOWN);
   });
 
   it('format supports %q (quoted) and %% (literal percent)', () => {

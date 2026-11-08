@@ -28,6 +28,10 @@ export interface EvalUsage {
    *  Carries the shape because each row is rendered on its own terms — one
    *  instance can pass a name and another a list. */
   conflicts: Map<string, ResolvedValue>;
+  /** What a value rests on that no file in the workspace can show, so the hover
+   *  can say so instead of presenting a guess as a fact. Today that is one case:
+   *  where Terraform was run from, for `path.cwd`. */
+  assumes: Set<string>;
   /** Where call sites disagreed — `"app-${var.env}"` needs per-instance eval,
    *  so this marks where to branch. */
   divergedAt?: { moduleDir: string; sites: ModuleCallSite[]; labels: string[] };
@@ -40,6 +44,7 @@ export function emptyUsage(): EvalUsage {
     defaults: new Map(),
     calls: new Set(),
     conflicts: new Map(),
+    assumes: new Set(),
   };
 }
 
@@ -854,15 +859,26 @@ function resolveRefValue(parts: string[], scope: EvalScope, depth: number): Valu
   }
   if (head === 'path' && (name === 'module' || name === 'root' || name === 'cwd')) {
     if (parts.length !== 2) return undefined;
-    if (name === 'cwd') return scope.cwd;
-    // Terraform hands back a module's SourceDir as it was loaded, relative to the
-    // root module's directory, and makes only path.cwd absolute (GetPathAttr in
-    // hashicorp/terraform internal/terraform/evaluate.go). Showing the absolute
-    // directory would give a value Terraform never produces, so these need the
-    // root to be known — and stay unknown without it rather than guess.
-    if (scope.rootDir === undefined) return undefined;
+    const root = rootDirOf(scope);
+    if (name === 'cwd') {
+      if (scope.cwd !== undefined) return scope.cwd;
+      // The run directory is in no file: `cd infra && terraform plan` and
+      // `terraform -chdir=infra plan` from the repo root differ, and path.cwd is
+      // the original directory, before -chdir. The usual workflow is the first,
+      // where it is the root module directory — so that is the value, recorded
+      // as an assumption for the hover to state. No single root, no guess.
+      if (root === undefined) return undefined;
+      scope.used?.assumes.add('terraform runs in the root module directory');
+      return root;
+    }
+    // Terraform hands back a module's SourceDir as it was loaded (the parent's
+    // directory joined with the source, cleaned), relative to the root module's
+    // directory, and makes only path.cwd absolute (GetPathAttr in
+    // hashicorp/terraform internal/terraform/evaluate.go). An absolute path
+    // would be a value Terraform never produces.
+    if (root === undefined) return undefined;
     if (name === 'root') return '.';
-    return relative(scope.rootDir, scope.moduleDir).split('\\').join('/') || '.';
+    return relative(root, scope.moduleDir).split('\\').join('/') || '.';
   }
   if (head !== 'var' && head !== 'local') return undefined;
   const path = parts.slice(2);
@@ -903,6 +919,32 @@ function resolveRefValue(parts: string[], scope: EvalScope, depth: number): Valu
     if (value !== undefined || state.spends === spendsBefore) state.cache.set(key, value);
   }
   return walkPath(value, path);
+}
+
+/** The root module this module is reached from, or nothing when that is not a
+ *  single directory. An explicit `rootDir` (the setting) wins. Otherwise the
+ *  root is found the way `resolveVar` already finds it — a directory no
+ *  `module` block calls is a root, which is also what makes its variables come
+ *  from tfvars — by climbing the callers, honouring the call site the hover is
+ *  pinned to. Reached from two roots, `path.module` differs between them, so
+ *  nothing is claimed; a loop of modules that only call each other has no root. */
+function rootDirOf(scope: EvalScope): string | undefined {
+  if (scope.rootDir !== undefined) return scope.rootDir;
+  const roots = new Set<string>();
+  const seen = new Set<string>();
+  const climb = (dir: string): boolean => {
+    if (seen.has(dir)) return true; // a loop contributes no root of its own
+    if (seen.size >= MAX_REF_HOPS) return false;
+    seen.add(dir);
+    const pinned = scope.pinnedSites?.get(dir);
+    const sites = pinned ? [pinned] : scope.index.externalCallSitesOf(dir);
+    if (sites.length === 0) {
+      roots.add(dir);
+      return true;
+    }
+    return sites.every((site) => climb(site.callerDir));
+  };
+  return climb(scope.moduleDir) && roots.size === 1 ? [...roots][0] : undefined;
 }
 
 /** Module name + shortest path suffix that disambiguates sites — basenames

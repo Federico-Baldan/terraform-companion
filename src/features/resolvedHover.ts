@@ -546,6 +546,12 @@ export function hoverMarkdown({
     if (escaped.some((call) => call === undefined)) return undefined;
     origins.push(`via ${escaped.join(' → ')}`);
   }
+  // a value that rests on something no file shows says so, rather than read as fact
+  if (used.assumes.size > 0) {
+    const escaped = [...used.assumes].map((what) => escapeMd(what, isCancelled));
+    if (escaped.some((what) => what === undefined)) return undefined;
+    origins.push(`assumes ${escaped.join(', ')}`);
+  }
 
   // one metadata line under the value rather than a stack of italics: length
   // first, because a resolved name is usually on its way into a field with a
