@@ -26,7 +26,16 @@ export interface ProviderCacheEntry {
   lastActivityMs: number;
 }
 
-const LOCK_PROVIDER = /^\s*provider\s+"([^"]+)"\s*\{/gm;
+/** A `provider "source" {` block that starts its line.
+ *
+ *  The indent is blanks within the line, not `\s*`: that also crosses newlines, so
+ *  on a run of blank lines it walked the whole run from every line start, found no
+ *  `provider` at the end of it, and began again one line later — quadratic, and a
+ *  lock file of 40k blank lines followed by anything else cost 2s (4s with a space
+ *  on each line). Every line start is still a candidate, so the same blocks match;
+ *  only the walk across other lines is gone. The class is `\s` minus the four
+ *  characters `^` treats as a line break. */
+const LOCK_PROVIDER = /^[^\S\n\r\u2028\u2029]*provider\s+"([^"]+)"\s*\{/gm;
 /** `key = "value"`, the key bare or quoted as HCL allows. Sticky, so it matches
  *  at exactly the position it is given. */
 const STRING_ASSIGNMENT = /"?([A-Za-z_][\w-]*)"?[ \t]*=[ \t]*"([^"\r\n]*)"/y;

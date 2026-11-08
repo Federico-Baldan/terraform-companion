@@ -87,7 +87,26 @@ const COLLECTION_ARG_FUNCS = new Set([
 /** Callee name when the element sits directly in that function's first
  *  argument slot — there is no accessor to find in that position, so the
  *  accessor scan below cannot see the shape at all. */
-const COLLECTION_CALL = /([\w-]+)\s*\($/;
+const WHITESPACE = /\s/;
+const NAME_CHAR = /[\w-]/;
+
+/** The callee name when `text` (already trimmed at the end) ends in `name(`:
+ *  the longest run of name characters before the paren and any blanks around it.
+ *
+ *  Read backwards from the end rather than matched with `/([\w-]+)\s*\($/`. That
+ *  pattern is not anchored at its start, so on a long word with no paren after
+ *  it the engine tried every starting point and walked the rest of the word from
+ *  each: quadratic, and the word is whatever the file holds — a 100k-character
+ *  line took 12s, on every cursor move. The text is only inspected from its end,
+ *  and each character once. */
+export function calleeBefore(text: string): string | undefined {
+  if (!text.endsWith('(')) return undefined;
+  let end = text.length - 1;
+  while (end > 0 && WHITESPACE.test(text.charAt(end - 1))) end--;
+  let start = end;
+  while (start > 0 && NAME_CHAR.test(text.charAt(start - 1))) start--;
+  return start < end ? text.slice(start, end) : undefined;
+}
 
 function usedAsCollectionArgument(file: ParsedFile, uses: Span[]): boolean {
   return uses.some((use) => {
@@ -95,7 +114,7 @@ function usedAsCollectionArgument(file: ParsedFile, uses: Span[]): boolean {
     for (let row = use.start.row; before.trim() === '' && row > 0; ) {
       before = stripComments(file.lines[--row] ?? '');
     }
-    const callee = COLLECTION_CALL.exec(before.trimEnd())?.[1];
+    const callee = calleeBefore(before.trimEnd());
     return callee !== undefined && COLLECTION_ARG_FUNCS.has(callee);
   });
 }
