@@ -224,6 +224,25 @@ function chargeElements(scope: EvalScope, n: number): boolean {
  *  `provideHover` and took the hover down entirely. Far past any real chain. */
 const MAX_REF_HOPS = 256;
 
+/** Reference evaluations one resolve may start, however they are shaped.
+ *
+ *  The memos answer the repeats they can recognise, and a resolve evaluates each
+ *  distinct reference once. What they cannot recognise is a give-up that came
+ *  from where the walk stood (the hop limit, the live frames) reached down two
+ *  different paths: each path is its own frame, so nothing remembered for one is
+ *  used for the other, and every level of such a ladder doubled the work — 60k
+ *  reads at eight levels, and fourteen did not finish. A few hundred lines of
+ *  HCL, written to be opened or just generated, held the extension host for as
+ *  long as they liked.
+ *
+ *  Past this the resolve gives up like it does for the element budget: the rest
+ *  is ⟨unknown⟩, counted as a spend so nothing certifies a rewrite on it. It only
+ *  ever goes one way, so it is remembered like the element budget is. Sized by
+ *  the work it bounds rather than by anything a real file does: a module reading
+ *  five thousand distinct locals in one expression costs five thousand, and one
+ *  read is ~25µs, so this is about half a second at the very worst. */
+const MAX_REF_EVALUATIONS = 20_000;
+
 export interface EvalScope {
   index: WorkspaceIndex;
   moduleDir: string;
@@ -986,6 +1005,13 @@ function resolveRefValue(parts: string[], scope: EvalScope, depth: number): Valu
       state.spends++;
       // the same reference reached from nearer the top is not over the limit
       state.contextual++;
+      return undefined;
+    }
+    // `frames` counts the evaluations begun, and is what the cap is spent in. Not
+    // contextual: it never comes back, so the same reference asked again would
+    // be refused again
+    if (state.frames >= MAX_REF_EVALUATIONS) {
+      state.spends++;
       return undefined;
     }
     state.inProgress.add(key);

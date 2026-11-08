@@ -493,6 +493,60 @@ describe('a reference that ran out of budget is evaluated once', () => {
     }
   });
 
+  /** The one shape the memos above cannot recognise: every level reaches the next
+   *  through two different locals (`x = local.d`, `y = local.d`, `d' = concat(x, y)`),
+   *  under a chain longer than the hop limit. The give-up is about where the walk
+   *  stands, so it is remembered only for the very frame that met it, and the two
+   *  locals are two frames: the work doubled at every level, and a few hundred
+   *  lines of HCL — generated, or written to be opened — held the extension host
+   *  for as long as it cared to. A resolve now has a number of reference
+   *  evaluations it may start, whatever shape they come in. */
+  it('stops a resolve that keeps evaluating after its budget of references is spent', async () => {
+    const index = new WorkspaceIndex();
+    const chain = 260;
+    const levels = 8;
+    const lines = ['locals {', '  c0 = ["leaf"]'];
+    for (let i = 1; i <= chain; i++) lines.push(`  c${i} = local.c${i - 1}`);
+    lines.push(`  d0 = local.c${chain}`);
+    for (let j = 1; j <= levels; j++) {
+      lines.push(`  x${j} = local.d${j - 1}`, `  y${j} = local.d${j - 1}`);
+      lines.push(`  d${j} = concat(local.x${j}, local.y${j})`);
+    }
+    lines.push('}', '');
+    await index.updateFile('/diamond/locals.tf', lines.join('\n'));
+    const at: EvalScope = { index, moduleDir: '/diamond' };
+
+    const reads = vi.spyOn(parser, 'withExpressionNode');
+    try {
+      const text = resolveRef(['local', `d${levels}`], at);
+      // unbounded, every one of the 2^levels paths walks the chain again, and each
+      // added level doubles that (14 levels did not finish); the cap is 20,000
+      // evaluations, so what is left is that plus the unwinding
+      expect(reads.mock.calls.length).toBeLessThan(25_000);
+      expect(text).toContain(UNKNOWN);
+    } finally {
+      reads.mockRestore();
+    }
+    // spent is not the same as absent: nothing certifies a rewrite on it
+    expect(listShape(`local.d${levels}`, at)).not.toMatchObject({ kind: 'strings' });
+  });
+
+  /** The number it may start is a ceiling on pathological work, not a limit anyone
+   *  meets: with the memo, a resolve evaluates each distinct reference once, and
+   *  this reads five thousand of them. */
+  it('leaves a resolve that needs thousands of distinct references alone', async () => {
+    const index = new WorkspaceIndex();
+    const count = 5000;
+    const lines = ['locals {'];
+    for (let i = 0; i < count; i++) lines.push(`  v${i} = "x${i}"`);
+    lines.push(`  all = [${Array.from({ length: count }, (_, i) => `local.v${i}`).join(', ')}]`);
+    lines.push('}', '');
+    await index.updateFile('/wide/locals.tf', lines.join('\n'));
+    const shape = listShape('local.all', { index, moduleDir: '/wide' });
+    expect(shape.kind).toBe('strings');
+    if (shape.kind === 'strings') expect(shape.values).toHaveLength(count);
+  });
+
   /** `MAX_DEPTH` counts module call hops, so it is another limit a reference can run
    *  into from where the walk stands and not from what it is. Thirteen modules
    *  each passing the next a value, with ladders in some that run the budget out,
