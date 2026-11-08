@@ -99,9 +99,9 @@
         },
         "tfCompanion.cacheCleaner.providerCache": {
           "type": "boolean",
-          "default": false,
+          "default": true,
           "scope": "machine",
-          "description": "Also offer to delete provider versions from Terraform's shared plugin cache (plugin_cache_dir or TF_PLUGIN_CACHE_DIR) that were installed over staleDays days ago and that no lock file in the workspace names. Off by default because every Terraform project on the machine uses that cache; it always asks, even with autoDelete on. A machine setting: a workspace's .vscode/settings.json cannot turn it on"
+          "description": "Also offer to delete provider versions from Terraform's shared plugin cache (plugin_cache_dir or TF_PLUGIN_CACHE_DIR) that were installed over staleDays days ago and that no lock file in the workspace names. Every Terraform project on the machine uses that cache, so it always asks and lets you pick what to remove, even with autoDelete on. A machine setting: a workspace's .vscode/settings.json cannot change it"
         },
         "tfCompanion.resolvedHover.enabled": {
           "type": "boolean",

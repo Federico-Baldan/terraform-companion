@@ -156,9 +156,21 @@ describe('shared provider cache', () => {
     return logged;
   }
 
-  it('leaves the shared cache alone unless it is switched on', async () => {
+  it('is on by default, and asks before it removes anything', async () => {
     const { version } = provider(UNUSED);
     process.env.TF_PLUGIN_CACHE_DIR = cacheHome;
+    mock.warningAnswers = ['Ignore'];
+    await run();
+
+    expect(mock.warnings).toHaveLength(1);
+    expect(prompt()).toContain(cacheHome);
+    expect(existsSync(version)).toBe(true);
+  });
+
+  it('leaves the shared cache alone when it is switched off', async () => {
+    const { version } = provider(UNUSED);
+    process.env.TF_PLUGIN_CACHE_DIR = cacheHome;
+    mock.settings.set('cacheCleaner.providerCache', false);
     await run();
     expect(mock.warnings).toEqual([]);
     expect(existsSync(version)).toBe(true);
