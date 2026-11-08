@@ -1,6 +1,11 @@
 import { basename, dirname, isAbsolute, relative } from 'node:path';
 import * as vscode from 'vscode';
-import { cacheCleanerAutoDelete, cacheCleanerStaleDays, featureEnabled } from '../config';
+import {
+  cacheCleanerAutoDelete,
+  cacheCleanerProviderCache,
+  cacheCleanerStaleDays,
+  featureEnabled,
+} from '../config';
 import {
   collectProviderSources,
   configuredProviderCache,
@@ -10,6 +15,7 @@ import {
   findStaleProviderCacheEntries,
   findStaleTerraformDirs,
   formatSize,
+  isProviderEntryStillStale,
   isStillStale,
   isTerraformCacheDir,
   type ProviderCacheEntry,
@@ -175,9 +181,17 @@ export async function scan(
       log(`cacheCleaner: could not record the snooze: ${e}`),
     );
 
+  const providerCacheOn = cacheCleanerProviderCache();
+  const folders = vscode.workspace.workspaceFolders ?? [];
   const stale: FoundCache[] = [];
   const protectedSources = new Set<string>();
-  for (const folder of vscode.workspace.workspaceFolders ?? []) {
+  // The workspace's lock files are the only thing that protects a provider from
+  // the shared-cache sweep, so any doubt about them — no folder open, one that
+  // would not scan, a lock file that would not read — switches the sweep off for
+  // this run. An incomplete set does not mean "protects less", it means "offers
+  // for deletion exactly what the unread lock file named".
+  let lockFilesRead = folders.length > 0;
+  for (const folder of folders) {
     // a multi-root workspace must not start the next folder's walk either
     if (cancelled()) return;
     const root = folder.uri.fsPath;
@@ -190,10 +204,18 @@ export async function scan(
         cancelled,
       );
       for (const c of found) stale.push({ ...c, root });
-      for (const source of await collectProviderSources(root, cancelled))
-        protectedSources.add(source);
     } catch (e) {
       log(`cacheCleaner: scan failed in ${root}: ${e}`);
+    }
+    if (!providerCacheOn) continue;
+    // its own try: a failed .terraform walk must not skip the lock files
+    try {
+      const locks = await collectProviderSources(root, cancelled);
+      for (const source of locks.sources) protectedSources.add(source);
+      if (!locks.complete) lockFilesRead = false;
+    } catch (e) {
+      lockFilesRead = false;
+      log(`cacheCleaner: lock file scan failed in ${root}: ${e}`);
     }
   }
   // workspace folders may nest — VS Code allows both /repo and /repo/infra —
@@ -202,16 +224,25 @@ export async function scan(
   // already-deleted path succeeds silently and inflates the result too.
   const unique = [...new Map(stale.map((c) => [c.dir, c])).values()];
   if (cancelled()) return;
-  const providerCache = await configuredProviderCache();
-  const staleProviders = providerCache
-    ? await findStaleProviderCacheEntries(
+  const providerCache = providerCacheOn ? await configuredProviderCache() : undefined;
+  let staleProviders: ProviderCacheEntry[] = [];
+  if (providerCache) {
+    if (lockFilesRead) {
+      staleProviders = await findStaleProviderCacheEntries(
         providerCache,
         protectedSources,
         staleDays,
         Date.now(),
         cancelled,
-      )
-    : [];
+      );
+    } else {
+      log(
+        folders.length === 0
+          ? 'cacheCleaner: provider cache left alone — no workspace folder is open, so no lock file can say what is in use'
+          : 'cacheCleaner: provider cache left alone — not every lock file in the workspace could be read',
+      );
+    }
+  }
   if (unique.length === 0 && staleProviders.length === 0) {
     await snooze(QUIET_SCAN_MS);
     return;
@@ -333,36 +364,70 @@ export async function scan(
       `cacheCleaner: stale provider ${entry.source} ${basename(entry.dir)} (${formatSize(entry.sizeBytes)}, last activity ${activityDate(entry.lastActivityMs)})`,
     );
   }
+  // Always asked, `autoDelete` or not. That switch covers a workspace's own
+  // `.terraform`, which `terraform init` rebuilds; this cache is shared by every
+  // Terraform project on the machine, and a provider deleted from it leaves the
+  // symlink in each project that used it dangling.
+  const count = staleProviders.length;
+  const them = count === 1 ? 'it' : 'them';
+  const deleteLabel = count === 1 ? 'Delete' : `Delete all ${count}`;
+  const choice = await vscode.window.showWarningMessage(
+    // "installed", not "unused": Terraform never writes to a cache entry again
+    // after installing it, so the install date is the only date there is
+    `Terraform Companion: ${count} provider version${count === 1 ? '' : 's'} in the shared plugin cache ${providerCache} ${count === 1 ? 'was' : 'were'} installed over ${days} days ago and no lock file in this workspace names ${them} — about ${formatSize(providerTotal)}. Other projects on this machine may still use ${them}, and would need terraform init again. Delete?`,
+    REVIEW,
+    deleteLabel,
+    'Ignore',
+  );
   let providerTargets = staleProviders;
-  if (!cacheCleanerAutoDelete()) {
-    const choice = await vscode.window.showWarningMessage(
-      `Terraform Companion: unused provider cache in ${staleProviders.length} entr${staleProviders.length === 1 ? 'y' : 'ies'} — no activity for over ${days} days, about ${formatSize(providerTotal)}. Delete? Provider sources referenced by workspace lock files are protected.`,
-      REVIEW,
-      staleProviders.length === 1 ? 'Delete' : `Delete all ${staleProviders.length}`,
-      'Ignore',
-    );
-    if (choice === REVIEW) {
-      const picked = await reviewProviders(staleProviders, days);
-      if (!picked || picked.length === 0) return;
-      providerTargets = picked;
-    } else if (choice === 'Ignore' || !choice) {
+  if (choice === REVIEW) {
+    const picked = await reviewProviders(staleProviders, days);
+    // escaped, or unchecked everything: both mean "not now"
+    if (!picked || picked.length === 0) {
+      await snooze(IGNORE_SNOOZE_MS);
       return;
     }
+    providerTargets = picked;
+  } else if (choice !== deleteLabel) {
+    // same reasoning as for .terraform: an ignored prompt that returns on the
+    // next window open is a prompt people learn to click through
+    await snooze(IGNORE_SNOOZE_MS);
+    return;
   }
+  const providerKept = staleProviders.length - providerTargets.length;
+
   let providerFreed = 0;
+  let providerCleaned = 0;
+  let providerFailed = 0;
   for (const entry of providerTargets) {
+    if (cancelled()) return;
+    // the prompt may have sat open while another project ran terraform init
+    if (!(await isProviderEntryStillStale(entry.dir, staleDays))) {
+      log(`cacheCleaner: skipped provider ${entry.dir} (used since the scan)`);
+      continue;
+    }
     const result = await deleteProviderCacheEntry(entry, providerCache);
     if (!result.ok) {
+      providerFailed++;
       log(`cacheCleaner: left provider ${entry.dir} alone: ${result.reason}`);
       continue;
     }
+    providerCleaned++;
     providerFreed += entry.sizeBytes;
     log(`cacheCleaner: cleaned provider ${entry.dir}`);
   }
-  if (providerFreed > 0 && !cacheCleanerAutoDelete()) {
+  if (providerKept > 0) await snooze(IGNORE_SNOOZE_MS);
+  if (providerFailed > 0) {
+    vscode.window
+      .showWarningMessage(
+        `Terraform Companion: ${providerFailed} provider version${providerFailed === 1 ? '' : 's'} could not be removed from the shared plugin cache. See the Terraform Companion output channel for details.`,
+      )
+      .then(undefined, (e) => log(`cacheCleaner: notification failed: ${e}`));
+  }
+  if (providerCleaned > 0) {
     vscode.window
       .showInformationMessage(
-        `Terraform Companion: cleaned unused provider cache, freed ${formatSize(providerFreed)}.`,
+        `Terraform Companion: removed ${providerCleaned} provider version${providerCleaned === 1 ? '' : 's'} from the shared plugin cache, freed ${formatSize(providerFreed)}. A project that used ${providerCleaned === 1 ? 'it' : 'them'} needs terraform init next time.`,
       )
       .then(undefined, (e) => log(`cacheCleaner: notification failed: ${e}`));
   }

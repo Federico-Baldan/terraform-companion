@@ -95,7 +95,12 @@
         "tfCompanion.cacheCleaner.autoDelete": {
           "type": "boolean",
           "default": false,
-          "description": "Delete the stale .terraform caches automatically, without asking for confirmation. The folders and the subdirectories removed are still listed in the Terraform Companion output channel (default: ask first, naming the folders)"
+          "description": "Delete the stale .terraform caches automatically, without asking for confirmation. The folders and the subdirectories removed are still listed in the Terraform Companion output channel (default: ask first, naming the folders). Never applies to the shared provider cache"
+        },
+        "tfCompanion.cacheCleaner.providerCache": {
+          "type": "boolean",
+          "default": false,
+          "description": "Also offer to delete provider versions from Terraform's shared plugin cache (plugin_cache_dir or TF_PLUGIN_CACHE_DIR) that were installed over staleDays days ago and that no lock file in the workspace names. Off by default because every Terraform project on the machine uses that cache; it always asks, even with autoDelete on"
         },
         "tfCompanion.resolvedHover.enabled": {
           "type": "boolean",

@@ -14,11 +14,14 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
+  collectProviderSources,
+  configuredProviderCache,
   deleteCachePayload,
   deleteProviderCacheEntry,
   findStaleProviderCacheEntries,
   findStaleTerraformDirs,
   formatSize,
+  isProviderEntryStillStale,
   isStillStale,
   isTerraformCacheDir,
   providerSourcesFromLockFile,
@@ -35,12 +38,27 @@ function touch(path: string, ageDays: number): void {
 let root: string;
 let outside: string;
 
+/** The environment Terraform itself reads for the plugin cache. Saved and
+ *  restored around every test, since a leaked value would point the next test
+ *  at somebody's real cache. */
+const ENV_KEYS = ['TF_CLI_CONFIG_FILE', 'TF_PLUGIN_CACHE_DIR', 'TFC_TEST_CACHE_BASE'] as const;
+const savedEnv = new Map<string, string | undefined>();
+
 beforeEach(() => {
   root = mkdtempSync(join(tmpdir(), 'tfc-cache-'));
   outside = mkdtempSync(join(tmpdir(), 'tfc-outside-'));
+  for (const key of ENV_KEYS) {
+    savedEnv.set(key, process.env[key]);
+    delete process.env[key];
+  }
 });
 
 afterEach(() => {
+  for (const key of ENV_KEYS) {
+    const value = savedEnv.get(key);
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
   rmSync(root, { recursive: true, force: true });
   rmSync(outside, { recursive: true, force: true });
 });
@@ -82,6 +100,9 @@ provider "registry.terraform.io/hashicorp/random" {
     mkdirSync(protectedVersion, { recursive: true });
     writeFileSync(join(stale, 'provider'), 'x'.repeat(2048));
     writeFileSync(join(protectedVersion, 'provider'), 'x');
+    // the files are part of the entry's activity now, so they age with it
+    touch(join(stale, 'provider'), 60);
+    touch(join(protectedVersion, 'provider'), 60);
     touch(stale, 60);
     touch(protectedVersion, 60);
 
@@ -95,6 +116,132 @@ provider "registry.terraform.io/hashicorp/random" {
     expect((await deleteProviderCacheEntry(found[0]!, cache)).ok).toBe(true);
     expect(existsSync(stale)).toBe(false);
     expect(existsSync(protectedVersion)).toBe(true);
+  });
+
+  /** Terraform links a cached provider into a project and never touches the
+   *  cache entry again, so the version directory's own mtime is the install
+   *  date. Anything written below it is the only sign of life there is. */
+  describe('provider activity', () => {
+    function busyProvider(): { cache: string; version: string; binary: string } {
+      const cache = join(root, 'plugin-cache');
+      const version = join(cache, 'registry.terraform.io', 'example', 'busy', '1.0.0');
+      const platform = join(version, 'linux_amd64');
+      mkdirSync(platform, { recursive: true });
+      const binary = join(platform, 'terraform-provider-busy');
+      writeFileSync(binary, 'x'.repeat(2048));
+      touch(binary, 90);
+      touch(platform, 90);
+      touch(version, 90);
+      return { cache, version, binary };
+    }
+
+    it('does not offer a provider with a recently written file under an old version dir', async () => {
+      const { cache, binary } = busyProvider();
+      touch(binary, 2);
+      expect(await findStaleProviderCacheEntries(cache, new Set(), 30, NOW)).toEqual([]);
+    });
+
+    it('reports the newest activity under the version dir, not the install date', async () => {
+      const { cache, version, binary } = busyProvider();
+      touch(binary, 45);
+      const [found] = await findStaleProviderCacheEntries(cache, new Set(), 30, NOW);
+      expect(found?.dir).toBe(version);
+      expect(found?.lastActivityMs).toBe(NOW - 45 * DAY);
+    });
+
+    it('re-checks staleness against the files, so a prompt left open cannot delete a fresh install', async () => {
+      const { version, binary } = busyProvider();
+      expect(await isProviderEntryStillStale(version, 30, NOW)).toBe(true);
+      touch(binary, 1);
+      expect(await isProviderEntryStillStale(version, 30, NOW)).toBe(false);
+    });
+  });
+
+  describe('collectProviderSources', () => {
+    const LOCK = 'provider "registry.terraform.io/hashicorp/aws" {\n  version = "5.0.0"\n}\n';
+
+    it('reads every lock file in the tree and reports a complete scan', async () => {
+      mkdirSync(join(root, 'infra', 'prod'), { recursive: true });
+      writeFileSync(join(root, 'infra', 'prod', '.terraform.lock.hcl'), LOCK);
+      const { sources, complete } = await collectProviderSources(root);
+      expect([...sources]).toEqual(['registry.terraform.io/hashicorp/aws']);
+      expect(complete).toBe(true);
+    });
+
+    it('follows a symlinked lock file, which monorepos use to share one', async () => {
+      writeFileSync(join(outside, 'shared.lock.hcl'), LOCK);
+      mkdirSync(join(root, 'mod'));
+      symlinkSync(join(outside, 'shared.lock.hcl'), join(root, 'mod', '.terraform.lock.hcl'));
+      const { sources, complete } = await collectProviderSources(root);
+      expect([...sources]).toEqual(['registry.terraform.io/hashicorp/aws']);
+      expect(complete).toBe(true);
+    });
+
+    it('says the scan is incomplete when a lock file cannot be read', async () => {
+      mkdirSync(join(root, 'mod'));
+      // a dangling link is unreadable whoever runs the test, root included
+      symlinkSync(join(outside, 'missing.hcl'), join(root, 'mod', '.terraform.lock.hcl'));
+      const { complete } = await collectProviderSources(root);
+      expect(complete).toBe(false);
+    });
+
+    it('says the scan is incomplete when the depth limit hides part of the tree', async () => {
+      mkdirSync(join(root, ...Array.from({ length: 40 }, () => 'd')), { recursive: true });
+      const { complete } = await collectProviderSources(root);
+      expect(complete).toBe(false);
+    });
+  });
+
+  /** What Terraform itself does with the same two settings — see
+   *  internal/command/cliconfig/cliconfig.go: the environment variable wins and
+   *  is taken verbatim, the file value goes through os.ExpandEnv, and nothing
+   *  expands `~`. */
+  describe('configuredProviderCache', () => {
+    function cliConfig(body: string): void {
+      const file = join(root, 'terraform.rc');
+      writeFileSync(file, body);
+      process.env.TF_CLI_CONFIG_FILE = file;
+    }
+
+    it('prefers TF_PLUGIN_CACHE_DIR over the file, verbatim', async () => {
+      cliConfig(`plugin_cache_dir = "${join(root, 'from-file')}"\n`);
+      process.env.TF_PLUGIN_CACHE_DIR = join(root, 'from-env', '$NOT_EXPANDED');
+      expect(await configuredProviderCache()).toBe(join(root, 'from-env', '$NOT_EXPANDED'));
+    });
+
+    it('expands $VAR and ${VAR} in the file value', async () => {
+      process.env.TFC_TEST_CACHE_BASE = root;
+      cliConfig('plugin_cache_dir = "$TFC_TEST_CACHE_BASE/plugins"\n');
+      expect(await configuredProviderCache()).toBe(`${root}/plugins`);
+      cliConfig('plugin_cache_dir = "${TFC_TEST_CACHE_BASE}/plugins"\n');
+      expect(await configuredProviderCache()).toBe(`${root}/plugins`);
+    });
+
+    it('reads a value followed by a comment or written with CRLF line endings', async () => {
+      const dir = join(root, 'plugins');
+      cliConfig(`plugin_cache_dir = "${dir}" # shared\r\n`);
+      expect(await configuredProviderCache()).toBe(dir);
+      cliConfig(`plugin_cache_dir = "${dir}" // shared\n`);
+      expect(await configuredProviderCache()).toBe(dir);
+    });
+
+    it('ignores a commented-out setting', async () => {
+      cliConfig(`# plugin_cache_dir = "${join(root, 'plugins')}"\n`);
+      expect(await configuredProviderCache()).toBeUndefined();
+    });
+
+    it('refuses a path that is not absolute, since the extension host has no say in the cwd', async () => {
+      cliConfig('plugin_cache_dir = "relative/plugins"\n');
+      expect(await configuredProviderCache()).toBeUndefined();
+      // Terraform does not expand `~`, so the file value is a relative path to it too
+      cliConfig('plugin_cache_dir = "~/plugins"\n');
+      expect(await configuredProviderCache()).toBeUndefined();
+    });
+
+    it('is undefined when nothing configures a cache', async () => {
+      cliConfig('provider_installation {}\n');
+      expect(await configuredProviderCache()).toBeUndefined();
+    });
   });
 
   it('finds .terraform dirs with no recent activity', async () => {

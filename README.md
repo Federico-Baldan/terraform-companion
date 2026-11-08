@@ -103,14 +103,36 @@ It only offers the rewrite when the rewrite is safe. If `count.index` also drive
 
 On startup it looks for `.terraform` folders whose module hasn't been touched in 30 days, and asks before deleting. These are caches `terraform init` rebuilds.
 
-If Terraform has a configured `plugin_cache_dir`, the same scan also finds
-provider sources in that shared cache that are not mentioned by any
-`.terraform.lock.hcl` in the workspace and have not been touched for 30 days.
-It asks separately before removing those provider-version directories. A
-provider source mentioned by a lock file is protected in full: lock files do
-not contain a standalone selected-version field, so the cleaner never guesses
-which version is safe to remove. The CLI configuration and every lock file are
-read-only; neither is deleted.
+### Shared provider cache (opt-in)
+
+Terraform's shared plugin cache (`plugin_cache_dir` in the CLI config, or
+`TF_PLUGIN_CACHE_DIR`) is used by every Terraform project on the machine, not
+just this workspace, and Terraform never deletes from it. Cleaning it is off
+until you set `cacheCleaner.providerCache`, and then it always asks, even with
+`autoDelete` on.
+
+With it on, the scan offers provider versions that were **installed** over 30
+days ago and whose provider is named by no `.terraform.lock.hcl` in the
+workspace. The date is the install date, because Terraform links a cached
+provider into a project and never touches the entry again: a provider another
+project uses every day looks as old as one nobody uses. So the prompt says
+"installed", names the cache directory, and warns that another project may still
+use what it lists. Deleting an entry that is in use leaves a dangling link in
+that project until its next `terraform init`.
+
+What keeps this from deleting more than it should:
+
+- A provider named by a lock file is protected in full: lock files do not record
+  a selected version, so the cleaner never guesses which one is safe. Symlinked
+  lock files are followed.
+- If any lock file or folder could not be read, no folder is open, or the depth
+  limit hid part of the tree, the shared cache is left alone for that run.
+- Anything written under an entry within the stale window keeps it, and the
+  check is repeated right before each delete.
+- A relative `plugin_cache_dir` is ignored: Terraform resolves it against its own
+  working directory, which the extension cannot see. `$VAR` is expanded as
+  Terraform does; `~` is not.
+- The CLI configuration and every lock file are read-only.
 
 **It tells you what it is about to delete.** The prompt names the modules, such as `infra/prod, modules/vpc`, instead of showing only a count. **Review…** opens a checklist with each cache's full path, size, last-used date, and subdirectories:
 
@@ -145,7 +167,8 @@ All keys are under `tfCompanion.`
 | `versionHygiene.variableDocs` | `false` | also flag variables without `description` or `type` |
 | `cacheCleaner.enabled` | `true` | on startup, offer to delete the cache of modules with no recent activity |
 | `cacheCleaner.staleDays` | `30` | days of inactivity before a `.terraform` counts as stale; floored at 1 |
-| `cacheCleaner.autoDelete` | `false` | delete without asking or showing a confirmation/info banner; all targets are still listed in the output channel |
+| `cacheCleaner.autoDelete` | `false` | delete a workspace's stale `.terraform` caches without asking; the folders are still listed in the output channel. Never applies to the shared provider cache |
+| `cacheCleaner.providerCache` | `false` | also offer to delete provider versions from Terraform's shared plugin cache that were installed over `staleDays` ago and that no workspace lock file names. Always asks |
 
 ## Development
 

@@ -1,4 +1,12 @@
-import { existsSync, mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  symlinkSync,
+  utimesSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -8,18 +16,29 @@ import { mock, type QuickPickItem, resetVscodeMock } from './mocks/vscode';
 const DAY = 86_400_000;
 
 let root: string;
-const originalCliConfig = process.env.TF_CLI_CONFIG_FILE;
+let cacheHome: string;
+const ENV_KEYS = ['TF_CLI_CONFIG_FILE', 'TF_PLUGIN_CACHE_DIR'] as const;
+const savedEnv = new Map<string, string | undefined>();
 
 beforeEach(() => {
   root = mkdtempSync(join(tmpdir(), 'tfc-prompt-'));
+  cacheHome = mkdtempSync(join(tmpdir(), 'tfc-plugins-'));
+  for (const key of ENV_KEYS) {
+    savedEnv.set(key, process.env[key]);
+    delete process.env[key];
+  }
   resetVscodeMock();
   mock.folders = [{ uri: { fsPath: root } }];
 });
 
 afterEach(() => {
-  if (originalCliConfig === undefined) delete process.env.TF_CLI_CONFIG_FILE;
-  else process.env.TF_CLI_CONFIG_FILE = originalCliConfig;
+  for (const key of ENV_KEYS) {
+    const value = savedEnv.get(key);
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
   rmSync(root, { recursive: true, force: true });
+  rmSync(cacheHome, { recursive: true, force: true });
 });
 
 function age(p: string, days: number): void {
@@ -93,26 +112,174 @@ function picker(): QuickPickItem[] {
 /** The whole point of the change: "3 .terraform folders, delete?" gave the user
  *  nothing to check the answer against, so the only available reply was a blind
  *  yes on a recursive delete. */
-describe('cache cleaner prompt', () => {
-  it('shows a confirmation banner for stale unreferenced provider cache', async () => {
-    const cache = join(root, 'plugin-cache');
-    const provider = join(cache, 'registry.terraform.io', 'example', 'unused', '1.0.0');
-    mkdirSync(provider, { recursive: true });
-    writeFileSync(join(provider, 'provider'), 'x'.repeat(4096));
-    age(provider, 90);
-    const cliConfig = join(root, 'terraform.rc');
-    writeFileSync(cliConfig, `plugin_cache_dir = "${cache}"\n`);
-    process.env.TF_CLI_CONFIG_FILE = cliConfig;
-    mock.warningAnswers = ['Ignore'];
+/** The shared plugin cache is not the workspace's: every Terraform project on the
+ *  machine links into it, and Terraform never writes to an entry after
+ *  installing it. So nothing here is deleted unless the user switched the
+ *  feature on, and nothing is deleted without being asked — not even under
+ *  `autoDelete`, which was only ever meant for a workspace's own `.terraform`. */
+describe('shared provider cache', () => {
+  const UNUSED = 'registry.terraform.io/example/unused';
+  const AWS = 'registry.terraform.io/hashicorp/aws';
 
+  /** A provider version as `terraform init` leaves it: a binary under an
+   *  os_arch directory, all of it installed `days` ago. */
+  function provider(source: string, days = 90): { version: string; binary: string } {
+    const version = join(cacheHome, ...source.split('/'), '1.0.0');
+    const platformDir = join(version, 'linux_amd64');
+    mkdirSync(platformDir, { recursive: true });
+    const binary = join(platformDir, 'terraform-provider');
+    writeFileSync(binary, 'x'.repeat(4096));
+    for (const p of [binary, platformDir, version]) age(p, days);
+    return { version, binary };
+  }
+
+  function lockFile(rel: string, source: string): string {
+    const dir = join(root, rel);
+    mkdirSync(dir, { recursive: true });
+    const file = join(dir, '.terraform.lock.hcl');
+    writeFileSync(file, `provider "${source}" {\n  version = "1.0.0"\n}\n`);
+    return file;
+  }
+
+  function enable(): void {
+    process.env.TF_PLUGIN_CACHE_DIR = cacheHome;
+    mock.settings.set('cacheCleaner.providerCache', true);
+  }
+
+  async function runLogged(): Promise<string[]> {
+    const logged: string[] = [];
+    await scan(
+      (m) => logged.push(m),
+      () => false,
+      memento(),
+    );
+    return logged;
+  }
+
+  it('leaves the shared cache alone unless it is switched on', async () => {
+    const { version } = provider(UNUSED);
+    process.env.TF_PLUGIN_CACHE_DIR = cacheHome;
+    await run();
+    expect(mock.warnings).toEqual([]);
+    expect(existsSync(version)).toBe(true);
+  });
+
+  it('says what stale means here, and that other projects may still use the entry', async () => {
+    provider(UNUSED);
+    enable();
+    mock.warningAnswers = ['Ignore'];
+    await run();
+
+    const message = prompt();
+    // the only date available is the install date, so the prompt must not call it "unused"
+    expect(message).toContain('installed over 30 days ago');
+    expect(message).not.toContain('unused');
+    expect(message).toContain('Other projects');
+    expect(message).toContain(cacheHome);
+  });
+
+  it('deletes an unreferenced provider on Delete and keeps one a lock file names', async () => {
+    const gone = provider(UNUSED);
+    const kept = provider(AWS);
+    lockFile('infra/prod', AWS);
+    enable();
+    mock.warningAnswers = ['Delete'];
+    await run();
+
+    expect(existsSync(gone.version)).toBe(false);
+    expect(existsSync(kept.version)).toBe(true);
+    expect(mock.infos[0]).toContain('freed');
+  });
+
+  it('still asks when autoDelete is on', async () => {
+    const { version } = provider(UNUSED);
+    enable();
+    mock.settings.set('cacheCleaner.autoDelete', true);
+    mock.warningAnswers = ['Ignore'];
     await run();
 
     expect(mock.warnings).toHaveLength(1);
-    expect(mock.warnings[0]!.message).toContain('unused provider cache');
-    expect(mock.warnings[0]!.message).toContain('Delete');
-    expect(existsSync(provider)).toBe(true);
+    expect(existsSync(version)).toBe(true);
   });
 
+  it('does nothing when no workspace folder is open, since nothing then protects anything', async () => {
+    const { version } = provider(UNUSED);
+    enable();
+    mock.folders = [];
+    const logged = await runLogged();
+
+    expect(mock.warnings).toEqual([]);
+    expect(existsSync(version)).toBe(true);
+    expect(logged.some((l) => l.includes('provider cache') && l.includes('workspace'))).toBe(true);
+  });
+
+  it('does nothing when a lock file in the workspace cannot be read', async () => {
+    const { version } = provider(UNUSED);
+    enable();
+    mkdirSync(join(root, 'mod'));
+    // dangling: unreadable whoever runs the test, root included
+    symlinkSync(join(cacheHome, 'missing.hcl'), join(root, 'mod', '.terraform.lock.hcl'));
+    await run();
+
+    expect(mock.warnings).toEqual([]);
+    expect(existsSync(version)).toBe(true);
+  });
+
+  it('is protected by a lock file that is a symlink to a shared one', async () => {
+    const { version } = provider(UNUSED);
+    enable();
+    // the real file lives outside the workspace, so only following the link can
+    // bring its provider into the protected set
+    const shared = join(cacheHome, 'shared.lock.hcl');
+    writeFileSync(shared, `provider "${UNUSED}" {\n  version = "1.0.0"\n}\n`);
+    mkdirSync(join(root, 'mod'));
+    symlinkSync(shared, join(root, 'mod', '.terraform.lock.hcl'));
+    await run();
+
+    expect(mock.warnings).toEqual([]);
+    expect(existsSync(version)).toBe(true);
+  });
+
+  it('stays quiet for a week once the prompt is ignored', async () => {
+    provider(UNUSED);
+    enable();
+    mock.warningAnswers = ['Ignore'];
+    const state = memento();
+    await scan(silent, () => false, state);
+    await scan(silent, () => false, state);
+    expect(mock.warnings).toHaveLength(1);
+  });
+
+  it('does not delete a provider that was written while the prompt was open', async () => {
+    const { version, binary } = provider(UNUSED);
+    enable();
+    mock.warningAnswers = ['Review…'];
+    mock.pick = (items) => {
+      age(binary, 0); // a terraform init in another project, mid-prompt
+      return items;
+    };
+    await run();
+
+    expect(existsSync(version)).toBe(true);
+    expect(mock.infos).toEqual([]);
+  });
+
+  it('stops deleting once the window is closing', async () => {
+    const { version } = provider(UNUSED);
+    enable();
+    let closing = false;
+    mock.warningAnswers = ['Review…'];
+    mock.pick = (items) => {
+      closing = true;
+      return items;
+    };
+    await scan(silent, () => closing, memento());
+
+    expect(existsSync(version)).toBe(true);
+  });
+});
+
+describe('cache cleaner prompt', () => {
   it('names the folder it wants to delete', async () => {
     module_('infra/prod', 90);
     mock.warningAnswers = ['Ignore'];

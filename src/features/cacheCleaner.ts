@@ -3,6 +3,11 @@ import { lstat, readdir, readFile, realpath, rm } from 'node:fs/promises';
 import { homedir, platform } from 'node:os';
 import { basename, isAbsolute, join, relative, sep } from 'node:path';
 
+// The shared provider cache below is deliberately modelled on what Terraform
+// itself does with it (internal/command/cliconfig, internal/providercache):
+// it links a cached provider into a project with a symlink and never writes to
+// the cache entry again, and it never deletes anything from the cache itself.
+
 export interface StaleCache {
   dir: string;
   sizeBytes: number;
@@ -21,7 +26,11 @@ export interface ProviderCacheEntry {
 }
 
 const LOCK_PROVIDER = /^\s*provider\s+"([^"]+)"\s*\{/gm;
-const PROVIDER_CACHE_ROOT = /(?:^|\n)\s*plugin_cache_dir\s*=\s*"([^"]+)"\s*(?:\n|$)/;
+/** One `plugin_cache_dir = "..."` line, optionally followed by a `#` or `//`
+ *  comment and optionally CRLF-terminated. A commented-out line cannot match:
+ *  only whitespace may precede the key. */
+const PROVIDER_CACHE_ROOT =
+  /^[ \t]*plugin_cache_dir[ \t]*=[ \t]*"([^"\r\n]+)"[ \t]*(?:#.*|\/\/.*)?\r?$/m;
 
 /** Provider sources named by lock files. A lock file identifies a provider
  * source, not a single version, so protecting the whole source is the only
@@ -34,13 +43,26 @@ export function providerSourcesFromLockFile(contents: string): Set<string> {
   );
 }
 
-export function expandHome(path: string): string {
-  return path.startsWith('~/') ? join(homedir(), path.slice(2)) : path;
+/** Go's `os.ExpandEnv`, which Terraform applies to the `plugin_cache_dir` value
+ *  of the CLI config file — so `$HOME/.terraform.d/plugin-cache`, the example in
+ *  HashiCorp's own docs, names a real directory. An unset variable expands to
+ *  nothing, as it does there. Terraform does not expand `~`, and neither do we. */
+export function expandEnv(value: string): string {
+  return value.replace(
+    /\$(?:\{(\w+)\}|(\w+))/g,
+    (_match, braced?: string, bare?: string) => process.env[braced ?? bare ?? ''] ?? '',
+  );
 }
 
-/** Reads Terraform's CLI config without changing it. The shared cache is
- * deliberately skipped when no explicit plugin_cache_dir is configured. */
+/** Where Terraform keeps its shared plugin cache, or nothing when none is
+ *  configured. Resolved the way Terraform resolves it: `TF_PLUGIN_CACHE_DIR`
+ *  wins and is used verbatim, otherwise the CLI config file's value after
+ *  `$VAR` expansion. A relative path is refused: Terraform resolves it against
+ *  its own working directory, which the extension host cannot know, so any
+ *  guess could point the scan at the wrong tree. */
 export async function configuredProviderCache(): Promise<string | undefined> {
+  const fromEnv = process.env.TF_PLUGIN_CACHE_DIR;
+  if (fromEnv) return isAbsolute(fromEnv) ? fromEnv : undefined;
   const configured = process.env.TF_CLI_CONFIG_FILE;
   const candidates = configured
     ? [configured]
@@ -50,7 +72,10 @@ export async function configuredProviderCache(): Promise<string | undefined> {
   for (const candidate of candidates) {
     try {
       const match = PROVIDER_CACHE_ROOT.exec(await readFile(candidate, 'utf8'));
-      if (match?.[1]) return expandHome(match[1]);
+      if (match?.[1]) {
+        const dir = expandEnv(match[1]);
+        return isAbsolute(dir) ? dir : undefined;
+      }
     } catch {
       // An absent CLI config is normal; callers log only actual scan failures.
     }
@@ -380,40 +405,113 @@ export async function findStaleTerraformDirs(
   return out;
 }
 
-/** Collects lock-file provider sources during the same workspace walk used by
- * the cache cleaner. Sources, rather than versions, are protected because
- * Terraform lock files do not record a standalone selected-version field. */
+export interface ProviderSourceScan {
+  sources: Set<string>;
+  /** False when anything that could name a provider went unread: a directory
+   *  that would not list, a lock file that would not open, the depth limit, or a
+   *  cancelled walk. The sources are what *protects* cache entries, so an
+   *  incomplete set means "unprotected" for exactly the providers a missed lock
+   *  file would have named — the caller must not delete on it. */
+  complete: boolean;
+}
+
+/** Collects lock-file provider sources from a workspace folder. Sources, rather
+ * than versions, are protected because Terraform lock files do not record a
+ * standalone selected-version field.
+ *
+ * A symlinked `.terraform.lock.hcl` is read too — monorepos share one lock file
+ * that way, and `Dirent.isFile()` is false for a link, so skipping it would
+ * leave every provider that file names unprotected. */
 export async function collectProviderSources(
   root: string,
   cancelled?: () => boolean,
-): Promise<Set<string>> {
+): Promise<ProviderSourceScan> {
   const sources = new Set<string>();
+  let complete = true;
   const visit = async (dir: string, depth: number): Promise<void> => {
-    if (cancelled?.() || depth > MAX_DEPTH) return;
+    if (cancelled?.()) {
+      complete = false;
+      return;
+    }
+    if (depth > MAX_DEPTH) {
+      complete = false;
+      return;
+    }
     let entries: Dirent[];
     try {
       entries = await readdir(dir, { withFileTypes: true });
     } catch {
+      complete = false;
       return;
     }
     for (const de of entries) {
-      if (cancelled?.()) return;
+      if (cancelled?.()) {
+        complete = false;
+        return;
+      }
       if (de.isDirectory()) {
         if (!SKIP.has(de.name)) await visit(join(dir, de.name), depth + 1);
-      } else if (de.isFile() && de.name === '.terraform.lock.hcl') {
+      } else if ((de.isFile() || de.isSymbolicLink()) && de.name === '.terraform.lock.hcl') {
         try {
           for (const source of providerSourcesFromLockFile(
             await readFile(join(dir, de.name), 'utf8'),
           ))
             sources.add(source);
         } catch {
-          // A lock file may disappear while the workspace is being edited.
+          // Gone mid-walk, or a dangling link: either way this project's providers
+          // are unknown, which is not the same as "uses none".
+          complete = false;
         }
       }
     }
   };
   await visit(root, 0);
-  return sources;
+  return { sources, complete };
+}
+
+/** Newest mtime among the descendants of `dir` (not `dir` itself), with the
+ *  same bounds, and the same refusal to follow links, as `dirSize`. */
+async function newestBelow(
+  dir: string,
+  depth = 0,
+  cancelled?: () => boolean,
+  budget: { left: number } = { left: MAX_SIZE_ENTRIES },
+): Promise<number> {
+  if (depth > MAX_DEPTH || budget.left <= 0 || cancelled?.()) return 0;
+  let newest = 0;
+  let entries: Dirent[];
+  try {
+    entries = await readdir(dir, { withFileTypes: true });
+  } catch {
+    return 0;
+  }
+  for (const de of entries) {
+    if (cancelled?.() || budget.left <= 0) return newest;
+    const p = join(dir, de.name);
+    try {
+      budget.left--;
+      newest = Math.max(newest, (await lstat(p)).mtimeMs);
+      if (de.isDirectory())
+        newest = Math.max(newest, await newestBelow(p, depth + 1, cancelled, budget));
+    } catch {
+      // unreadable entry: it says nothing about activity
+    }
+  }
+  return newest;
+}
+
+/** Last sign of life of a provider version directory. Terraform links a cached
+ *  provider into a project and never writes to the cache entry again, so the
+ *  directory's own mtime is when it was installed — a provider used every day
+ *  still looks months old by that measure. Anything written beneath it (an
+ *  install finishing, a binary being replaced) is the only activity there is to
+ *  see, which is why it is counted. */
+async function providerActivity(
+  dir: string,
+  ownMtimeMs: number,
+  cancelled?: () => boolean,
+): Promise<number> {
+  return Math.max(ownMtimeMs, await newestBelow(dir, 0, cancelled));
 }
 
 export async function findStaleProviderCacheEntries(
@@ -469,12 +567,13 @@ export async function findStaleProviderCacheEntries(
           } catch {
             continue;
           }
-          if (st.mtimeMs >= cutoff) continue;
+          const activity = await providerActivity(dir, st.mtimeMs, cancelled);
+          if (activity >= cutoff) continue;
           out.push({
             dir,
             source,
             sizeBytes: await dirSize(dir, 0, cancelled),
-            lastActivityMs: st.mtimeMs,
+            lastActivityMs: activity,
           });
         }
       }
@@ -499,6 +598,24 @@ export async function deleteProviderCacheEntry(
   } catch (e) {
     return { ok: false, reason: `${e}` };
   }
+}
+
+/** The provider-cache counterpart of `isStillStale`: the prompt can sit open
+ *  indefinitely, and the shared cache is exactly where a `terraform init` in
+ *  another project writes while it waits. A directory that is gone counts as
+ *  not stale, since there is nothing left to delete. */
+export async function isProviderEntryStillStale(
+  dir: string,
+  staleDays: number,
+  now: number = Date.now(),
+): Promise<boolean> {
+  let own: number;
+  try {
+    own = (await lstat(dir)).mtimeMs;
+  } catch {
+    return false;
+  }
+  return (await providerActivity(dir, own)) < staleCutoff(staleDays, now);
 }
 
 /** The prompt can sit open indefinitely, so a `terraform init` run while
