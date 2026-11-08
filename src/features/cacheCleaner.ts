@@ -117,8 +117,7 @@ export function expandEnv(value: string): string {
  *  (internal/command/cliconfig): one named by `TF_CLI_CONFIG_FILE`, else
  *  `TERRAFORM_CONFIG`, and nothing else; otherwise `~/.terraformrc` (on Windows
  *  `%APPDATA%\\terraform.rc`) and then the `*.tfrc` files in `~/.terraform.d`
- *  (`%APPDATA%\\terraform.d`). `*.tfrc.json` is skipped: it is JSON, and an
- *  unread file only means "not configured". */
+ *  (`%APPDATA%\\terraform.d`), `*.tfrc.json` ones included, in file name order. */
 async function cliConfigFiles(): Promise<string[]> {
   const override = process.env.TF_CLI_CONFIG_FILE || process.env.TERRAFORM_CONFIG;
   if (override) return [override];
@@ -127,7 +126,9 @@ async function cliConfigFiles(): Promise<string[]> {
   const dir = join(base, win ? 'terraform.d' : '.terraform.d');
   let names: string[] = [];
   try {
-    names = (await readdir(dir)).filter((name) => name.endsWith('.tfrc')).sort();
+    names = (await readdir(dir))
+      .filter((name) => name.endsWith('.tfrc') || name.endsWith('.tfrc.json'))
+      .sort();
   } catch {
     // no config directory is normal
   }
@@ -137,24 +138,54 @@ async function cliConfigFiles(): Promise<string[]> {
   ];
 }
 
+/** The `plugin_cache_dir` of a `*.tfrc.json` CLI config, which Terraform reads
+ *  as JSON. */
+function pluginCacheDirOfJson(text: string): string | undefined {
+  const value: unknown = (JSON.parse(text) as { plugin_cache_dir?: unknown } | null)
+    ?.plugin_cache_dir;
+  return typeof value === 'string' && value ? value : undefined;
+}
+
 /** Where Terraform keeps its shared plugin cache, or nothing when none is
  *  configured. Resolved the way Terraform resolves it: `TF_PLUGIN_CACHE_DIR`
  *  wins and is used verbatim, otherwise the first CLI config file that sets it,
  *  after `$VAR` expansion. A relative path is refused: Terraform resolves it
  *  against its own working directory, which the extension host cannot know, so
  *  any guess could point the scan at the wrong tree. So is a local provider
- *  mirror (see `LOCAL_MIRROR_DIR`). */
-export async function configuredProviderCache(): Promise<string | undefined> {
-  const usable = (dir: string): string | undefined =>
-    isAbsoluteFsPath(dir) && !LOCAL_MIRROR_DIR.test(dir) ? dir : undefined;
+ *  mirror (see `LOCAL_MIRROR_DIR`), by the name it was given and by where it
+ *  really is. Each refusal is logged, so a cache that is never swept can be told
+ *  apart from one that is not configured. */
+export async function configuredProviderCache(
+  log?: (m: string) => void,
+): Promise<string | undefined> {
+  const usable = async (dir: string): Promise<string | undefined> => {
+    if (!isAbsoluteFsPath(dir)) {
+      log?.(`cacheCleaner: shared plugin cache ${dir} ignored, the path must be absolute`);
+      return undefined;
+    }
+    let real = dir;
+    try {
+      real = await realpath(dir);
+    } catch {
+      // not there yet: only the name can be judged
+    }
+    if (LOCAL_MIRROR_DIR.test(dir) || LOCAL_MIRROR_DIR.test(real)) {
+      log?.(`cacheCleaner: shared plugin cache ${dir} ignored, it is a local provider mirror`);
+      return undefined;
+    }
+    return dir;
+  };
   const fromEnv = process.env.TF_PLUGIN_CACHE_DIR;
   if (fromEnv) return usable(fromEnv);
   for (const candidate of await cliConfigFiles()) {
     try {
-      const configured = pluginCacheDirOf(await readFile(candidate, 'utf8'));
+      const text = await readFile(candidate, 'utf8');
+      const configured = candidate.endsWith('.json')
+        ? pluginCacheDirOfJson(text)
+        : pluginCacheDirOf(text);
       if (configured) return usable(expandEnv(configured));
     } catch {
-      // An absent CLI config is normal; callers log only actual scan failures.
+      // An absent or unparseable CLI config is normal; callers log only actual scan failures.
     }
   }
   return undefined;
@@ -224,6 +255,12 @@ export const CACHE_SUBDIRS = ['providers', 'plugins', 'modules'] as const;
  *  in a notification, so it is not worth an unbounded walk: past the budget the
  *  figure is an undercount, which `formatSize` already tolerates. */
 const MAX_SIZE_ENTRIES = 50_000;
+
+/** Entries the lock-file walk may read in one workspace folder. It follows
+ *  symlinks, so a link to `/usr` would otherwise cost every scan, and the second
+ *  one after the prompt, half a minute. Past the budget the scan reports itself
+ *  incomplete, which switches the shared-cache sweep off. */
+const MAX_LOCK_WALK_ENTRIES = 200_000;
 
 /** Bounded and cancellable: this recurses into a module checkout, which for a
  *  git-sourced module is a full clone, and the total exists only to render a
@@ -536,16 +573,19 @@ async function providerSourcesFromDotTerraform(
 export async function collectProviderSources(
   root: string,
   cancelled?: () => boolean,
+  maxEntries: number = MAX_LOCK_WALK_ENTRIES,
 ): Promise<ProviderSourceScan> {
   const sources = new Set<string>();
   let complete = true;
+  let left = maxEntries;
   const seen = new Set<string>();
   const visit = async (dir: string, real: string, depth: number): Promise<void> => {
     if (cancelled?.()) {
       complete = false;
       return;
     }
-    if (depth > MAX_DEPTH) {
+    // out of budget: `complete` is already false, and reading on would only cost time
+    if (depth > MAX_DEPTH || left < 0) {
       complete = false;
       return;
     }
@@ -555,6 +595,12 @@ export async function collectProviderSources(
     try {
       entries = await readdir(dir, { withFileTypes: true });
     } catch {
+      complete = false;
+      return;
+    }
+    // a link may lead anywhere, so a tree has to be bounded by what it holds
+    left -= entries.length;
+    if (left < 0) {
       complete = false;
       return;
     }
@@ -589,8 +635,17 @@ export async function collectProviderSources(
         try {
           if (!(await stat(path)).isDirectory()) continue;
           target = await realpath(path);
-        } catch {
-          continue; // a dangling or file link has no lock file to find
+        } catch (e) {
+          // a link to nothing, or in a loop, has no lock file to find; one that
+          // could not be reached (permissions, a stale mount) may have had one
+          const code = (e as NodeJS.ErrnoException).code;
+          if (code !== 'ENOENT' && code !== 'ELOOP' && code !== 'ENOTDIR') complete = false;
+          continue;
+        }
+        if (de.name === '.terraform') {
+          const linked = await providerSourcesFromDotTerraform(path);
+          for (const source of linked.sources) sources.add(source);
+          if (!linked.complete) complete = false;
         }
         await visit(path, target, depth + 1);
       }

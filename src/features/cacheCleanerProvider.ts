@@ -242,7 +242,7 @@ export async function scan(
   // already-deleted path succeeds silently and inflates the result too.
   const unique = [...new Map(stale.map((c) => [c.dir, c])).values()];
   if (cancelled()) return;
-  const providerCache = providerCacheOn ? await configuredProviderCache() : undefined;
+  const providerCache = providerCacheOn ? await configuredProviderCache(log) : undefined;
   let staleProviders: ProviderCacheEntry[] = [];
   if (providerCache) {
     if (lockFilesRead) {
@@ -426,11 +426,19 @@ export async function scan(
     log(
       'cacheCleaner: provider cache left alone — the lock files could not all be read again after the prompt',
     );
+    // the click was Delete: saying nothing would read as "done"
+    vscode.window
+      .showWarningMessage(
+        'Terraform Companion: left the shared plugin cache alone. The lock files in the workspace could not all be read again after you answered, so nothing was removed.',
+      )
+      .then(undefined, (e) => log(`cacheCleaner: notification failed: ${e}`));
     return;
   }
+  let providerSpared = 0;
   providerTargets = providerTargets.filter((entry) => {
     if (!fresh.sources.has(entry.source)) return true;
     log(`cacheCleaner: skipped provider ${entry.dir} (a lock file names it now)`);
+    providerSpared++;
     return false;
   });
 
@@ -442,6 +450,7 @@ export async function scan(
     // the prompt may have sat open while another project ran terraform init
     if (!(await isProviderEntryStillStale(entry.dir, staleDays))) {
       log(`cacheCleaner: skipped provider ${entry.dir} (used since the scan)`);
+      providerSpared++;
       continue;
     }
     const result = await deleteProviderCacheEntry(entry, providerCache);
@@ -462,11 +471,19 @@ export async function scan(
       )
       .then(undefined, (e) => log(`cacheCleaner: notification failed: ${e}`));
   }
-  if (providerCleaned > 0) {
+  const outcome: string[] = [];
+  if (providerCleaned > 0)
+    outcome.push(
+      `removed ${providerCleaned} provider version${providerCleaned === 1 ? '' : 's'} from the shared plugin cache, freed ${formatSize(providerFreed)}. A project that used ${providerCleaned === 1 ? 'it' : 'them'} needs terraform init next time.`,
+    );
+  // a Delete that spared something should say so, not look like it did nothing
+  if (providerSpared > 0)
+    outcome.push(
+      `${outcome.length > 0 ? 'Kept' : 'kept'} ${providerSpared} provider version${providerSpared === 1 ? '' : 's'} because a project started using ${providerSpared === 1 ? 'it' : 'them'} while the prompt was open.`,
+    );
+  if (outcome.length > 0) {
     vscode.window
-      .showInformationMessage(
-        `Terraform Companion: removed ${providerCleaned} provider version${providerCleaned === 1 ? '' : 's'} from the shared plugin cache, freed ${formatSize(providerFreed)}. A project that used ${providerCleaned === 1 ? 'it' : 'them'} needs terraform init next time.`,
-      )
+      .showInformationMessage(`Terraform Companion: ${outcome.join(' ')}`)
       .then(undefined, (e) => log(`cacheCleaner: notification failed: ${e}`));
   }
 }

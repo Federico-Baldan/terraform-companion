@@ -273,7 +273,9 @@ describe('shared provider cache', () => {
     await run();
 
     expect(existsSync(version)).toBe(true);
-    expect(mock.infos).toEqual([]);
+    // the click was Delete, so silence afterwards would read as "done"
+    expect(mock.infos).toHaveLength(1);
+    expect(mock.infos[0]).toContain('kept 1 provider version');
   });
 
   /** Reuse leaves no trace in the cache, so the only way to learn that a
@@ -290,7 +292,8 @@ describe('shared provider cache', () => {
     await run();
 
     expect(existsSync(version)).toBe(true);
-    expect(mock.infos).toEqual([]);
+    expect(mock.infos).toHaveLength(1);
+    expect(mock.infos[0]).toContain('kept 1 provider version');
   });
 
   it('deletes nothing if the lock files cannot be read again', async () => {
@@ -305,6 +308,8 @@ describe('shared provider cache', () => {
     await run();
 
     expect(existsSync(version)).toBe(true);
+    expect(mock.warnings).toHaveLength(2);
+    expect(mock.warnings[1]!.message).toContain('left the shared plugin cache alone');
   });
 
   it('protects a project whose .terraform/providers links into the cache, with or without a lock file', async () => {
