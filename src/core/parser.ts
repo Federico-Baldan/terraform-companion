@@ -269,7 +269,50 @@ export function withExpressionNode<T>(text: string, use: (expr: Node) => T): T |
   }
 }
 
+/** How many files `parseFile` remembers the latest parse of. A handful is the
+ *  point: what repeats is the *same buffer* being asked about by several
+ *  providers within a moment of an edit — the CodeLens, the lint's live buffer,
+ *  the count→for_each provider, the hover, then the debounced index — and a
+ *  split view or two adds a few more. A parse holds ~22x its source in objects,
+ *  so remembering many would trade the CPU it saves for the memory it costs. The
+ *  index keeps the files it knows about on its own; this only has to outlast the
+ *  burst that follows one edit. */
+const MEMO_FILES = 8;
+const memo = new Map<string, ParsedFile>();
+
+/** Parse `source` as the file at `path`.
+ *
+ *  The latest parse of a path is remembered, and handed back for identical text.
+ *  Each provider used to keep a one-slot cache of its own, so none of them could
+ *  see another's: one edit was parsed up to five times, ~86ms apiece on a
+ *  3000-line file, and none of it could be skipped by any of them alone.
+ *
+ *  Sharing the object is safe because it is never written to: nothing in the
+ *  extension mutates a `ParsedFile` or the blocks, attributes and references
+ *  hanging off it, and `lines` is a lazy, idempotent getter. The text is the
+ *  whole input to the parse, so identical text can only mean an identical
+ *  result — an edit changes the text and misses. */
 export function parseFile(path: string, source: string): ParsedFile {
+  const hit = memo.get(path);
+  if (hit && hit.source === source) {
+    // a hit is a use: the buffer under the cursor is asked about between every
+    // scan of the others, and has to outlive them
+    memo.delete(path);
+    memo.set(path, hit);
+    return hit;
+  }
+  // not remembered if it throws: a failed parse leaves nothing behind to serve
+  const parsed = parseUncached(path, source);
+  memo.delete(path);
+  memo.set(path, parsed);
+  if (memo.size > MEMO_FILES) {
+    const oldest = memo.keys().next();
+    if (!oldest.done) memo.delete(oldest.value);
+  }
+  return parsed;
+}
+
+function parseUncached(path: string, source: string): ParsedFile {
   if (!parser) throw new Error('initParser() must be called before parseFile()');
   const tree = parser.parse(source);
   const blocks: TfBlock[] = [];
