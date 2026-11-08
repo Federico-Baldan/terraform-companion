@@ -832,10 +832,20 @@ function resolveRefValue(parts: string[], scope: EvalScope, depth: number): Valu
     if (parts.length !== 2) return undefined;
     const root = rootDirOf(scope);
     if (name === 'cwd') {
-      // a configured run directory belongs to the configured root: for a module
-      // another root owns it says nothing, and the assumption below applies
-      if (scope.cwd !== undefined && (scope.rootDir === undefined || root === scope.rootDir))
-        return scope.cwd;
+      if (scope.cwd !== undefined) {
+        if (scope.rootDir === undefined) {
+          // `terraform -chdir=` may point anywhere, so the run directory has no
+          // checkable relation to a root. With several roots in the window and no
+          // terraformRoot saying which one the setting belongs to, it is applied
+          // to all of them, and says so
+          if (hasSeveralRoots(scope.index))
+            scope.used?.assumes.add('terraformCwd is the run directory for this root');
+          return scope.cwd;
+        }
+        // the configured run directory belongs to the configured root: for a
+        // module another root owns it says nothing, and the assumption below applies
+        if (root !== undefined && sameDir(root, scope.rootDir)) return scope.cwd;
+      }
       // The run directory is in no file: `cd infra && terraform plan` and
       // `terraform -chdir=infra plan` from the repo root differ, and path.cwd is
       // the original directory, before -chdir. The usual workflow is the first,
@@ -911,7 +921,7 @@ function rootDirOf(scope: EvalScope): string | undefined {
     if (seen.has(dir)) return true; // a loop contributes no root of its own
     if (seen.size >= MAX_REF_HOPS) return false;
     seen.add(dir);
-    if (dir === scope.rootDir) {
+    if (scope.rootDir !== undefined && sameDir(dir, scope.rootDir)) {
       roots.add(dir);
       return true;
     }
@@ -924,8 +934,30 @@ function rootDirOf(scope: EvalScope): string | undefined {
     return sites.every((site) => climb(site.callerDir));
   };
   if (!climb(scope.moduleDir)) return undefined;
-  if (scope.rootDir !== undefined && roots.has(scope.rootDir)) return scope.rootDir;
+  // spelled as the index spells it, so `relative` against a module directory works
+  const explicit = [...roots].find((r) => scope.rootDir !== undefined && sameDir(r, scope.rootDir));
+  if (explicit !== undefined) return explicit;
   return roots.size === 1 ? [...roots][0] : undefined;
+}
+
+/** A setting and the index can spell one directory differently in exactly one
+ *  way that matters: VS Code lowers a Windows drive letter, a typed path may not. */
+function dirKey(path: string): string {
+  return /^[a-zA-Z]:/.test(path) ? path.charAt(0).toLowerCase() + path.slice(1) : path;
+}
+
+function sameDir(a: string, b: string): boolean {
+  return dirKey(a) === dirKey(b);
+}
+
+/** Whether the window holds more than one root module: directories with
+ *  Terraform files that no `module` block calls. */
+function hasSeveralRoots(index: WorkspaceIndex): boolean {
+  const dirs = new Set(index.files().map((file) => index.moduleDirOf(file.path)));
+  let roots = 0;
+  for (const dir of dirs)
+    if (index.externalCallSitesOf(dir).length === 0 && ++roots > 1) return true;
+  return false;
 }
 
 /** Module name + shortest path suffix that disambiguates sites — basenames

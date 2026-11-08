@@ -9,6 +9,15 @@ import { mock, resetVscodeMock } from './mocks/vscode';
 describe('terraformRoot and terraformCwd', () => {
   beforeEach(resetVscodeMock);
 
+  it('drop a trailing separator, which no directory Terraform reports carries', () => {
+    mock.settings.set('terraformRoot', '/work/infra/');
+    mock.settings.set('terraformCwd', '/work//');
+    expect(terraformRoot()).toBe('/work/infra');
+    expect(terraformCwd()).toBe('/work');
+    mock.settings.set('terraformRoot', '/');
+    expect(terraformRoot()).toBe('/');
+  });
+
   it('return an absolute path as given', () => {
     mock.settings.set('terraformRoot', '/work/infra');
     mock.settings.set('terraformCwd', '/work');

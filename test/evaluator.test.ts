@@ -576,7 +576,9 @@ describe('context values', () => {
    *  a tree doubles the work with every level, so a 24-line chain of locals froze
    *  the extension host. */
   it('does not expand a shared value as a tree', async () => {
-    const levels = 21;
+    // deep enough that expanding the shared structure as a tree takes seconds, not
+    // the fraction of one that a slower machine could blame
+    const levels = 26;
     const chain = ['a0 = ["x", "x"]'];
     for (let i = 1; i <= levels; i++) chain.push(`a${i} = [local.a${i - 1}, local.a${i - 1}]`);
     const { block, s } = await resource(
@@ -585,7 +587,7 @@ describe('context values', () => {
     const started = performance.now();
     const instances = resolveContext(block, s);
     resolveRef(['each', 'value'], { ...s, context: instances?.[0] });
-    expect(performance.now() - started).toBeLessThan(250);
+    expect(performance.now() - started).toBeLessThan(500);
     expect(instances).toHaveLength(1);
   });
 
@@ -652,5 +654,99 @@ describe('context values', () => {
     expect(resolveRef(['path', 'cwd'], prod)).toBe('/run/prod');
     const vpc: EvalScope = { ...base, moduleDir: '/repo/modules/vpc' };
     expect(resolveRef(['path', 'module'], vpc)).toBe('../../modules/vpc');
+  });
+
+  /** One window can hold several roots, and a single terraformCwd describes only
+   *  one run. `terraform -chdir=` may point anywhere, so no relation between the
+   *  run directory and a root can be checked: what can be said is that, with
+   *  several roots and no terraformRoot to say which one the setting belongs to,
+   *  the setting is applied to all of them as an assumption. */
+  it('says a configured path.cwd is an assumption for a root among several', async () => {
+    const index = new WorkspaceIndex();
+    await index.updateFile('/ws/envs/dev/main.tf', 'locals {}\n');
+    await index.updateFile('/ws/envs/prod/main.tf', 'locals {}\n');
+    const used = emptyUsage();
+    const scope: EvalScope = { index, moduleDir: '/ws/envs/dev', cwd: '/run/prod', used };
+    expect(resolveRef(['path', 'cwd'], scope)).toBe('/run/prod');
+    expect([...used.assumes].join()).toContain('terraformCwd');
+  });
+
+  it('takes a configured path.cwd at its word when there is a single root', async () => {
+    const index = new WorkspaceIndex();
+    await index.updateFile('/ws/main.tf', 'module "m" {\n  source = "./m"\n}\n');
+    await index.updateFile('/ws/m/main.tf', 'locals {}\n');
+    const used = emptyUsage();
+    expect(resolveRef(['path', 'cwd'], { index, moduleDir: '/ws/m', cwd: '/run', used })).toBe(
+      '/run',
+    );
+    expect(used.assumes.size).toBe(0);
+  });
+
+  /** VS Code spells a Windows drive letter in lower case; a setting is spelled as
+   *  it was typed. */
+  it('compares configured directories without regard to the case of a drive letter', async () => {
+    const index = new WorkspaceIndex();
+    await index.updateFile('c:/ws/envs/prod/main.tf', 'locals {}\n');
+    const used = emptyUsage();
+    const scope: EvalScope = {
+      index,
+      moduleDir: 'c:/ws/envs/prod',
+      rootDir: 'C:/ws/envs/prod',
+      cwd: 'C:/ws',
+      used,
+    };
+    expect(resolveRef(['path', 'cwd'], scope)).toBe('C:/ws');
+    expect(used.assumes.size).toBe(0);
+  });
+
+  describe('which root a module belongs to', () => {
+    const workspace = async (files: Record<string, string>) => {
+      const index = new WorkspaceIndex();
+      for (const [path, text] of Object.entries(files)) await index.updateFile(path, text);
+      return index;
+    };
+    const call = (name: string, source: string) =>
+      `module "${name}" {\n  source = "${source}"\n}\n`;
+
+    it('finds the one root above a module that two of its modules both call', async () => {
+      const index = await workspace({
+        '/r/main.tf': call('b', './b') + call('c', './c'),
+        '/r/b/main.tf': call('d', '../d'),
+        '/r/c/main.tf': call('d', '../d'),
+        '/r/d/main.tf': 'locals {}\n',
+      });
+      expect(resolveRef(['path', 'module'], { index, moduleDir: '/r/d' })).toBe('d');
+    });
+
+    it('is not thrown by modules that call each other', async () => {
+      const index = await workspace({
+        '/r/main.tf': call('a', './a') + call('b', './b'),
+        '/r/a/main.tf': call('b', '../b'),
+        '/r/b/main.tf': call('a', '../a'),
+      });
+      expect(resolveRef(['path', 'module'], { index, moduleDir: '/r/a' })).toBe('a');
+    });
+
+    const twoRoots = {
+      '/repo/envs/prod/main.tf': call('vpc', '../../modules/vpc'),
+      '/repo/envs/dev/main.tf': call('vpc', '../../modules/vpc'),
+      '/repo/modules/vpc/main.tf': 'locals {}\n',
+    };
+
+    it('claims nothing for a module two roots reach, since path.module differs between them', async () => {
+      const index = await workspace(twoRoots);
+      const scope: EvalScope = { index, moduleDir: '/repo/modules/vpc' };
+      expect(resolveRef(['path', 'module'], scope)).toBe(UNKNOWN);
+    });
+
+    it('lets an explicit root settle a module two roots reach', async () => {
+      const index = await workspace(twoRoots);
+      const scope: EvalScope = {
+        index,
+        moduleDir: '/repo/modules/vpc',
+        rootDir: '/repo/envs/prod',
+      };
+      expect(resolveRef(['path', 'module'], scope)).toBe('../../modules/vpc');
+    });
   });
 });

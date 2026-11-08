@@ -371,11 +371,17 @@ export function computeHover(file: ParsedFile, pos: Pos, ctx: HoverContext): str
   // discovering the instances reads `count` or `for_each` through the same
   // evaluator; its provenance is that expression's, not the value hovered, so it
   // is kept in a usage of its own
+  const discovery = emptyUsage();
   const instances =
     contextTarget && block && !file.hasError
-      ? resolveContext(block, { ...scope, used: emptyUsage() }, { isCancelled: ctx.isCancelled })
+      ? resolveContext(block, { ...scope, used: discovery }, { isCancelled: ctx.isCancelled })
       : undefined;
   if (ctx.isCancelled?.()) return undefined;
+  // An assumption is not provenance. `each.value` and `each.key` are made of what
+  // `for_each` evaluated to, so what that rested on, they rest on. (`each.key`
+  // can say so when only the value did: the note is then one too many, not one
+  // too few.)
+  if (kind === 'each') for (const what of discovery.assumes) used.assumes.add(what);
   if (contextTarget && (!instances || instances.length === 0)) return undefined;
   // `count.index` in a for_each block, or `each.key` in a count block, has no
   // instance to read: a column of ⟨unknown⟩ says nothing
@@ -414,14 +420,16 @@ export function computeHover(file: ParsedFile, pos: Pos, ctx: HoverContext): str
   if (diverged) {
     const sampled = diverged.sites.slice(0, MAX_CONFLICT_SITES);
     omitted = diverged.sites.length - sampled.length;
-    const rows = sampled.map((site, i) => ({
-      label: diverged.labels[i] ?? '?',
-      value: resolveRefShaped(target, {
+    const rows = sampled.map((site, i) => {
+      const rowUsage = emptyUsage();
+      const value = resolveRefShaped(target, {
         ...scope,
-        used: emptyUsage(),
+        used: rowUsage,
         pinnedSites: new Map([...(scope.pinnedSites ?? []), [diverged.moduleDir, site]]),
-      }),
-    }));
+      });
+      for (const what of rowUsage.assumes) used.assumes.add(what);
+      return { label: diverged.labels[i] ?? '?', value };
+    });
     if (ctx.isCancelled?.()) return undefined;
     if (omitted > 0 || new Set(rows.map((r) => r.value.text)).size > 1) {
       // With instances left unread we cannot claim they agree, so the collapse
@@ -550,9 +558,13 @@ export function hoverMarkdown({
       spent += row.length;
     }
     const more = dropped > 0 ? `\n- …and ${dropped} more instance${dropped === 1 ? '' : 's'}` : '';
+    // the rows are values too: one that rests on something no file shows says so
+    const assumed = [...used.assumes].map((what) => escapeMd(what, isCancelled));
+    if (assumed.some((what) => what === undefined)) return undefined;
+    const assumption = assumed.length > 0 ? `\n\n_assumes ${assumed.join(', ')}_` : '';
     return isCancelled?.()
       ? undefined
-      : `**${name}** ${rowsKind === 'instance' ? 'per instance' : 'differs per module instance'}:\n\n${rows.join('\n')}${more}`;
+      : `**${name}** ${rowsKind === 'instance' ? 'per instance' : 'differs per module instance'}:\n\n${rows.join('\n')}${more}${assumption}`;
   }
 
   const origins: string[] = [];

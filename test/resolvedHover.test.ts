@@ -796,6 +796,39 @@ describe('Terraform context hover', () => {
     ).toBeUndefined();
   });
 
+  /** The rows and `each` are read through throwaway usages so the hovered value
+   *  does not borrow the provenance of the collection it was discovered in, but an
+   *  assumption is not provenance: a value that rests on one has to say so wherever
+   *  it is shown. */
+  it('keeps the assumption behind a path.cwd that reaches each.value', async () => {
+    const note = 'assumes terraform runs in the root module directory';
+    const one = await hover(
+      'resource "x" "item" {\n  for_each = { a = path.cwd }\n  name = each.value\n}\n',
+      2,
+      12,
+    );
+    expect(one).toContain('/context');
+    expect(one).toContain(note);
+    const two = await hover(
+      'resource "x" "item" {\n  for_each = { a = path.cwd, b = "x" }\n  name = each.value\n}\n',
+      2,
+      12,
+    );
+    expect(two).toContain('per instance');
+    expect(two).toContain(note);
+  });
+
+  it('says nothing for an each that a for expression binds as its key', async () => {
+    const line = '  n = [for each, v in var.o : each.key]';
+    expect(
+      await hover(
+        `variable "o" { default = { x = "v" } }\nresource "x" "i" {\n  for_each = { a = "r" }\n${line}\n}\n`,
+        3,
+        line.lastIndexOf('each') + 1,
+      ),
+    ).toBeUndefined();
+  });
+
   it('does not inherit context into nested blocks', async () => {
     const md = await hover(
       'resource "x" "item" {\n  count = 2\n  nested {\n    name = count.index\n  }\n}\n',

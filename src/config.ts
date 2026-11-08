@@ -63,7 +63,13 @@ function absolutePath(key: string): string | undefined {
   const value = cfg().get<unknown>(key);
   if (typeof value !== 'string') return undefined;
   const trimmed = value.trim();
-  return trimmed !== '' && !trimmed.includes('${') && isAbsolute(trimmed) ? trimmed : undefined;
+  if (trimmed === '' || trimmed.includes('${') || !isAbsolute(trimmed)) return undefined;
+  // no directory Terraform reports carries a trailing separator, and one would
+  // keep the setting from matching the directory the index spells without it.
+  // A root (`/`, `C:\`) is all separator and stays as it is.
+  const bare = trimmed.replace(/[\\/]+$/, '');
+  if (bare === '') return trimmed.charAt(0);
+  return /^[a-zA-Z]:$/.test(bare) ? trimmed.slice(0, bare.length + 1) : bare;
 }
 
 /** The Terraform root module directory, when the user said which it is. */
