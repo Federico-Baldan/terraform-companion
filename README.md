@@ -14,8 +14,9 @@
 </p>
 
 <p align="center">
-  Version CodeLens, resolved-value hover on <code>var</code> and <code>local</code>, <code>count</code>&nbsp;→&nbsp;<code>for_each</code> refactor,<br>
-  plus unused-local and version-constraint lints.
+  Version CodeLens, resolved-value hover on <code>var</code>, <code>local</code>, <code>count.index</code>, <code>each.*</code> and <code>path.*</code>,<br>
+  <code>count</code>&nbsp;→&nbsp;<code>for_each</code> refactor, unused-local, version-constraint and redundant <code>depends_on</code> lints,<br>
+  plus cleanup of stale <code>.terraform</code> folders and the shared plugin cache.
 </p>
 
 <p align="center"><em>What does that <code>var.*</code> or <code>local.*</code> actually resolve to? Hover and find out.</em></p>
