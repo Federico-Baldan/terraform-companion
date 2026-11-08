@@ -83,6 +83,43 @@ describe('F7 evaluator', () => {
     expect(resolveExpr('toset([8080, 8080])', scope)).toBe('[8080, 8080]');
   });
 
+  /** A set converts to a list wherever a function wants one, so wrapping a list
+   *  in `toset` must not turn a resolvable `join` into ⟨unknown⟩. */
+  it('joins and re-sets a set, which converts to a list for the call', () => {
+    expect(resolveExpr('join(",", toset(["b", "a", "b"]))', scope)).toBe('a,b');
+    expect(resolveExpr('toset(toset(["b", "a"]))', scope)).toBe('[a, b]');
+  });
+
+  /** Terraform reports a module's directory as it was loaded, relative to the
+   *  root module's directory, and only `path.cwd` as an absolute path (see
+   *  GetPathAttr in hashicorp/terraform internal/terraform/evaluate.go). */
+  it('reports path.module and path.root relative to the root module, like terraform', () => {
+    const at = (moduleDir: string, rootDir?: string): EvalScope => ({
+      index: scope.index,
+      moduleDir,
+      ...(rootDir ? { rootDir } : {}),
+    });
+    expect(resolveRef(['path', 'root'], at('/work/infra', '/work/infra'))).toBe('.');
+    expect(resolveRef(['path', 'module'], at('/work/infra', '/work/infra'))).toBe('.');
+    expect(resolveRef(['path', 'module'], at('/work/infra/modules/vpc', '/work/infra'))).toBe(
+      'modules/vpc',
+    );
+    expect(resolveRef(['path', 'module'], at('/work/shared/vpc', '/work/infra'))).toBe(
+      '../shared/vpc',
+    );
+  });
+
+  it('leaves path.module and path.root unknown when the root module is not known', () => {
+    const noRoot: EvalScope = { index: scope.index, moduleDir: '/work/infra' };
+    expect(resolveRef(['path', 'module'], noRoot)).toBe(UNKNOWN);
+    expect(resolveRef(['path', 'root'], noRoot)).toBe(UNKNOWN);
+  });
+
+  it('keeps path.cwd absolute and only when it is configured', () => {
+    expect(resolveRef(['path', 'cwd'], { ...scope, cwd: '/terraform-run' })).toBe('/terraform-run');
+    expect(resolveRef(['path', 'cwd'], scope)).toBe(UNKNOWN);
+  });
+
   it('format supports %q (quoted) and %% (literal percent)', () => {
     expect(resolveExpr('format("env is %q", var.env)', scope)).toBe('env is "dev"');
     expect(resolveExpr('format("100%% %s", var.env)', scope)).toBe('100% dev');

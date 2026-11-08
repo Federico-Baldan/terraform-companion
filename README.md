@@ -74,6 +74,8 @@ The hover shows the value's character count. This helps catch names that exceed 
 
 It follows the whole chain. `local.name = "app-${var.env}"` with `var.env = "dev"` in tfvars resolves to `app-dev`, not `dev`. Inside a called module, `var.*` comes from the call site and traces back to the root and its tfvars. If nobody passes a value, it falls back to the module's default. When two `module` blocks pass different values, the hover shows one line per instance.
 
+In a `resource`, `data`, `module` or `ephemeral` block, `count.index`, `each.key` and `each.value` resolve one line per instance, when the `count` or `for_each` value can be worked out from the file (up to 64 instances). Nested blocks are not covered. `path.root` and `path.module` are relative to the root module, as in Terraform, so they need `terraformRoot`. `path.cwd` needs `terraformCwd`.
+
 A status bar item pins the active tfvars file when auto-loading is not enough. The pin behaves like `-var-file`: it belongs to the module where you set it, while the file can live anywhere, such as `environments/prod.tfvars` beside the module or in a parent folder. Each module keeps its own pin, and the status bar reports the pin for the file you're viewing.
 
 The picker lists files the module could read, using paths relative to the module so similarly named files remain distinct. It identifies module folders by their `.tf` files, not their names. A module's entire subtree belongs to it, so `other/env/prod.tfvars` belongs to `other` just like `other/prod.tfvars`. Other nearby tfvars folders are also included, such as `environments/prod/`, `live/prod/vpc/`, and `config/`. Results are ordered by proximity: folders in the current module rank first regardless of name, self-named folders rank next, and other modules' subtrees rank lower. In a monorepo, shared `environments/` folders stay above sibling teams' folders. The picker only shows a shortlist. **Browse…** reaches the rest, including files outside the workspace.
@@ -129,6 +131,8 @@ All keys are under `tfCompanion.`
 | `versionLens.enabled` | `true` | |
 | `versionLens.cacheTtlHours` | `6` | floored at 5 minutes |
 | `resolvedHover.enabled` | `true` | |
+| `terraformRoot` | unset | directory of the root module; the hover needs it for `path.root` and `path.module` |
+| `terraformCwd` | unset | directory Terraform runs from; the hover needs it for `path.cwd` |
 | `countForEach.enabled` | `true` | |
 | `dependsOn.enabled` | `true` | |
 | `unusedLocals.enabled` | `true` | |

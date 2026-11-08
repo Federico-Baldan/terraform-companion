@@ -104,11 +104,11 @@
         },
         "tfCompanion.terraformCwd": {
           "type": "string",
-          "description": "Explicit Terraform invocation directory used to resolve path.cwd; left unset when unknown"
+          "description": "Directory Terraform is invoked from, used to resolve path.cwd in the resolved-value hover. Unset means path.cwd stays unknown"
         },
         "tfCompanion.terraformRoot": {
           "type": "string",
-          "description": "Explicit Terraform root module directory used to resolve path.root; left unset when unknown"
+          "description": "Directory of the Terraform root module. Terraform reports path.root and path.module relative to it, so the hover needs it for both. Unset means they stay unknown"
         }
       }
     }

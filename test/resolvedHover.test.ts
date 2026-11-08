@@ -700,6 +700,19 @@ describe('Terraform context hover', () => {
     expect(md).not.toContain('differs per');
   });
 
+  it('walks into an each.value object, one row per instance', async () => {
+    const md = await hover(
+      'resource "x" "item" {\n  for_each = { api = { size = "small" }, web = { size = "large" } }\n  size = each.value.size\n}\n',
+      2,
+      10,
+    );
+    expect(md).toContain('each.key = api');
+    expect(md).toContain('`small`');
+    expect(md).toContain('each.key = web');
+    expect(md).toContain('`large`');
+    expect(md).not.toContain('⟨unknown⟩');
+  });
+
   it('uses explicit path context and leaves unavailable cwd unknown', async () => {
     const md = await hover(
       'locals { paths = "${path.module}|${path.root}|${path.cwd}" }\nresource "x" "item" {\n  name = local.paths\n}\n',
@@ -707,7 +720,8 @@ describe('Terraform context hover', () => {
       10,
       { rootDir: '/context', cwd: '/terraform-run' },
     );
-    expect(md).toContain('/context|/context|/terraform-run');
+    // module and root are relative to the root module, cwd is the absolute run directory
+    expect(md).toContain('.|.|/terraform-run');
     const noRoot = await hover('resource "x" "item" { name = path.root }\n', 0, 35);
     expect(noRoot).toContain('⟨unknown⟩');
     const unknown = await hover('resource "x" "item" { name = path.cwd }\n', 0, 35);

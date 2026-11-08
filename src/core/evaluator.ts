@@ -1,3 +1,4 @@
+import { relative } from 'node:path';
 import type { Node } from 'web-tree-sitter';
 import { attrOf } from './hcl';
 import type { TfBlock } from './model';
@@ -579,8 +580,10 @@ function compareCodePoints(a: string, b: string): number {
 function callFunction(name: string, args: Value[], scope: EvalScope): Value {
   switch (name) {
     case 'join': {
-      const [sep, list] = args;
+      const [sep, given] = args;
       const delim = asString(sep);
+      // a set converts to the list `join` asks for, in the order the set keeps
+      const list = given instanceof SetValue ? given.values : given;
       if (delim === undefined || !Array.isArray(list)) return undefined;
       const items = list.map(asString);
       if (!items.every((i) => i !== undefined)) return undefined;
@@ -613,6 +616,8 @@ function callFunction(name: string, args: Value[], scope: EvalScope): Value {
     }
     case 'toset': {
       const list = args[0];
+      // already a set: converting again changes nothing
+      if (list instanceof SetValue) return list;
       if (!Array.isArray(list)) return undefined;
       // sets dedupe and sort lexically, but only for known strings — anything
       // else keeps its elements for shape checks
@@ -842,17 +847,22 @@ function resolveRefValue(parts: string[], scope: EvalScope, depth: number): Valu
     return undefined;
   }
   if (head === 'each' && name === 'value') {
-    if (parts.length !== 2) return undefined;
-    if (scope.context) {
-      if (scope.context.eachValue === undefined) return undefined;
-      return internalValue(scope.context.eachValue, scope.isCancelled);
-    }
-    return undefined;
+    if (scope.context?.eachValue === undefined) return undefined;
+    // `each.value.size` is the usual spelling: the attribute walk is the same
+    // one `var.x.y` gets, over the instance's own value
+    return walkPath(internalValue(scope.context.eachValue, scope.isCancelled), parts.slice(2));
   }
   if (head === 'path' && (name === 'module' || name === 'root' || name === 'cwd')) {
     if (parts.length !== 2) return undefined;
-    const path = name === 'module' ? scope.moduleDir : name === 'root' ? scope.rootDir : scope.cwd;
-    return path === undefined ? undefined : path;
+    if (name === 'cwd') return scope.cwd;
+    // Terraform hands back a module's SourceDir as it was loaded, relative to the
+    // root module's directory, and makes only path.cwd absolute (GetPathAttr in
+    // hashicorp/terraform internal/terraform/evaluate.go). Showing the absolute
+    // directory would give a value Terraform never produces, so these need the
+    // root to be known — and stay unknown without it rather than guess.
+    if (scope.rootDir === undefined) return undefined;
+    if (name === 'root') return '.';
+    return relative(scope.rootDir, scope.moduleDir).split('\\').join('/') || '.';
   }
   if (head !== 'var' && head !== 'local') return undefined;
   const path = parts.slice(2);
