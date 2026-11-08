@@ -226,6 +226,15 @@ function resolvedListUnusable(
   };
   const used = emptyUsage();
   const shape = listShape(refText, { ...base, used, pinnedSites });
+  // A variable's value comes from its callers and its tfvars, and a file too large
+  // to read can be either: it may call this module with another list, or set the
+  // variable. What was resolved is only what the files that were read say.
+  if (
+    index.hasUnreadFile() &&
+    (used.defaults.size > 0 || used.tfvars.size > 0 || used.calls.size > 0)
+  ) {
+    return true;
+  }
   const diverged = used.divergedAt;
   if (!diverged) return shapeUnusable(shape);
   // That module's call site is already pinned, so what diverged was not one site

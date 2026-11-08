@@ -1186,6 +1186,11 @@ function siteLabels(sites: ModuleCallSite[]): string[] {
  *  called-module vars come from the call site (evaluated in the caller's
  *  scope, up to the root) then default — never from tfvars. */
 function resolveVar(name: string, scope: EvalScope, depth: number): Value {
+  // A variable is set by its callers and its tfvars, and a file too large to read
+  // can be either, so the value is only what the files that were read say.
+  if (scope.index.hasUnreadFile()) {
+    scope.used?.assumes.add('no file over 1 MiB, which was not read, sets this');
+  }
   const pinned = scope.pinnedSites?.get(scope.moduleDir);
   // having call sites is what makes a dir a "called module" — no separate root
   // flag to drift out of sync and let stray tfvars outrank the call site

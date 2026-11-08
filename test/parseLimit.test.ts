@@ -1,6 +1,8 @@
 import { beforeAll, describe, expect, it } from 'vitest';
+import { emptyUsage, resolveRef } from '../src/core/evaluator';
 import { parseFile, withExpressionNode } from '../src/core/parser';
 import { WorkspaceIndex } from '../src/core/workspaceIndex';
+import { detectCountLength } from '../src/features/countForEach';
 import { detectUnusedLocals } from '../src/features/unusedLocals';
 import { initTestParser } from './helpers';
 
@@ -50,10 +52,11 @@ describe('a file past the parse limit', () => {
   });
 
   it('does not push a file the extension is using out of the parse memo', () => {
-    const small = 'locals {\n  a = 1\n}\n';
-    const first = parseFile('/limit/small.tf', small);
+    // the memo holds eight files: with it full, a ninth entry would evict the first
+    const small = (i: number) => `locals {\n  a${i} = ${i}\n}\n`;
+    const parsed = Array.from({ length: 8 }, (_, i) => parseFile(`/limit/s${i}.tf`, small(i)));
     parseFile('/limit/huge.tf', sourceOfLength(LIMIT + 1));
-    expect(parseFile('/limit/small.tf', small)).toBe(first);
+    expect(parseFile('/limit/s0.tf', small(0))).toBe(parsed[0]);
   });
 
   it('keeps the module from claiming a local is unused', async () => {
@@ -75,6 +78,13 @@ describe('a file past the parse limit', () => {
     expect(await index.updateFile('/limit/twice.tf', source)).toBe(false);
   });
 
+  it('hands the expression parser a text of exactly the limit', () => {
+    // a number with trailing blanks: a valid expression of exactly LIMIT characters
+    const expr = `1${' '.repeat(LIMIT - 1)}`;
+    expect(expr).toHaveLength(LIMIT);
+    expect(withExpressionNode(expr, (node) => node.text)).toBe('1');
+  });
+
   it('is not handed to the expression parser either', () => {
     let used = false;
     const expr = `[${'1,'.repeat(LIMIT / 2)}1]`;
@@ -86,5 +96,70 @@ describe('a file past the parse limit', () => {
       }),
     ).toBeUndefined();
     expect(used).toBe(false);
+  });
+});
+
+/** A file nobody read cannot be ruled out as the one that calls a module, sets a
+ *  variable, or references a name. `moduleHasParseError` covers the siblings in
+ *  one directory; the rest of the workspace needs its own answer. */
+describe('a file past the parse limit, seen from the rest of the workspace', () => {
+  const unread = (tail = '') => sourceOfLength(LIMIT + 1, tail);
+
+  it('is known to the index for as long as it is there', async () => {
+    const index = new WorkspaceIndex();
+    expect(index.hasUnreadFile()).toBe(false);
+    await index.updateFile('/u/a.tf', unread());
+    expect(index.hasUnreadFile()).toBe(true);
+    await index.updateFile('/u/a.tf', 'locals {\n  a = 1\n}\n');
+    expect(index.hasUnreadFile()).toBe(false);
+    await index.updateFile('/u/b.tfvars', unread());
+    expect(index.hasUnreadFile()).toBe(true);
+    index.removeFile('/u/b.tfvars');
+    expect(index.hasUnreadFile()).toBe(false);
+  });
+
+  const child = `variable "names" {
+  default = ["a", "b"]
+}
+resource "aws_instance" "srv" {
+  count = length(var.names)
+  name  = var.names[count.index]
+}
+`;
+  const safeToRefactor = (index: WorkspaceIndex) =>
+    detectCountLength(parseFile('/w/modules/app/main.tf', child), index, {
+      tfvarsOf: () => new Map(),
+    })[0]?.safeToRefactor;
+
+  it('withholds the count -> for_each rewrite: its caller may be the file nobody read', async () => {
+    const index = new WorkspaceIndex();
+    await index.updateFile('/w/modules/app/main.tf', child);
+    // the caller sits in another directory and would pass duplicates; unread, the
+    // module looks like a root and resolves to its own default
+    await index.updateFile(
+      '/w/env/main.tf',
+      unread('module "app" {\n  source = "../modules/app"\n  names = ["dup", "dup"]\n}\n'),
+    );
+    expect(safeToRefactor(index)).toBe(false);
+  });
+
+  it('leaves the rewrite alone when every file was read', async () => {
+    const index = new WorkspaceIndex();
+    await index.updateFile('/w/modules/app/main.tf', child);
+    expect(safeToRefactor(index)).toBe(true);
+  });
+
+  it('tells the hover that a value rests on something not read', async () => {
+    const index = new WorkspaceIndex();
+    await index.updateFile('/w/m/main.tf', 'variable "env" {\n  default = "dev"\n}\n');
+    const read = emptyUsage();
+    expect(resolveRef(['var', 'env'], { index, moduleDir: '/w/m', used: read })).toBe('dev');
+    expect([...read.assumes]).toEqual([]);
+
+    // a tfvars that would have set it, and was too large to read
+    await index.updateFile('/w/m/terraform.tfvars', unread());
+    const used = emptyUsage();
+    expect(resolveRef(['var', 'env'], { index, moduleDir: '/w/m', used })).toBe('dev');
+    expect([...used.assumes]).toEqual([expect.stringContaining('over 1 MiB')]);
   });
 });

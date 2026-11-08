@@ -188,6 +188,8 @@ export class WorkspaceIndex {
   private filesByDir = new Map<string, string[]>();
   private dirIndex?: DirIndex;
   private gen = 0;
+  /** Indexed files past the parse limit: held, but with nothing read from them. */
+  private unread = new Set<string>();
 
   /** Index every file the host lists, skipping ones it can't read.
    *
@@ -261,6 +263,8 @@ export class WorkspaceIndex {
     if (previous?.source === source) return false;
     const parsed = parseFile(p, source);
     this.parsed.set(p, parsed);
+    if (parsed.tooLarge) this.unread.add(p);
+    else this.unread.delete(p);
     if (!previous && p.endsWith('.tf')) {
       const list = this.filesByDir.get(dirOf(p));
       if (list) list.push(p);
@@ -293,6 +297,7 @@ export class WorkspaceIndex {
     // generation-keyed memo for nothing
     if (!previous) return;
     this.parsed.delete(p);
+    this.unread.delete(p);
     const dir = dirOf(p);
     const list = this.filesByDir.get(dir);
     if (list) {
@@ -422,6 +427,17 @@ export class WorkspaceIndex {
       if (file) out.push(file);
     }
     return out;
+  }
+
+  /** Whether any file in the workspace was too large to read.
+   *
+   *  `moduleHasParseError` answers for the files of one directory. This answers
+   *  for everything else: a file nobody read can be the caller of a module, the
+   *  tfvars that sets a variable, or the only place a name is used, and none of
+   *  those can be ruled out from where they are not. Anything that concludes
+   *  from what the index does *not* hold has to ask this first. */
+  hasUnreadFile(): boolean {
+    return this.unread.size > 0;
   }
 
   /** Whether any indexed file in this directory needed error recovery to parse.
