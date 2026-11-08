@@ -365,7 +365,7 @@ provider "registry.terraform.io/hashicorp/random" {
 
     /** Following links is what lets a lock file behind one protect its
      *  providers, so a link that could not be followed is a project nobody read. */
-    it.skipIf(process.getuid?.() === 0)(
+    it.skipIf(process.platform === 'win32' || process.getuid?.() === 0)(
       'says the scan is incomplete when a linked directory cannot be reached',
       async () => {
         const locked = join(outside, 'locked');
@@ -381,6 +381,62 @@ provider "registry.terraform.io/hashicorp/random" {
         }
       },
     );
+
+    it('ignores a link in a loop, and a link through a file: neither leads to a project', async () => {
+      symlinkSync('loop', join(root, 'loop'));
+      writeFileSync(join(root, 'file'), 'x');
+      symlinkSync(join(root, 'file', 'x'), join(root, 'through-file'));
+      expect((await collectProviderSources(root)).complete).toBe(true);
+    });
+
+    it.skipIf(process.platform === 'win32' || process.getuid?.() === 0)(
+      'says the scan is incomplete when what a symlinked .terraform links in cannot be listed',
+      async () => {
+        const real = join(outside, 'dot-terraform');
+        mkdirSync(join(real, 'providers'), { recursive: true });
+        mkdirSync(join(root, 'proj'));
+        symlinkSync(real, join(root, 'proj', '.terraform'));
+        chmodSync(join(real, 'providers'), 0o000);
+        try {
+          expect((await collectProviderSources(root)).complete).toBe(false);
+        } finally {
+          chmodSync(join(real, 'providers'), 0o700);
+        }
+      },
+    );
+
+    it('counts entries across the whole walk, not per directory, and says the limit was why', async () => {
+      let dir = root;
+      for (let i = 0; i < 6; i++) {
+        dir = join(dir, `d${i}`);
+        mkdirSync(dir);
+        writeFileSync(join(dir, 'f.tf'), '');
+      }
+      // no directory holds more than two entries, the tree holds twelve
+      const scan = await collectProviderSources(root, undefined, 8);
+      expect(scan.complete).toBe(false);
+      expect(scan.limited).toBe(true);
+      mkdirSync(join(outside, 'mod'));
+      symlinkSync(join(outside, 'missing.hcl'), join(outside, 'mod', '.terraform.lock.hcl'));
+      const unreadable = await collectProviderSources(join(outside, 'mod'));
+      expect(unreadable.complete).toBe(false);
+      expect(unreadable.limited).toBe(false);
+    });
+
+    /** What a project downloaded under .terraform/modules is somebody else's
+     *  module, and a walk through it is what used up the budget in a terragrunt
+     *  tree. Terraform reads one lock file, the root module's. */
+    it('does not walk the modules a project downloaded', async () => {
+      const downloaded = join(root, 'proj', '.terraform', 'modules', 'vpc');
+      mkdirSync(downloaded, { recursive: true });
+      writeFileSync(
+        join(downloaded, '.terraform.lock.hcl'),
+        'provider "registry.terraform.io/example/trap" {\n}\n',
+      );
+      writeFileSync(join(root, 'proj', '.terraform.lock.hcl'), LOCK);
+      const { sources } = await collectProviderSources(root);
+      expect([...sources]).toEqual(['registry.terraform.io/hashicorp/aws']);
+    });
 
     it('ignores a link to nothing, which has no lock file to find', async () => {
       symlinkSync(join(outside, 'gone'), join(root, 'dangling'));
@@ -599,6 +655,17 @@ provider "registry.terraform.io/hashicorp/random" {
       expect(await configuredProviderCache()).toBe(join(root, '.terraform.d', 'plugin-cache'));
     });
 
+    /** The name alone says it is a mirror, wherever the link leads. */
+    it('refuses a directory named like a local provider mirror, even if it is a link elsewhere', async () => {
+      const real = join(root, 'real-cache');
+      mkdirSync(real);
+      mkdirSync(join(root, '.terraform.d'));
+      const named = join(root, '.terraform.d', 'plugins');
+      symlinkSync(real, named);
+      process.env.TF_PLUGIN_CACHE_DIR = named;
+      expect(await configuredProviderCache()).toBeUndefined();
+    });
+
     it('refuses a directory that is a link to a local provider mirror', async () => {
       const mirror = join(root, '.terraform.d', 'plugins');
       mkdirSync(mirror, { recursive: true });
@@ -735,6 +802,44 @@ provider "registry.terraform.io/hashicorp/random" {
         // `$TFC_TEST_MIRROR` is a relative path to Terraform, hence the doubt
         expect((await refused()).join('\n')).toContain('relative');
         delete process.env.TFC_TEST_MIRROR;
+      });
+
+      /** HCL v1 takes a file for JSON when its first character is `{`, whatever
+       *  the file is called. */
+      it('tells JSON from HCL by what a file holds, not by its name', async () => {
+        const dir = cache();
+        const hclNamedJson = join(root, 'looks-like.tfrc.json');
+        writeFileSync(hclNamedJson, `plugin_cache_dir = "${dir}"\n`);
+        process.env.TF_CLI_CONFIG_FILE = hclNamedJson;
+        expect(await configuredProviderCache()).toBe(dir);
+
+        const jsonNamedRc = join(root, 'looks-like.tfrc');
+        writeFileSync(jsonNamedRc, `  \n{"plugin_cache_dir": "${dir}"}`);
+        process.env.TF_CLI_CONFIG_FILE = jsonNamedRc;
+        expect(await configuredProviderCache()).toBe(dir);
+
+        // and the mirrors are read the same way
+        process.env.TF_PLUGIN_CACHE_DIR = dir;
+        writeFileSync(hclNamedJson, withMirror(dir));
+        process.env.TF_CLI_CONFIG_FILE = hclNamedJson;
+        await refused();
+        writeFileSync(
+          jsonNamedRc,
+          JSON.stringify({ provider_installation: { filesystem_mirror: { path: dir } } }),
+        );
+        process.env.TF_CLI_CONFIG_FILE = jsonNamedRc;
+        await refused();
+      });
+
+      it('says when it skipped a config file it could not parse', async () => {
+        const dir = cache();
+        process.env.TF_PLUGIN_CACHE_DIR = dir;
+        const broken = join(root, 'broken.tfrc.json');
+        writeFileSync(broken, '{ not json');
+        process.env.TF_CLI_CONFIG_FILE = broken;
+        const logged: string[] = [];
+        expect(await configuredProviderCache((m) => logged.push(m))).toBe(dir);
+        expect(logged.join('\n')).toContain(broken);
       });
     });
 

@@ -347,6 +347,43 @@ describe('shared provider cache', () => {
     expect(mock.infos[0]).toContain('kept 1 provider version');
   });
 
+  /** Another window can finish the same delete while the prompt is open. That
+   *  is not a project that started using the provider. */
+  it('does not say a provider was kept when another window already removed it', async () => {
+    const { version } = provider(UNUSED);
+    enable();
+    mock.warningAnswers = ['Review…'];
+    mock.pick = (items) => {
+      rmSync(version, { recursive: true });
+      return items;
+    };
+    await run();
+
+    expect(mock.infos).toEqual([]);
+    expect(mock.warnings).toHaveLength(1);
+  });
+
+  it('leaves the cache alone when any one of several folders cannot be read, in either order', async () => {
+    const { version } = provider(UNUSED);
+    enable();
+    const other = mkdtempSync(join(tmpdir(), 'tfc-other-'));
+    try {
+      mkdirSync(join(other, 'mod'));
+      symlinkSync(join(cacheHome, 'missing.hcl'), join(other, 'mod', '.terraform.lock.hcl'));
+      for (const folders of [
+        [root, other],
+        [other, root],
+      ]) {
+        mock.folders = folders.map((fsPath) => ({ uri: { fsPath } }));
+        await run();
+      }
+      expect(mock.warnings).toEqual([]);
+      expect(existsSync(version)).toBe(true);
+    } finally {
+      rmSync(other, { recursive: true, force: true });
+    }
+  });
+
   it('deletes nothing if the lock files cannot be read again', async () => {
     const { version } = provider(UNUSED);
     enable();

@@ -198,22 +198,32 @@ function filesystemMirrorPathsOfJson(text: string): string[] {
  *  names the cache: Terraform appends the `provider_installation` blocks of all of
  *  them, and the cache may come from `TF_PLUGIN_CACHE_DIR`. Taken as written,
  *  since Terraform neither expands nor checks it. */
-async function filesystemMirrorPaths(): Promise<string[]> {
+async function filesystemMirrorPaths(log?: (m: string) => void): Promise<string[]> {
   const paths: string[] = [];
   for (const candidate of await cliConfigFiles()) {
     try {
       const text = await readFile(candidate, 'utf8');
       paths.push(
-        ...(candidate.endsWith('.json')
-          ? filesystemMirrorPathsOfJson(text)
-          : filesystemMirrorPathsOf(text)),
+        ...(isJsonConfig(text) ? filesystemMirrorPathsOfJson(text) : filesystemMirrorPathsOf(text)),
       );
-    } catch {
-      // An absent or unparseable CLI config is normal; Terraform itself would
-      // refuse the second, and neither can name a mirror.
+    } catch (e) {
+      skippedConfig(candidate, e, log);
     }
   }
   return paths;
+}
+
+/** HCL v1 takes a file for JSON when its first non-blank character is `{`,
+ *  whatever the file is called. */
+function isJsonConfig(text: string): boolean {
+  return text.trimStart().startsWith('{');
+}
+
+/** An absent CLI config is normal. One that is there and could not be read or
+ *  parsed is skipped, which Terraform itself would not do, so it is said. */
+function skippedConfig(file: string, error: unknown, log?: (m: string) => void): void {
+  if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+  log?.(`cacheCleaner: CLI config ${file} skipped: ${error}`);
 }
 
 /** Whether two paths are one directory: through links, trailing separators and,
@@ -268,7 +278,7 @@ export async function configuredProviderCache(
       return undefined;
     }
     // a mirror declared in the CLI config: Terraform says the cache must not be one
-    for (const mirror of await filesystemMirrorPaths()) {
+    for (const mirror of await filesystemMirrorPaths(log)) {
       if (!isAbsoluteFsPath(mirror)) {
         // Terraform resolves it against its own working directory, which could
         // make it this very directory, and nothing here can tell
@@ -291,12 +301,10 @@ export async function configuredProviderCache(
   for (const candidate of await cliConfigFiles()) {
     try {
       const text = await readFile(candidate, 'utf8');
-      const configured = candidate.endsWith('.json')
-        ? pluginCacheDirOfJson(text)
-        : pluginCacheDirOf(text);
+      const configured = isJsonConfig(text) ? pluginCacheDirOfJson(text) : pluginCacheDirOf(text);
       if (configured) return usable(expandEnv(configured));
-    } catch {
-      // An absent or unparseable CLI config is normal; callers log only actual scan failures.
+    } catch (e) {
+      skippedConfig(candidate, e, log);
     }
   }
   return undefined;
@@ -371,7 +379,7 @@ const MAX_SIZE_ENTRIES = 50_000;
  *  symlinks, so a link to `/usr` would otherwise cost every scan, and the second
  *  one after the prompt, half a minute. Past the budget the scan reports itself
  *  incomplete, which switches the shared-cache sweep off. */
-const MAX_LOCK_WALK_ENTRIES = 200_000;
+export const MAX_LOCK_WALK_ENTRIES = 200_000;
 
 /** Bounded and cancellable: this recurses into a module checkout, which for a
  *  git-sourced module is a full clone, and the total exists only to render a
@@ -638,6 +646,9 @@ export interface ProviderSourceScan {
    *  incomplete set means "unprotected" for exactly the providers a missed lock
    *  file would have named — the caller must not delete on it. */
   complete: boolean;
+  /** True when the walk stopped because the workspace holds more entries than
+   *  `MAX_LOCK_WALK_ENTRIES`. `complete` is false then too; this says why. */
+  limited: boolean;
 }
 
 /** `SKIP` minus `.terragrunt-cache`. The sweep for stale `.terraform` folders
@@ -688,6 +699,7 @@ export async function collectProviderSources(
 ): Promise<ProviderSourceScan> {
   const sources = new Set<string>();
   let complete = true;
+  let limited = false;
   let left = maxEntries;
   const seen = new Set<string>();
   const visit = async (dir: string, real: string, depth: number): Promise<void> => {
@@ -713,6 +725,7 @@ export async function collectProviderSources(
     left -= entries.length;
     if (left < 0) {
       complete = false;
+      limited = true;
       return;
     }
     for (const de of entries) {
@@ -734,7 +747,10 @@ export async function collectProviderSources(
         if (LOCK_SKIP.has(de.name)) continue;
         // what the project links in is already read from the directory names; the
         // links themselves lead into the shared cache, which is no place to walk
-        if (de.name === 'providers' && basename(dir) === '.terraform') continue;
+        // `modules` holds what the project downloaded: somebody else's code, whose
+        // lock files Terraform never reads, and the bulk of a terragrunt tree
+        if ((de.name === 'providers' || de.name === 'modules') && basename(dir) === '.terraform')
+          continue;
         if (de.name === '.terraform') {
           const linked = await providerSourcesFromDotTerraform(path);
           for (const source of linked.sources) sources.add(source);
@@ -769,7 +785,7 @@ export async function collectProviderSources(
     complete = false;
   }
   await visit(root, rootReal, 0);
-  return { sources, complete };
+  return { sources, complete, limited };
 }
 
 /** Newest mtime among the descendants of `dir` (not `dir` itself), with the

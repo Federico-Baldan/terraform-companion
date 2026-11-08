@@ -1,3 +1,4 @@
+import { lstat } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, relative } from 'node:path';
 import * as vscode from 'vscode';
 import {
@@ -18,6 +19,7 @@ import {
   isProviderEntryStillStale,
   isStillStale,
   isTerraformCacheDir,
+  MAX_LOCK_WALK_ENTRIES,
   type ProviderCacheEntry,
   type StaleCache,
 } from './cacheCleaner';
@@ -138,21 +140,23 @@ async function readLockSources(
   folders: readonly { uri: { fsPath: string } }[],
   cancelled: () => boolean,
   log: (m: string) => void,
-): Promise<{ sources: Set<string>; complete: boolean }> {
+): Promise<{ sources: Set<string>; complete: boolean; limited: boolean }> {
   const sources = new Set<string>();
   let complete = folders.length > 0;
+  let limited = false;
   for (const folder of folders) {
     const root = folder.uri.fsPath;
     try {
       const locks = await collectProviderSources(root, cancelled);
       for (const source of locks.sources) sources.add(source);
       if (!locks.complete) complete = false;
+      if (locks.limited) limited = true;
     } catch (e) {
       complete = false;
       log(`cacheCleaner: lock file scan failed in ${root}: ${e}`);
     }
   }
-  return { sources, complete };
+  return { sources, complete, limited };
 }
 
 async function reviewProviders(
@@ -214,6 +218,7 @@ export async function scan(
   // this run. An incomplete set does not mean "protects less", it means "offers
   // for deletion exactly what the unread lock file named".
   let lockFilesRead = folders.length > 0;
+  let lockScanLimited = false;
   for (const folder of folders) {
     // a multi-root workspace must not start the next folder's walk either
     if (cancelled()) return;
@@ -235,6 +240,7 @@ export async function scan(
     const locks = await readLockSources([folder], cancelled, log);
     for (const source of locks.sources) protectedSources.add(source);
     if (!locks.complete) lockFilesRead = false;
+    if (locks.limited) lockScanLimited = true;
   }
   // workspace folders may nest — VS Code allows both /repo and /repo/infra —
   // and a cache under both is found once per folder. Counted twice it inflates
@@ -257,7 +263,9 @@ export async function scan(
       log(
         folders.length === 0
           ? 'cacheCleaner: provider cache left alone — no workspace folder is open, so no lock file can say what is in use'
-          : 'cacheCleaner: provider cache left alone — not every lock file in the workspace could be read',
+          : lockScanLimited
+            ? `cacheCleaner: provider cache left alone — the workspace holds more than ${MAX_LOCK_WALK_ENTRIES} entries to read for lock files, so it cannot be sure what is in use`
+            : 'cacheCleaner: provider cache left alone — not every lock file in the workspace could be read',
       );
     }
   }
@@ -451,6 +459,17 @@ export async function scan(
     if (cancelled()) return;
     // the prompt may have sat open while another project ran terraform init
     if (!(await isProviderEntryStillStale(entry.dir, staleDays))) {
+      // another window can finish the same delete: that is not a project that
+      // started using the provider, and saying so would be wrong
+      if (
+        await lstat(entry.dir).then(
+          () => false,
+          () => true,
+        )
+      ) {
+        log(`cacheCleaner: provider ${entry.dir} is already gone`);
+        continue;
+      }
       log(`cacheCleaner: skipped provider ${entry.dir} (used since the scan)`);
       providerSpared++;
       continue;
