@@ -89,4 +89,20 @@ describe('parseFile memo', () => {
     // the debounced index update lands on the parse a provider already paid for
     expect(index.file('/memo/g/main.tf')).toBe(live);
   });
+
+  /** The count above bounds the memo for the files people write. A few hundred
+   *  kilobytes each is the other case: a parse holds ~22x its source in objects, so
+   *  eight files near the parse limit would sit on ~190MB for the sake of a burst
+   *  that lasts a moment. */
+  it('is bounded by the text it holds as well as by how many files', () => {
+    const text = (c: string) => `# ${c.repeat(800_000)}\n`;
+    const a = parseFile('/memo/h-a.tf', text('a'));
+    parseFile('/memo/h-b.tf', text('b'));
+    const c = parseFile('/memo/h-c.tf', text('c'));
+    // three files of 800k characters are 2.4M, past the 2 MiB the memo keeps: the
+    // oldest goes although the count alone would have kept it...
+    expect(parseFile('/memo/h-a.tf', text('a'))).not.toBe(a);
+    // ...and the newest never does
+    expect(parseFile('/memo/h-c.tf', text('c'))).toBe(c);
+  });
 });

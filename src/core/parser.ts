@@ -292,7 +292,32 @@ export const MAX_PARSE_CHARS = 1_048_576;
  *  index keeps the files it knows about on its own; this only has to outlast the
  *  burst that follows one edit. */
 const MEMO_FILES = 8;
+/** The count bounds the memo for the files people write; this bounds it for the
+ *  ones that are large. Eight files near the parse limit would otherwise sit on
+ *  ~190MB for the sake of a burst that lasts a moment. Two parse limits of source
+ *  is a handful of ordinary files with room to spare, and the newest entry is
+ *  always kept, so one file is never refused. */
+const MEMO_CHARS = 2 * MAX_PARSE_CHARS;
+let memoChars = 0;
 const memo = new Map<string, ParsedFile>();
+
+function remember(path: string, parsed: ParsedFile): void {
+  const replaced = memo.get(path);
+  if (replaced) {
+    memoChars -= replaced.source.length;
+    memo.delete(path);
+  }
+  memo.set(path, parsed);
+  memoChars += parsed.source.length;
+  // oldest first; never the one just stored, which is what the caller is about to
+  // share between the providers that ask
+  while ((memo.size > MEMO_FILES || memoChars > MEMO_CHARS) && memo.size > 1) {
+    const oldest = memo.keys().next();
+    if (oldest.done) break;
+    memoChars -= memo.get(oldest.value)?.source.length ?? 0;
+    memo.delete(oldest.value);
+  }
+}
 
 /** Parse `source` as the file at `path`.
  *
@@ -321,12 +346,7 @@ export function parseFile(path: string, source: string): ParsedFile {
   }
   // not remembered if it throws: a failed parse leaves nothing behind to serve
   const parsed = parseUncached(path, source);
-  memo.delete(path);
-  memo.set(path, parsed);
-  if (memo.size > MEMO_FILES) {
-    const oldest = memo.keys().next();
-    if (!oldest.done) memo.delete(oldest.value);
-  }
+  remember(path, parsed);
   return parsed;
 }
 
