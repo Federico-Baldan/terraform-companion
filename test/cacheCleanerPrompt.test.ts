@@ -264,6 +264,125 @@ describe('shared provider cache', () => {
     expect(mock.infos).toEqual([]);
   });
 
+  /** Reuse leaves no trace in the cache, so the only way to learn that a
+   *  provider became needed while the prompt was open is to read the lock files
+   *  again just before deleting. */
+  it('reads the lock files again before deleting, so a provider named meanwhile survives', async () => {
+    const { version } = provider(UNUSED);
+    enable();
+    mock.warningAnswers = ['Review…'];
+    mock.pick = (items) => {
+      lockFile('proj', UNUSED); // a terraform init in this workspace, mid-prompt
+      return items;
+    };
+    await run();
+
+    expect(existsSync(version)).toBe(true);
+    expect(mock.infos).toEqual([]);
+  });
+
+  it('deletes nothing if the lock files cannot be read again', async () => {
+    const { version } = provider(UNUSED);
+    enable();
+    mock.warningAnswers = ['Review…'];
+    mock.pick = (items) => {
+      mkdirSync(join(root, 'mod'));
+      symlinkSync(join(cacheHome, 'missing.hcl'), join(root, 'mod', '.terraform.lock.hcl'));
+      return items;
+    };
+    await run();
+
+    expect(existsSync(version)).toBe(true);
+  });
+
+  it('protects a project whose .terraform/providers links into the cache, with or without a lock file', async () => {
+    const { version } = provider(UNUSED);
+    enable();
+    const linked = join(root, 'proj', '.terraform', 'providers', ...UNUSED.split('/'), '1.0.0');
+    mkdirSync(join(linked, '..'), { recursive: true });
+    symlinkSync(version, linked);
+    await run();
+
+    expect(mock.warnings).toEqual([]);
+    expect(existsSync(version)).toBe(true);
+  });
+
+  it('stays quiet for a week after Esc or an emptied review', async () => {
+    provider(UNUSED);
+    for (const pick of [() => undefined, () => []] as (() => QuickPickItem[] | undefined)[]) {
+      resetVscodeMock();
+      mock.folders = [{ uri: { fsPath: root } }];
+      enable();
+      mock.warningAnswers = ['Review…'];
+      mock.pick = pick;
+      const state = memento();
+      await scan(silent, () => false, state);
+      await scan(silent, () => false, state);
+      expect(mock.warnings).toHaveLength(1);
+    }
+  });
+
+  it('stays quiet for a week after keeping some of what was offered', async () => {
+    provider(UNUSED);
+    provider('registry.terraform.io/example/other');
+    enable();
+    mock.warningAnswers = ['Review…'];
+    mock.pick = (items) => items.filter((i) => i.label.includes('unused'));
+    const state = memento();
+    await scan(silent, () => false, state);
+    await scan(silent, () => false, state);
+    expect(mock.warnings).toHaveLength(1);
+  });
+
+  it('says so when an entry could not be removed', async () => {
+    const { version } = provider(UNUSED);
+    enable();
+    mock.warningAnswers = ['Review…'];
+    mock.pick = (items) => {
+      // swapped for a file of the same age: not a directory any more when it is deleted
+      rmSync(version, { recursive: true });
+      writeFileSync(version, 'x');
+      age(version, 90);
+      return items;
+    };
+    await run();
+
+    expect(mock.warnings).toHaveLength(2);
+    expect(mock.warnings[1]!.message).toContain('could not be removed');
+  });
+
+  /** A walk cut short by a closing window found "nothing" only because it did not
+   *  finish, and recording that as a 24-hour quiet period hides real entries. */
+  it('records no quiet period when the window closes during the walk', async () => {
+    provider(AWS);
+    lockFile('proj', AWS); // protected, so a finished walk finds nothing and snoozes
+    enable();
+    let sawCancel = false;
+    for (let limit = 0; limit < 80; limit++) {
+      const state = memento();
+      let calls = 0;
+      await scan(silent, () => ++calls > limit, state);
+      if (calls > limit) {
+        sawCancel = true;
+        expect((state as unknown as { keys(): string[] }).keys()).toEqual([]);
+      }
+    }
+    expect(sawCancel).toBe(true);
+  });
+
+  it('names the picker entries by install, with the date they were last written', async () => {
+    provider(UNUSED);
+    enable();
+    mock.warningAnswers = ['Review…'];
+    mock.pick = () => undefined;
+    await run();
+
+    const { items, options } = mock.quickPicks[0]!;
+    expect(String(options.title)).toContain('installed');
+    expect(String(options.title)).not.toContain('Unused');
+    expect(items[0]?.description).toMatch(/last written \d{4}-\d{2}-\d{2}$/);
+  });
+
   it('stops deleting once the window is closing', async () => {
     const { version } = provider(UNUSED);
     enable();

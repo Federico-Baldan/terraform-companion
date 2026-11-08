@@ -21,6 +21,7 @@ import {
   findStaleProviderCacheEntries,
   findStaleTerraformDirs,
   formatSize,
+  isAbsoluteFsPath,
   isProviderEntryStillStale,
   isStillStale,
   isTerraformCacheDir,
@@ -41,7 +42,12 @@ let outside: string;
 /** The environment Terraform itself reads for the plugin cache. Saved and
  *  restored around every test, since a leaked value would point the next test
  *  at somebody's real cache. */
-const ENV_KEYS = ['TF_CLI_CONFIG_FILE', 'TF_PLUGIN_CACHE_DIR', 'TFC_TEST_CACHE_BASE'] as const;
+const ENV_KEYS = [
+  'TF_CLI_CONFIG_FILE',
+  'TERRAFORM_CONFIG',
+  'TF_PLUGIN_CACHE_DIR',
+  'TFC_TEST_CACHE_BASE',
+] as const;
 const savedEnv = new Map<string, string | undefined>();
 
 beforeEach(() => {
@@ -96,15 +102,17 @@ provider "registry.terraform.io/hashicorp/random" {
     const cache = join(root, 'plugin-cache');
     const stale = join(cache, 'registry.terraform.io', 'example', 'unused', '1.0.0');
     const protectedVersion = join(cache, 'registry.terraform.io', 'hashicorp', 'aws', '5.0.0');
-    mkdirSync(stale, { recursive: true });
-    mkdirSync(protectedVersion, { recursive: true });
-    writeFileSync(join(stale, 'provider'), 'x'.repeat(2048));
-    writeFileSync(join(protectedVersion, 'provider'), 'x');
+    // Terraform's layout: <version>/<os_arch>/<binary>
+    mkdirSync(join(stale, 'linux_amd64'), { recursive: true });
+    mkdirSync(join(protectedVersion, 'linux_amd64'), { recursive: true });
+    writeFileSync(join(stale, 'linux_amd64', 'provider'), 'x'.repeat(2048));
+    writeFileSync(join(protectedVersion, 'linux_amd64', 'provider'), 'x');
     // the files are part of the entry's activity now, so they age with it
-    touch(join(stale, 'provider'), 60);
-    touch(join(protectedVersion, 'provider'), 60);
-    touch(stale, 60);
-    touch(protectedVersion, 60);
+    for (const dir of [stale, protectedVersion]) {
+      touch(join(dir, 'linux_amd64', 'provider'), 60);
+      touch(join(dir, 'linux_amd64'), 60);
+      touch(dir, 60);
+    }
 
     const found = await findStaleProviderCacheEntries(
       cache,
@@ -157,6 +165,112 @@ provider "registry.terraform.io/hashicorp/random" {
     });
   });
 
+  /** Terraform only checks that `plugin_cache_dir` exists, so a path that is not a
+   *  plugin cache at all is still handed over. The sweep must refuse anything
+   *  that does not look like `<host>/<namespace>/<type>/<version>/<os_arch>`,
+   *  or any directory four levels deep becomes "a provider". */
+  describe('provider cache layout', () => {
+    it('offers only <host>/<namespace>/<type>/<semver>/<os_arch> entries', async () => {
+      const cache = join(root, 'cache');
+      const stray = join(cache, 'Documents', 'projects', 'client-a', 'backups');
+      mkdirSync(stray, { recursive: true });
+      writeFileSync(join(stray, 'irreplaceable.txt'), 'x');
+      touch(join(stray, 'irreplaceable.txt'), 90);
+      touch(stray, 90);
+      // a version directory with no os_arch directory inside is not an install either
+      const noPlatform = join(cache, 'registry.terraform.io', 'example', 'half', '1.0.0');
+      mkdirSync(noPlatform, { recursive: true });
+      touch(noPlatform, 90);
+      const real = join(cache, 'registry.terraform.io', 'example', 'unused', '1.0.0');
+      mkdirSync(join(real, 'linux_amd64'), { recursive: true });
+      writeFileSync(join(real, 'linux_amd64', 'terraform-provider-unused'), 'x');
+      for (const p of [
+        join(real, 'linux_amd64', 'terraform-provider-unused'),
+        join(real, 'linux_amd64'),
+        real,
+      ])
+        touch(p, 90);
+
+      const found = await findStaleProviderCacheEntries(cache, new Set(), 30, NOW);
+      expect(found.map((e) => e.source)).toEqual(['registry.terraform.io/example/unused']);
+    });
+
+    it('accepts pre-release versions', async () => {
+      const cache = join(root, 'cache');
+      const real = join(cache, 'registry.terraform.io', 'example', 'beta', '2.0.0-beta.1');
+      mkdirSync(join(real, 'darwin_arm64'), { recursive: true });
+      touch(join(real, 'darwin_arm64'), 90);
+      touch(real, 90);
+      const found = await findStaleProviderCacheEntries(cache, new Set(), 30, NOW);
+      expect(found).toHaveLength(1);
+    });
+  });
+
+  /** The guard is the last line before `rm -rf`, and it was exercised only on
+   *  the happy path. */
+  describe('deleteProviderCacheEntry guards', () => {
+    const entry = (dir: string) => ({ dir, source: 'x', sizeBytes: 0, lastActivityMs: 0 });
+    const version = (cache: string, ...parts: string[]) => {
+      const dir = join(cache, ...parts, '1.0.0');
+      mkdirSync(join(dir, 'linux_amd64'), { recursive: true });
+      writeFileSync(join(dir, 'linux_amd64', 'bin'), 'x');
+      return dir;
+    };
+
+    it('refuses the cache root itself', async () => {
+      const cache = join(root, 'cache');
+      version(cache, 'registry.terraform.io', 'a', 'b');
+      expect((await deleteProviderCacheEntry(entry(cache), cache)).ok).toBe(false);
+      expect(existsSync(cache)).toBe(true);
+    });
+
+    it('refuses an entry outside the cache root', async () => {
+      const cache = join(root, 'cache');
+      mkdirSync(cache);
+      const elsewhere = join(outside, 'precious');
+      mkdirSync(elsewhere);
+      expect((await deleteProviderCacheEntry(entry(elsewhere), cache)).ok).toBe(false);
+      expect(existsSync(elsewhere)).toBe(true);
+    });
+
+    it('refuses an entry that is itself a symlink', async () => {
+      const cache = join(root, 'cache');
+      const real = version(cache, 'registry.terraform.io', 'a', 'b');
+      const link = join(cache, 'registry.terraform.io', 'a', 'b', '2.0.0');
+      symlinkSync(real, link);
+      expect((await deleteProviderCacheEntry(entry(link), cache)).ok).toBe(false);
+      expect(existsSync(real)).toBe(true);
+    });
+
+    /** The scan skips symlinked levels, but the prompt can sit open for hours: a
+     *  level swapped for a link meanwhile must not redirect the delete onto an
+     *  entry the user never saw — or one a lock file protects. */
+    it('refuses a path that runs through a symlink swapped in after the scan', async () => {
+      const cache = join(root, 'cache');
+      const protectedVersion = version(cache, 'registry.terraform.io', 'hashicorp', 'aws');
+      mkdirSync(join(cache, 'h'), { recursive: true });
+      symlinkSync(join(cache, 'registry.terraform.io', 'hashicorp'), join(cache, 'h', 'n'));
+      const viaLink = join(cache, 'h', 'n', 'aws', '1.0.0');
+      expect((await deleteProviderCacheEntry(entry(viaLink), cache)).ok).toBe(false);
+      expect(existsSync(protectedVersion)).toBe(true);
+    });
+  });
+
+  describe('isAbsoluteFsPath', () => {
+    it('does not take a drive-less rooted path for absolute on Windows', () => {
+      // `$HOME/x` with HOME unset expands to `/x`, which win32 resolves against the cwd's drive
+      expect(isAbsoluteFsPath('/x', 'win32')).toBe(false);
+      expect(isAbsoluteFsPath('C:\\Users\\x', 'win32')).toBe(true);
+      expect(isAbsoluteFsPath('C:/Users/x', 'win32')).toBe(true);
+      expect(isAbsoluteFsPath('\\\\server\\share\\x', 'win32')).toBe(true);
+    });
+
+    it('keeps the ordinary POSIX rule elsewhere', () => {
+      expect(isAbsoluteFsPath('/x', 'linux')).toBe(true);
+      expect(isAbsoluteFsPath('x/y', 'linux')).toBe(false);
+    });
+  });
+
   describe('collectProviderSources', () => {
     const LOCK = 'provider "registry.terraform.io/hashicorp/aws" {\n  version = "5.0.0"\n}\n';
 
@@ -172,6 +286,44 @@ provider "registry.terraform.io/hashicorp/random" {
       writeFileSync(join(outside, 'shared.lock.hcl'), LOCK);
       mkdirSync(join(root, 'mod'));
       symlinkSync(join(outside, 'shared.lock.hcl'), join(root, 'mod', '.terraform.lock.hcl'));
+      const { sources, complete } = await collectProviderSources(root);
+      expect([...sources]).toEqual(['registry.terraform.io/hashicorp/aws']);
+      expect(complete).toBe(true);
+    });
+
+    it('follows a symlinked directory, whose lock file is a project the workspace still uses', async () => {
+      mkdirSync(join(outside, 'shared-project'));
+      writeFileSync(join(outside, 'shared-project', '.terraform.lock.hcl'), LOCK);
+      symlinkSync(join(outside, 'shared-project'), join(root, 'linked'));
+      const { sources, complete } = await collectProviderSources(root);
+      expect([...sources]).toEqual(['registry.terraform.io/hashicorp/aws']);
+      expect(complete).toBe(true);
+    });
+
+    it('terminates on a symlink loop', async () => {
+      mkdirSync(join(root, 'a'));
+      symlinkSync(root, join(root, 'a', 'back'));
+      writeFileSync(join(root, 'a', '.terraform.lock.hcl'), LOCK);
+      const { sources } = await collectProviderSources(root);
+      expect([...sources]).toEqual(['registry.terraform.io/hashicorp/aws']);
+    });
+
+    it('reads lock files under .terragrunt-cache, which is where terragrunt keeps real projects', async () => {
+      const dir = join(root, 'live', '.terragrunt-cache', 'abc', 'def');
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, '.terraform.lock.hcl'), LOCK);
+      const { sources } = await collectProviderSources(root);
+      expect([...sources]).toEqual(['registry.terraform.io/hashicorp/aws']);
+    });
+
+    it('protects what an initialised project links in, even when its lock file is missing', async () => {
+      const providers = join(root, 'proj', '.terraform', 'providers');
+      mkdirSync(
+        join(providers, 'registry.terraform.io', 'hashicorp', 'aws', '5.0.0', 'linux_amd64'),
+        {
+          recursive: true,
+        },
+      );
       const { sources, complete } = await collectProviderSources(root);
       expect([...sources]).toEqual(['registry.terraform.io/hashicorp/aws']);
       expect(complete).toBe(true);
@@ -236,6 +388,97 @@ provider "registry.terraform.io/hashicorp/random" {
       // Terraform does not expand `~`, so the file value is a relative path to it too
       cliConfig('plugin_cache_dir = "~/plugins"\n');
       expect(await configuredProviderCache()).toBeUndefined();
+    });
+
+    it('refuses a relative TF_PLUGIN_CACHE_DIR', async () => {
+      process.env.TF_PLUGIN_CACHE_DIR = 'relative/plugins';
+      expect(await configuredProviderCache()).toBeUndefined();
+    });
+
+    it('ignores a setting inside a block or a block comment', async () => {
+      const dir = join(root, 'plugins');
+      cliConfig(
+        `/* plugin_cache_dir = "${dir}" */\nprovider_installation {\n  plugin_cache_dir = "${dir}"\n}\n`,
+      );
+      expect(await configuredProviderCache()).toBeUndefined();
+      cliConfig(`provider_installation {\n}\nplugin_cache_dir = "${dir}"\n`);
+      expect(await configuredProviderCache()).toBe(dir);
+    });
+
+    it('takes TERRAFORM_CONFIG when TF_CLI_CONFIG_FILE is unset, like Terraform', async () => {
+      const dir = join(root, 'legacy');
+      const file = join(root, 'legacy.rc');
+      writeFileSync(file, `plugin_cache_dir = "${dir}"\n`);
+      process.env.TERRAFORM_CONFIG = file;
+      expect(await configuredProviderCache()).toBe(dir);
+      // and TF_CLI_CONFIG_FILE outranks it
+      cliConfig(`plugin_cache_dir = "${join(root, 'preferred')}"\n`);
+      expect(await configuredProviderCache()).toBe(join(root, 'preferred'));
+    });
+
+    /** Terraform reads ~/.terraformrc and then ~/.terraform.d/*.tfrc, the
+     *  directory only when no override env var is set. There is no
+     *  ~/.terraform.d/terraform.rc. */
+    describe('from the home directory', () => {
+      const realHome = process.env.HOME;
+      afterEach(() => {
+        if (realHome === undefined) delete process.env.HOME;
+        else process.env.HOME = realHome;
+      });
+      const home = () => {
+        const dir = join(root, 'home');
+        mkdirSync(join(dir, '.terraform.d'), { recursive: true });
+        process.env.HOME = dir;
+        return dir;
+      };
+
+      it('reads ~/.terraform.d/*.tfrc, and the main file wins over it', async () => {
+        const dir = home();
+        writeFileSync(
+          join(dir, '.terraform.d', 'cache.tfrc'),
+          `plugin_cache_dir = "${join(root, 'from-dir')}"\n`,
+        );
+        expect(await configuredProviderCache()).toBe(join(root, 'from-dir'));
+        writeFileSync(
+          join(dir, '.terraformrc'),
+          `plugin_cache_dir = "${join(root, 'from-main')}"\n`,
+        );
+        expect(await configuredProviderCache()).toBe(join(root, 'from-main'));
+      });
+
+      it('does not read ~/.terraform.d/terraform.rc, which Terraform never loads', async () => {
+        const dir = home();
+        writeFileSync(
+          join(dir, '.terraform.d', 'terraform.rc'),
+          `plugin_cache_dir = "${join(root, 'ghost')}"\n`,
+        );
+        expect(await configuredProviderCache()).toBeUndefined();
+      });
+
+      it('skips the directory when an override env var is set', async () => {
+        const dir = home();
+        writeFileSync(
+          join(dir, '.terraform.d', 'cache.tfrc'),
+          `plugin_cache_dir = "${join(root, 'from-dir')}"\n`,
+        );
+        cliConfig('provider_installation {}\n');
+        expect(await configuredProviderCache()).toBeUndefined();
+      });
+    });
+
+    /** `~/.terraform.d/plugins` is Terraform's implied local mirror: same layout,
+     *  but it holds providers placed by hand that nothing can restore. */
+    it('refuses a directory that is a local provider mirror, not a cache', async () => {
+      for (const dir of [
+        join(root, '.terraform.d', 'plugins'),
+        join(root, 'share', 'terraform', 'plugins'),
+        join(root, 'Library', 'Application Support', 'io.terraform', 'plugins'),
+      ]) {
+        process.env.TF_PLUGIN_CACHE_DIR = dir;
+        expect(await configuredProviderCache()).toBeUndefined();
+      }
+      process.env.TF_PLUGIN_CACHE_DIR = join(root, '.terraform.d', 'plugin-cache');
+      expect(await configuredProviderCache()).toBe(join(root, '.terraform.d', 'plugin-cache'));
     });
 
     it('is undefined when nothing configures a cache', async () => {

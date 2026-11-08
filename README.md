@@ -120,9 +120,9 @@ Only the cache is removed. `providers`, `plugins`, and `modules` are deleted, wh
 
 Set `cacheCleaner.providerCache` to also clean Terraform's shared plugin cache (`plugin_cache_dir` or `TF_PLUGIN_CACHE_DIR`). Every Terraform project on the machine uses that cache, so it always asks, even with `autoDelete` on.
 
-It offers provider versions installed over 30 days ago that no `.terraform.lock.hcl` in the workspace names. Terraform never touches a cache entry after installing it, so the install date is the only one available, and another project may still use the provider. If you delete one that is in use, that project needs `terraform init` again.
+It offers provider versions installed over 30 days ago that no `.terraform.lock.hcl` in the workspace names. Terraform never touches a cache entry after installing it, so the date is when it was installed, not when it was last used, and another project may still use the provider. If you delete one that is in use, that project needs `terraform init` again.
 
-The cache is left alone when no folder is open or a lock file could not be read.
+A project in the workspace keeps its providers even without a lock file. The lock files are read again right before anything is deleted. The cache is left alone when no folder is open, when a lock file could not be read, or when `plugin_cache_dir` points at a local provider mirror such as `~/.terraform.d/plugins`.
 
 ## Offline
 

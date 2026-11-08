@@ -132,20 +132,43 @@ export function registerCacheCleaner(
   });
 }
 
+/** The provider sources the workspace's lock files, and its initialised
+ *  projects, still need — and whether every one of them was read. */
+async function readLockSources(
+  folders: readonly { uri: { fsPath: string } }[],
+  cancelled: () => boolean,
+  log: (m: string) => void,
+): Promise<{ sources: Set<string>; complete: boolean }> {
+  const sources = new Set<string>();
+  let complete = folders.length > 0;
+  for (const folder of folders) {
+    const root = folder.uri.fsPath;
+    try {
+      const locks = await collectProviderSources(root, cancelled);
+      for (const source of locks.sources) sources.add(source);
+      if (!locks.complete) complete = false;
+    } catch (e) {
+      complete = false;
+      log(`cacheCleaner: lock file scan failed in ${root}: ${e}`);
+    }
+  }
+  return { sources, complete };
+}
+
 async function reviewProviders(
   entries: ProviderCacheEntry[],
   days: number,
 ): Promise<ProviderCacheEntry[] | undefined> {
   const items: ProviderItem[] = entries.map((entry) => ({
     label: `${entry.source} ${basename(entry.dir)}`,
-    description: `${formatSize(entry.sizeBytes)} · last activity ${activityDate(entry.lastActivityMs)}`,
+    description: `${formatSize(entry.sizeBytes)} · last written ${activityDate(entry.lastActivityMs)}`,
     detail: entry.dir,
     picked: true,
     entry,
   }));
   const picked = await vscode.window.showQuickPick(items, {
     canPickMany: true,
-    title: `Unused Terraform provider cache — no activity for over ${days} days`,
+    title: `Shared Terraform plugin cache — provider versions installed over ${days} days ago`,
     placeHolder: 'Uncheck anything you want to keep, then press Enter to delete the rest',
     ignoreFocusOut: true,
     matchOnDetail: true,
@@ -208,15 +231,10 @@ export async function scan(
       log(`cacheCleaner: scan failed in ${root}: ${e}`);
     }
     if (!providerCacheOn) continue;
-    // its own try: a failed .terraform walk must not skip the lock files
-    try {
-      const locks = await collectProviderSources(root, cancelled);
-      for (const source of locks.sources) protectedSources.add(source);
-      if (!locks.complete) lockFilesRead = false;
-    } catch (e) {
-      lockFilesRead = false;
-      log(`cacheCleaner: lock file scan failed in ${root}: ${e}`);
-    }
+    // its own step: a failed .terraform walk must not skip the lock files
+    const locks = await readLockSources([folder], cancelled, log);
+    for (const source of locks.sources) protectedSources.add(source);
+    if (!locks.complete) lockFilesRead = false;
   }
   // workspace folders may nest — VS Code allows both /repo and /repo/infra —
   // and a cache under both is found once per folder. Counted twice it inflates
@@ -243,6 +261,9 @@ export async function scan(
       );
     }
   }
+  // a walk cut short found "nothing" only because it did not finish, and
+  // recording that as a quiet period would hide what it never reached
+  if (cancelled()) return;
   if (unique.length === 0 && staleProviders.length === 0) {
     await snooze(QUIET_SCAN_MS);
     return;
@@ -373,7 +394,7 @@ export async function scan(
   const deleteLabel = count === 1 ? 'Delete' : `Delete all ${count}`;
   const choice = await vscode.window.showWarningMessage(
     // "installed", not "unused": Terraform never writes to a cache entry again
-    // after installing it, so the install date is the only date there is
+    // after installing it, so what the date measures is the install, not the use
     `Terraform Companion: ${count} provider version${count === 1 ? '' : 's'} in the shared plugin cache ${providerCache} ${count === 1 ? 'was' : 'were'} installed over ${days} days ago and no lock file in this workspace names ${them} — about ${formatSize(providerTotal)}. Other projects on this machine may still use ${them}, and would need terraform init again. Delete?`,
     REVIEW,
     deleteLabel,
@@ -395,6 +416,23 @@ export async function scan(
     return;
   }
   const providerKept = staleProviders.length - providerTargets.length;
+
+  // Reuse leaves no trace in the cache — Terraform links an entry and never
+  // writes to it — so the only way to learn that a provider became needed while
+  // the prompt was open is to read the lock files again, now.
+  const fresh = await readLockSources(folders, cancelled, log);
+  if (cancelled()) return;
+  if (!fresh.complete) {
+    log(
+      'cacheCleaner: provider cache left alone — the lock files could not all be read again after the prompt',
+    );
+    return;
+  }
+  providerTargets = providerTargets.filter((entry) => {
+    if (!fresh.sources.has(entry.source)) return true;
+    log(`cacheCleaner: skipped provider ${entry.dir} (a lock file names it now)`);
+    return false;
+  });
 
   let providerFreed = 0;
   let providerCleaned = 0;
