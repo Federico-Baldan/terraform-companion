@@ -2,7 +2,7 @@ import { basename, dirname, isAbsolute, relative } from 'node:path';
 import * as vscode from 'vscode';
 import {
   cacheCleanerAutoDelete,
-  cacheCleanerProviderCache,
+  cacheCleanerSharedPluginCache,
   cacheCleanerStaleDays,
   featureEnabled,
 } from '../config';
@@ -168,7 +168,7 @@ async function reviewProviders(
   }));
   const picked = await vscode.window.showQuickPick(items, {
     canPickMany: true,
-    title: `Shared Terraform plugin cache — provider versions installed over ${days} days ago`,
+    title: `Shared Terraform plugin cache: provider versions installed over ${days} days ago`,
     placeHolder: 'Uncheck anything you want to keep, then press Enter to delete the rest',
     ignoreFocusOut: true,
     matchOnDetail: true,
@@ -204,7 +204,7 @@ export async function scan(
       log(`cacheCleaner: could not record the snooze: ${e}`),
     );
 
-  const providerCacheOn = cacheCleanerProviderCache();
+  const providerCacheOn = cacheCleanerSharedPluginCache();
   const folders = vscode.workspace.workspaceFolders ?? [];
   const stale: FoundCache[] = [];
   const protectedSources = new Set<string>();
@@ -391,11 +391,13 @@ export async function scan(
   // symlink in each project that used it dangling.
   const count = staleProviders.length;
   const them = count === 1 ? 'it' : 'them';
-  const deleteLabel = count === 1 ? 'Delete' : `Delete all ${count}`;
+  // worded unlike the .terraform prompt's `Delete all N`, which can sit right
+  // before this one: the same button twice invites answering the second unread
+  const deleteLabel = `Delete ${count} version${count === 1 ? '' : 's'}`;
   const choice = await vscode.window.showWarningMessage(
     // "installed", not "unused": Terraform never writes to a cache entry again
     // after installing it, so what the date measures is the install, not the use
-    `Terraform Companion: ${count} provider version${count === 1 ? '' : 's'} in the shared plugin cache ${providerCache} ${count === 1 ? 'was' : 'were'} installed over ${days} days ago and no lock file in this workspace names ${them} — about ${formatSize(providerTotal)}. Other projects on this machine may still use ${them}, and would need terraform init again. Delete?`,
+    `Terraform Companion: the shared plugin cache (${providerCache}) holds ${count} provider version${count === 1 ? '' : 's'} installed over ${days} days ago that no lock file in this workspace names, about ${formatSize(providerTotal)}. Other projects on this machine may still use ${them} and would need terraform init again. Delete?`,
     REVIEW,
     deleteLabel,
     'Ignore',

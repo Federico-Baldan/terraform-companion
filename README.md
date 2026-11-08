@@ -116,11 +116,11 @@ Everything starts checked. Uncheck anything you want to keep; only the remaining
 
 Only the cache is removed. `providers`, `plugins`, and `modules` are deleted, while `.terraform` and its metadata remain. Your selected workspace and `-backend-config` settings are preserved. Terraform state is not touched: it lives in `terraform.tfstate` and `terraform.tfstate.d/` beside `.terraform`, and `.terraform.lock.hcl` is a sibling. A pre-0.14 `plugins/<os>_<arch>/` without `lock.json` is left alone because it contains a manually placed binary that `terraform init` cannot restore. The scan does not follow symlinks and only removes directories named `.terraform`. Dismiss the prompt to suppress it for a week. Set `cacheCleaner.autoDelete` to skip the prompt.
 
-### Shared provider cache
+### Shared plugin cache
 
-The cleaner also covers Terraform's shared plugin cache (`plugin_cache_dir` or `TF_PLUGIN_CACHE_DIR`). Every Terraform project on the machine uses that cache, so it always asks and lets you pick what to remove, even with `autoDelete` on. Set `cacheCleaner.providerCache` to `false` to leave it alone.
+The cleaner also covers Terraform's shared plugin cache (`plugin_cache_dir` or `TF_PLUGIN_CACHE_DIR`), with its own prompt after the `.terraform` one. Every Terraform project on the machine uses that cache, so it always asks and lets you pick what to remove, even with `autoDelete` on. Set `cacheCleaner.sharedPluginCache` to `false` to leave it alone.
 
-It offers provider versions installed over 30 days ago that no `.terraform.lock.hcl` in the workspace names. Terraform never touches a cache entry after installing it, so the date is when it was installed, not when it was last used, and another project may still use the provider. If you delete one that is in use, that project needs `terraform init` again.
+It offers provider versions installed over `staleDays` days ago that no `.terraform.lock.hcl` in the workspace names. Terraform never touches a cache entry after installing it, so the date is when it was installed, not when it was last used, and another project may still use the provider. If you delete one that is in use, that project needs `terraform init` again.
 
 A project in the workspace keeps its providers even without a lock file. The lock files are read again right before anything is deleted. The cache is left alone when no folder is open, when a lock file could not be read, or when `plugin_cache_dir` points at a local provider mirror such as `~/.terraform.d/plugins`.
 
@@ -142,10 +142,10 @@ All keys are under `tfCompanion.`
 | `unusedLocals.enabled` | `true` | |
 | `versionHygiene.enabled` | `true` | |
 | `versionHygiene.variableDocs` | `false` | also flag variables without `description` or `type` |
-| `cacheCleaner.enabled` | `true` | on startup, offer to delete the cache of modules with no recent activity |
-| `cacheCleaner.staleDays` | `30` | days of inactivity before a `.terraform` counts as stale; floored at 1 |
-| `cacheCleaner.autoDelete` | `false` | delete stale `.terraform` caches without asking; the folders are still listed in the output channel |
-| `cacheCleaner.providerCache` | `true` | also offer to clean Terraform's shared plugin cache; always asks |
+| `cacheCleaner.enabled` | `true` | master switch for the cleaner: `.terraform` folders and the shared plugin cache |
+| `cacheCleaner.staleDays` | `30` | `.terraform`: days without activity. Shared plugin cache: days since install. Floored at 1 |
+| `cacheCleaner.autoDelete` | `false` | delete stale `.terraform` caches without asking; the folders are still listed in the output channel. The shared plugin cache always asks |
+| `cacheCleaner.sharedPluginCache` | `true` | also offer to clean Terraform's shared plugin cache; needs `cacheCleaner.enabled` |
 
 ## Development
 

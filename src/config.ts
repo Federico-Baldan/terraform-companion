@@ -62,6 +62,6 @@ export function cacheCleanerAutoDelete(): boolean {
  *  separate switch from `autoDelete`: the shared plugin cache belongs to every
  *  Terraform project on the machine, not to the workspace, so enabling silent
  *  deletion of a workspace's own `.terraform` must not extend to it. */
-export function cacheCleanerProviderCache(): boolean {
-  return bool('cacheCleaner.providerCache', true);
+export function cacheCleanerSharedPluginCache(): boolean {
+  return bool('cacheCleaner.sharedPluginCache', true);
 }

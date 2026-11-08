@@ -143,7 +143,7 @@ describe('shared provider cache', () => {
 
   function enable(): void {
     process.env.TF_PLUGIN_CACHE_DIR = cacheHome;
-    mock.settings.set('cacheCleaner.providerCache', true);
+    mock.settings.set('cacheCleaner.sharedPluginCache', true);
   }
 
   async function runLogged(): Promise<string[]> {
@@ -170,7 +170,7 @@ describe('shared provider cache', () => {
   it('leaves the shared cache alone when it is switched off', async () => {
     const { version } = provider(UNUSED);
     process.env.TF_PLUGIN_CACHE_DIR = cacheHome;
-    mock.settings.set('cacheCleaner.providerCache', false);
+    mock.settings.set('cacheCleaner.sharedPluginCache', false);
     await run();
     expect(mock.warnings).toEqual([]);
     expect(existsSync(version)).toBe(true);
@@ -195,12 +195,63 @@ describe('shared provider cache', () => {
     const kept = provider(AWS);
     lockFile('infra/prod', AWS);
     enable();
-    mock.warningAnswers = ['Delete'];
+    mock.warningAnswers = ['Delete 1 version'];
     await run();
 
     expect(existsSync(gone.version)).toBe(false);
     expect(existsSync(kept.version)).toBe(true);
     expect(mock.infos[0]).toContain('freed');
+  });
+
+  /** With both caches stale the user gets two prompts back to back, so each has
+   *  to say at a glance which cache it is about, and the buttons that delete must
+   *  not read the same: answering the second one without reading it would delete
+   *  entries other projects use. */
+  it('leads with the cache and counts what its button deletes', async () => {
+    provider(UNUSED);
+    provider(AWS);
+    provider('registry.terraform.io/example/other');
+    enable();
+    mock.warningAnswers = ['Ignore'];
+    await run();
+
+    expect(prompt()).toMatch(/^Terraform Companion: the shared plugin cache \(/);
+    expect(prompt()).toContain('holds 3 provider versions');
+    expect(mock.warnings[0]!.items).toEqual(['Review…', 'Delete 3 versions', 'Ignore']);
+  });
+
+  it('asks about the .terraform folders and the shared cache one after the other, in different words', async () => {
+    const dotTerraform = module_('infra/prod', 90);
+    const { version } = provider(UNUSED);
+    enable();
+    mock.warningAnswers = ['Delete', 'Delete 1 version'];
+    await run();
+
+    expect(mock.warnings).toHaveLength(2);
+    const [folders, shared] = [mock.warnings[0]!, mock.warnings[1]!];
+    expect(folders.message).toContain('stale .terraform cache');
+    expect(shared.message).toMatch(/^Terraform Companion: the shared plugin cache /);
+    const deleteButton = (w: typeof folders) => w.items.find((i) => i.startsWith('Delete'));
+    expect(deleteButton(folders)).not.toBe(deleteButton(shared));
+    expect(existsSync(join(dotTerraform, 'providers'))).toBe(false);
+    expect(existsSync(version)).toBe(false);
+    // two results, each naming what it removed
+    expect(mock.infos).toHaveLength(2);
+    expect(mock.infos[0]).toContain('.terraform cache');
+    expect(mock.infos[1]).toContain('shared plugin cache');
+  });
+
+  it('still asks about the shared cache after Ignore on the .terraform prompt, and leaves both alone', async () => {
+    const dotTerraform = module_('infra/prod', 90);
+    const { version } = provider(UNUSED);
+    enable();
+    mock.warningAnswers = ['Ignore', 'Ignore'];
+    await run();
+
+    expect(mock.warnings).toHaveLength(2);
+    expect(existsSync(join(dotTerraform, 'providers'))).toBe(true);
+    expect(existsSync(version)).toBe(true);
+    expect(mock.infos).toEqual([]);
   });
 
   it('still asks when autoDelete is on', async () => {
