@@ -36,51 +36,66 @@
 
 <br>
 
-You almost certainly already run the [HashiCorp Terraform](https://marketplace.visualstudio.com/items?itemName=HashiCorp.terraform) extension. Keep it. Formatting, completion, syntax and validation all go through terraform-ls, and nothing here reaches into any of that.
-
-This fills the gaps terraform-ls leaves: it won't tell you a provider constraint is a major release behind, and it won't tell you what `var.environment` resolves to until you run a plan. Install both and they stay out of each other's way.
+You almost certainly already run the [HashiCorp Terraform](https://marketplace.visualstudio.com/items?itemName=HashiCorp.terraform) extension. Keep it. Formatting, completion, syntax checks and validation stay with terraform-ls, and Terraform Companion adds none of them. It reads your files and never runs Terraform.
 
 ## Install
-
-[**Terraform Companion on the VS Code Marketplace**](https://marketplace.visualstudio.com/items?itemName=Federico-Baldan.tf-companion), or from the command line:
 
 ```bash
 code --install-extension Federico-Baldan.tf-companion
 ```
 
-Requires VS Code 1.138 or newer. Activates on `.tf` / `.tfvars` files.
+Needs VS Code 1.138 or newer. Activates when the workspace has a `.tf` file or a Terraform file is open.
 
 ## Version CodeLens
+
+A lens above each `version` line shows the newest stable release and whether your constraint allows it. Click it to update the constraint or open the registry page.
 
 ```hcl
 terraform {
   required_providers {
-    # 6.0.1 blocked by your constraint (1 major)
     aws = {
       source  = "hashicorp/aws"
+      # → 6.0.1 blocked by your constraint (1 major)
       version = "~> 5.34"
     }
   }
 }
 ```
 
-The lens sits over the `version` line. Click it to bump the constraint or open the registry page. It measures the gap from the release your constraint would actually install, not from the floor you typed. A `~> 5.34` that cannot cross into 6.x reads *blocked*, while an exact pin that could be raised reads *behind*. Modules work the same way. Answers are cached for six hours. If the registry does not recognise a source, the lens stays hidden instead of showing an error.
+The comment stands for the lens.
+
+- The gap is measured from the release your constraint installs today, not from the floor you typed.
+- A range that excludes the newest release reads "blocked". An exact pin reads like `→ 5.98.0 available (64 minors behind)`.
+- It covers `required_providers` entries and `module` blocks with a registry source. Local paths, git URLs, other registry hosts and sources the registry does not know get no lens, and neither does a constraint already at the newest release.
+- Answers are cached for 6 hours by default.
+
+Setting: `tfCompanion.versionLens.enabled`.
 
 ## Resolved-value hover
 
-Point at a `var.*` or `local.*` to see the resolved string and its provenance: a tfvars file, a variable default, or an argument passed at a `module` call. The hover also includes a copy link.
+Hover a `var.*` or `local.*` in a `.tf` file, or the name where it is defined, to see the string it resolves to.
 
-The hover shows the value's character count. This helps catch names that exceed provider limits. For example, `28 chars` under `satispay-payments-green-prod` is easier to catch here than in a failed apply. An AWS target group allows 32 characters. The count uses the actual string, so a newline counts as one character, not the two characters in the rendered `\n`. Each instance gets its own count. Lists and objects have no count, and a value containing `⟨unknown⟩` has no count yet.
+```text
+local.tg_name = satispay-payments-green-prod
+28 chars · from prod.tfvars
+```
 
-It follows the whole chain. `local.name = "app-${var.env}"` with `var.env = "dev"` in tfvars resolves to `app-dev`, not `dev`. Inside a called module, `var.*` comes from the call site and traces back to the root and its tfvars. If nobody passes a value, it falls back to the module's default. When two `module` blocks pass different values, the hover shows one line per instance.
+The origin is a tfvars file, a variable default or a module call (`via module "app" (main.tf)`). "Copy value" copies the string.
 
-In a `resource`, `data`, `module` or `ephemeral` block, `count.index`, `each.key` and `each.value` resolve one line per instance, when the `count` or `for_each` value can be worked out from the file (up to 64 instances). Nested blocks are not covered. `path.root` and `path.module` are relative to the root module, as in Terraform. The root is the module no other module calls, or the one in `terraformRoot`. `path.cwd` is in no file, so it assumes you run Terraform from the root module directory, and the hover says so. Set `terraformCwd` if you don't. With several roots in the window and no `terraformRoot`, that one directory is used for all of them, and the hover says so. A folder with Terraform files that no module calls is a root, and so is an example that calls its own module.
+- It follows the whole chain. `local.name = "app-${var.env}"` with `var.env = "dev"` in tfvars shows `app-dev`.
+- In a called module, `var.*` comes from the call site, traced back to the root and its tfvars, or from the module's default. Calls that pass different values get one line each, with its own count (the first 8).
+- The count is of the real string (a newline is one character). It helps catch names over a provider limit, such as the 32 characters of an AWS target group name. Lists, objects and values containing `⟨unknown⟩` get none.
+- Expressions it cannot evaluate, such as conditionals and most functions, show `⟨unknown⟩`.
+- In `resource`, `data`, `module` and `ephemeral` blocks, `count.index`, `each.key` and `each.value` show one line per instance, when `count` or `for_each` can be worked out from your files (up to 64 instances). Nested blocks are not covered.
+- `path.root`, `path.module` and `path.cwd` resolve too. The root is the module no other module calls (calls from its own `examples/` do not count), or `terraformRoot`. `path.cwd` assumes that directory unless you set `terraformCwd`, and the hover says so.
 
-A status bar item pins the active tfvars file when auto-loading is not enough. The pin behaves like `-var-file`: it belongs to the module where you set it, while the file can live anywhere, such as `environments/prod.tfvars` beside the module or in a parent folder. Each module keeps its own pin, and the status bar reports the pin for the file you're viewing.
+Setting: `tfCompanion.resolvedHover.enabled`.
 
-The picker lists files the module could read, using paths relative to the module so similarly named files remain distinct. It identifies module folders by their `.tf` files, not their names. A module's entire subtree belongs to it, so `other/env/prod.tfvars` belongs to `other` just like `other/prod.tfvars`. Other nearby tfvars folders are also included, such as `environments/prod/`, `live/prod/vpc/`, and `config/`. Results are ordered by proximity: folders in the current module rank first regardless of name, self-named folders rank next, and other modules' subtrees rank lower. In a monorepo, shared `environments/` folders stay above sibling teams' folders. The picker only shows a shortlist. **Browse…** reaches the rest, including files outside the workspace.
+### Choosing the tfvars file
 
-Because a pin belongs to a module, the picker needs a `.tf` file open to identify that module. If the file belongs to a called module, it explains that Terraform reads values from the call site instead of that module's tfvars.
+Each root module reads `terraform.tfvars` and `*.auto.tfvars` from its own folder, as Terraform does. `.tfvars.json` is not read.
+
+To use another file, click the `tfvars: auto` status bar item or run `Terraform Companion: Pick the active tfvars file`. The pin works like `-var-file`: it belongs to the module of the open `.tf` file, overrides the auto-loaded files, and the file can live anywhere. The picker offers nearby tfvars files, recent picks and Automatic, which clears the pin. Browse… reaches files outside the workspace. A module that another module calls has no tfvars of its own, so the command says its values come from the call site.
 
 ## count → for_each
 
@@ -91,65 +106,88 @@ resource "aws_instance" "web" {
 }
 ```
 
-Drop the first name from that list and Terraform destroys and recreates every instance after it, because `count` keys resources by position. The quick fix rewrites the block to `for_each = toset(...)` with `each.value` in place of the indexed reads, so each instance is keyed by its own value and reordering the list stops mattering.
+Drop the first name from that list and Terraform recreates every instance after it, because `count` keys instances by position. The warning appears on `count = length(var.*)` or `length(local.*)` in a `resource`, `data` or `module` block that indexes the list with `count.index`. The `Refactor: count → for_each` action rewrites it to `for_each = toset(...)` with `each.value`.
 
-It only offers the rewrite when the rewrite is safe. If `count.index` also drives something else in the block, if the resource is addressed by index somewhere else (`web[0]`, `web[*]`, a cross-file `depends_on`), if the elements get read as objects, or if the values would collapse under `toset()` because they're duplicates or not strings, the fix stays hidden. One caveat it can't fix for you: resources already in state need `terraform state mv`, since their addresses change from `[0]` to `["web"]`.
+The action is hidden when the rewrite could change what Terraform builds:
+
+- `count.index` is used elsewhere in the block.
+- Something else in the module refers to the resource (`web[0]`, `web[*]`, a `depends_on` in another file).
+- The elements are read as objects, or the variable is not declared `list(string)` or `set(string)`.
+- The values are duplicates or not strings.
+
+The warning stays. Resources already in state need `terraform state mv`, because their addresses change from the index to the value.
+
+Setting: `tfCompanion.countForEach.enabled`. It hides the refactor too.
 
 ## Lints
 
-- **Unused locals**, flagged on the definition line, scoped to the whole module so a local defined in one file and used in another doesn't get a false positive.
-- **Version hygiene**: registry modules with no `version`, and `>=` / bare `~> 5` constraints that leave the upper end open. Optionally, variables missing a `description` or `type`.
-- **Redundant `depends_on`**: an entry the block's own arguments already imply. The quick fix splices just that entry out and leaves your comments and formatting alone.
+| Lint | Flags | Setting |
+|---|---|---|
+| Unused local | A local no `.tf` file in the module references | `unusedLocals.enabled` |
+| Unpinned module | A registry module without `version` | `versionHygiene.enabled` |
+| Open-ended version | A module or provider constraint with no upper bound: only `>=`, `>` or `!=`, or a bare `~> 5` | `versionHygiene.enabled` |
+| Variable docs | A variable without `description` or `type` (off by default) | `versionHygiene.variableDocs` |
+| Redundant `depends_on` | An entry the block's own arguments already imply; the quick fix removes it | `dependsOn.enabled` |
 
-## `.terraform` cache cleanup
+Settings are under `tfCompanion.`.
 
-On startup it looks for `.terraform` folders whose module hasn't been touched in 30 days, and asks before deleting. These are caches `terraform init` rebuilds.
+## Cache cleanup
 
-**It tells you what it is about to delete.** The prompt names the modules, such as `infra/prod, modules/vpc`, instead of showing only a count. **Review…** opens a checklist with each cache's full path, size, last-used date, and subdirectories:
+Shortly after startup, the extension looks for `.terraform` folders with no activity for 30 days (`cacheCleaner.staleDays`) and asks before deleting. Activity means a recent change to `.terraform` or its top-level entries, or to the `.tf`, `.tfvars`, `.hcl`, lock or state files beside it.
+
+It deletes only the cache inside: `providers`, `modules` and the pre-0.14 `plugins` entries. `terraform init` rebuilds them. It keeps:
+
+- `.terraform` itself and its metadata, so your selected workspace and `-backend-config` settings survive.
+- Terraform state (`terraform.tfstate`, `terraform.tfstate.d/`) and `.terraform.lock.hcl`. They sit beside `.terraform` and are not touched.
+- A pre-0.14 `plugins/<os>_<arch>/` without `lock.json`, which may hold a binary placed by hand.
+
+Symlinks are not followed, and nothing outside the workspace folder is removed.
+
+The prompt names the first three modules (then a count) and the approximate size. Review… opens a checklist of every cache with its path, size, last activity and the directories to delete. Everything starts checked, so uncheck what you want to keep. A row looks like this:
 
 ```
 [x] infra/prod      12.0 MB · last activity 2026-05-04
     /repo/infra/prod/.terraform: deletes .terraform/providers, .terraform/modules
-[x] modules/vpc      5.0 MB · last activity 2026-02-13
-    /repo/modules/vpc/.terraform: deletes .terraform/providers
 ```
 
-Everything starts checked. Uncheck anything you want to keep; only the remaining caches are deleted. Before removal, the Terraform Companion output channel lists every cache, its path, and the directories to be deleted.
-
-Only the cache is removed. `providers`, `plugins`, and `modules` are deleted, while `.terraform` and its metadata remain. Your selected workspace and `-backend-config` settings are preserved. Terraform state is not touched: it lives in `terraform.tfstate` and `terraform.tfstate.d/` beside `.terraform`, and `.terraform.lock.hcl` is a sibling. A pre-0.14 `plugins/<os>_<arch>/` without `lock.json` is left alone because it contains a manually placed binary that `terraform init` cannot restore. The scan does not follow symlinks and only removes directories named `.terraform`. Dismiss the prompt to suppress it for a week. Set `cacheCleaner.autoDelete` to skip the prompt.
+Ignoring or dismissing the prompt silences it for 7 days. The Terraform Companion output channel lists every cache before anything is removed. With `cacheCleaner.autoDelete` on, stale `.terraform` caches go without the prompt and are still listed there.
 
 ### Shared plugin cache
 
-The cleaner also covers Terraform's shared plugin cache (`plugin_cache_dir` or `TF_PLUGIN_CACHE_DIR`), with its own prompt after the `.terraform` one. Every Terraform project on the machine uses that cache, so it always asks and lets you pick what to remove, even with `autoDelete` on. Set `cacheCleaner.sharedPluginCache` to `false` to leave it alone.
+The cleaner also checks Terraform's shared plugin cache (`TF_PLUGIN_CACHE_DIR`, or `plugin_cache_dir` in your CLI config) with its own prompt. Every Terraform project on the machine uses it, so it always asks, even with `autoDelete` on, and you pick what to remove.
 
-It offers provider versions installed over `staleDays` days ago that no `.terraform.lock.hcl` in the workspace names. Terraform never touches a cache entry after installing it, so the date is when it was installed, not when it was last used, and another project may still use the provider. If you delete one that is in use, that project needs `terraform init` again.
+It offers provider versions installed more than `staleDays` days ago, unless a `.terraform.lock.hcl` in the workspace names the provider or an initialised project links it under `.terraform/providers`. The date is the install date, not the last use, so another project may still need the provider. If you delete one in use, that project needs `terraform init` again. The lock files are read again just before deleting.
 
-A project in the workspace keeps its providers even without a lock file. The lock files are read again right before anything is deleted. The cache is left alone when no folder is open, when a lock file could not be read, or when `plugin_cache_dir` points at a local provider mirror, such as `~/.terraform.d/plugins` or a `filesystem_mirror` path in your CLI config. A relative `filesystem_mirror` path also leaves it alone, because it cannot be compared, and so does a workspace with more than 200,000 entries to read for lock files, which the output channel says.
+It leaves the cache alone, and the output channel says why, when:
+
+- no folder is open, or the lock files cannot all be read (a workspace folder with more than 200,000 entries counts);
+- the cache path is relative;
+- it points at a local provider mirror, such as `~/.terraform.d/plugins` or a `filesystem_mirror` path in your CLI config (a relative `filesystem_mirror` path counts too).
+
+Set `cacheCleaner.sharedPluginCache` to `false` to skip it. It is a machine setting, so a workspace's `.vscode/settings.json` cannot change it. `cacheCleaner.enabled` turns off the whole cleaner.
 
 ## Offline
 
-The CodeLens is the only feature that uses the network. Without a connection, or when the registry is down, it uses the last cached answer or stays hidden. There are no popups or red squiggles. Everything else runs on your machine.
+The version CodeLens is the only feature that uses the network (registry.terraform.io). Offline, or when the registry is down, it shows its last cached answer or no lens, never an error or a popup. Everything else runs on your machine.
 
 ## Settings
 
-All keys are under `tfCompanion.`
-
 | Setting | Default | Notes |
 |---|---|---|
-| `versionLens.enabled` | `true` | |
-| `versionLens.cacheTtlHours` | `6` | floored at 5 minutes |
-| `resolvedHover.enabled` | `true` | |
-| `terraformRoot` | unset | absolute path of the root module, for `path.root` and `path.module` in the hover; by default the module nothing calls |
-| `terraformCwd` | unset | absolute path Terraform runs from, for `path.cwd` in the hover; by default the root module directory |
-| `countForEach.enabled` | `true` | |
-| `dependsOn.enabled` | `true` | |
-| `unusedLocals.enabled` | `true` | |
-| `versionHygiene.enabled` | `true` | |
-| `versionHygiene.variableDocs` | `false` | also flag variables without `description` or `type` |
-| `cacheCleaner.enabled` | `true` | master switch for the cleaner: `.terraform` folders and the shared plugin cache |
-| `cacheCleaner.staleDays` | `30` | `.terraform`: days without activity. Shared plugin cache: days since install. Floored at 1 |
-| `cacheCleaner.autoDelete` | `false` | delete stale `.terraform` caches without asking; the folders are still listed in the output channel. The shared plugin cache always asks |
-| `cacheCleaner.sharedPluginCache` | `true` | also offer to clean Terraform's shared plugin cache; needs `cacheCleaner.enabled` |
+| `tfCompanion.versionLens.enabled` | `true` | |
+| `tfCompanion.versionLens.cacheTtlHours` | `6` | Hours a registry answer stays cached. Floored at 5 minutes |
+| `tfCompanion.resolvedHover.enabled` | `true` | |
+| `tfCompanion.terraformRoot` | unset | Absolute path of the root module, for `path.root` and `path.module`. Default: the module no other module calls. Relative paths and `${workspaceFolder}` are ignored |
+| `tfCompanion.terraformCwd` | unset | Absolute path Terraform runs from, for `path.cwd`. Default: the root module directory |
+| `tfCompanion.countForEach.enabled` | `true` | Also hides the refactor |
+| `tfCompanion.unusedLocals.enabled` | `true` | |
+| `tfCompanion.versionHygiene.enabled` | `true` | |
+| `tfCompanion.versionHygiene.variableDocs` | `false` | Also flag variables without `description` or `type` |
+| `tfCompanion.dependsOn.enabled` | `true` | |
+| `tfCompanion.cacheCleaner.enabled` | `true` | Master switch: `.terraform` folders and the shared plugin cache |
+| `tfCompanion.cacheCleaner.staleDays` | `30` | `.terraform`: days without activity. Shared plugin cache: days since install. Floored at 1 |
+| `tfCompanion.cacheCleaner.autoDelete` | `false` | Delete stale `.terraform` caches without asking. The shared plugin cache always asks |
+| `tfCompanion.cacheCleaner.sharedPluginCache` | `true` | Also offer to clean the shared plugin cache. Machine scope |
 
 ## Development
 
@@ -165,6 +203,4 @@ npm run package    # .vsix
 
 ## Licence
 
-MIT.
-
-Bugs and feature requests go in [Issues](https://github.com/Federico-Baldan/terraform-companion/issues).
+[MIT](LICENSE). Bugs and feature requests go in [Issues](https://github.com/Federico-Baldan/terraform-companion/issues).
