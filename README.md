@@ -131,7 +131,15 @@ Setting: `tfCompanion.countForEach.enabled`. It hides the refactor too.
 
 Settings are under `tfCompanion.`.
 
-Files over 1 MiB (1,048,576 characters) are not parsed, and nothing in one is analysed. While one is in the workspace, the count → for_each refactor is withheld wherever the list depends on a variable, the unused-local lint stays quiet for that module, and the hover on a variable says it assumes no unread file sets it. The Terraform Companion output channel names the file.
+## Files over 1 MiB
+
+A file over 1 MiB (1,048,576 characters) is not parsed, and nothing in it is analysed. While one is in the workspace:
+
+- the count → for_each refactor is withheld wherever the list takes its value from a variable's default, a tfvars file or a module call;
+- the unused-local lint stays quiet for that module;
+- the hover on a variable or a `path.*` value says it assumes no unread file sets or calls it.
+
+The Terraform Companion output channel names the file.
 
 ## Cache cleanup
 
