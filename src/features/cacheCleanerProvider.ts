@@ -209,6 +209,16 @@ export async function scan(
     );
 
   const providerCacheOn = cacheCleanerSharedPluginCache();
+  // Resolved before any walk, because it decides whether the lock-file walk below
+  // has a job at all. The lock files exist to protect providers in the *shared*
+  // plugin cache from its sweep, and nothing else reads them — yet the walk ran
+  // for everyone, and a cache needs an explicit `plugin_cache_dir` or
+  // TF_PLUGIN_CACHE_DIR to exist. With none configured it re-walked the whole
+  // workspace and parsed every lock file in it, once per window every 24 hours,
+  // to produce a set nothing consumed: 2000 projects were ~2000 extra readdirs
+  // and ~2000 file reads. It is also a few reads of one small config file, so
+  // asking first costs nothing.
+  const providerCache = providerCacheOn ? await configuredProviderCache(log) : undefined;
   const folders = vscode.workspace.workspaceFolders ?? [];
   const stale: FoundCache[] = [];
   const protectedSources = new Set<string>();
@@ -235,7 +245,8 @@ export async function scan(
     } catch (e) {
       log(`cacheCleaner: scan failed in ${root}: ${e}`);
     }
-    if (!providerCacheOn) continue;
+    // no shared cache, no sweep, and so nothing for a lock file to protect
+    if (!providerCache) continue;
     // its own step: a failed .terraform walk must not skip the lock files
     const locks = await readLockSources([folder], cancelled, log);
     for (const source of locks.sources) protectedSources.add(source);
@@ -248,7 +259,6 @@ export async function scan(
   // already-deleted path succeeds silently and inflates the result too.
   const unique = [...new Map(stale.map((c) => [c.dir, c])).values()];
   if (cancelled()) return;
-  const providerCache = providerCacheOn ? await configuredProviderCache(log) : undefined;
   let staleProviders: ProviderCacheEntry[] = [];
   if (providerCache) {
     if (lockFilesRead) {
