@@ -733,6 +733,69 @@ describe('Terraform context hover', () => {
     expect(md).not.toContain('assumes');
   });
 
+  it('does not borrow provenance from the count it had to evaluate', async () => {
+    const md = await hover(
+      'variable "n" { default = 1 }\nresource "x" "item" {\n  count = var.n\n  name = count.index\n}\n',
+      3,
+      12,
+    );
+    expect(md).toContain('**count.index** = `0`');
+    expect(md).not.toContain('default in');
+  });
+
+  it('says nothing when the block does not use the meta-argument asked about', async () => {
+    expect(
+      await hover(
+        'resource "x" "item" {\n  for_each = { a = "1", b = "2" }\n  name = count.index\n}\n',
+        2,
+        12,
+      ),
+    ).toBeUndefined();
+    expect(
+      await hover('resource "x" "item" {\n  count = 2\n  name = each.key\n}\n', 2, 12),
+    ).toBeUndefined();
+  });
+
+  it('labels the rows as instances of the block, not of a module', async () => {
+    const md = await hover(
+      'resource "x" "item" {\n  count = 3\n  name = "${count.index}"\n}\n',
+      2,
+      22,
+    );
+    expect(md).toContain('per instance');
+    expect(md).not.toContain('differs per module instance');
+  });
+
+  it('keeps a newline in a for_each key out of the markdown structure', async () => {
+    const md = await hover(
+      'resource "x" "item" {\n  for_each = { "a\\n\\n# Heading\\n- fake row" = "v", b = "w" }\n  name = each.key\n}\n',
+      2,
+      10,
+    );
+    expect(md).toBeDefined();
+    expect(md!.split('\n').some((line) => line.startsWith('# Heading'))).toBe(false);
+    expect(md!.split('\n').some((line) => line.startsWith('- fake row'))).toBe(false);
+  });
+
+  /** `for each in ...` binds its own `each`: inside the expression it is not the
+   *  resource's, and showing the resource's value there is a wrong answer. */
+  it('says nothing for an each or count that a for expression rebinds', async () => {
+    expect(
+      await hover(
+        'variable "objs" { default = [{ value = "from-iterator" }] }\nresource "x" "i" {\n  for_each = { a = "resource-value" }\n  n = [for each in var.objs : each.value]\n}\n',
+        3,
+        33,
+      ),
+    ).toBeUndefined();
+    expect(
+      await hover(
+        'resource "x" "i" {\n  count = 2\n  n = [for count in [7, 8] : count.index]\n}\n',
+        2,
+        32,
+      ),
+    ).toBeUndefined();
+  });
+
   it('does not inherit context into nested blocks', async () => {
     const md = await hover(
       'resource "x" "item" {\n  count = 2\n  nested {\n    name = count.index\n  }\n}\n',

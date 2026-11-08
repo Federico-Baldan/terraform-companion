@@ -180,7 +180,10 @@ export interface ContextInstance {
   label: string;
   countIndex?: number;
   eachKey?: string;
-  eachValue?: string | number | boolean | null | string[] | Record<string, unknown>;
+  /** The evaluator's own value, shared rather than copied: values share
+   *  structure, so a converted copy of one built from locals read twice grows by
+   *  a factor per level, and a number cannot survive a trip through a JS `Number`. */
+  eachValue?: Value;
 }
 
 export interface ContextOptions {
@@ -219,11 +222,11 @@ export function resolveContext(
   if (isObject(value)) {
     if (value.size > MAX_CONTEXT_INSTANCES) return undefined;
     const out: ContextInstance[] = [];
+    const known = new Set<object>();
     for (const [key, item] of value) {
       if (cancelled?.()) return undefined;
-      const eachValue = publicValue(item, cancelled);
-      if (eachValue === undefined) return undefined;
-      out.push({ label: `each.key = ${key}`, eachKey: key, eachValue });
+      if (!isFullyKnown(item, cancelled, known)) return undefined;
+      out.push({ label: `each.key = ${key}`, eachKey: key, eachValue: item });
     }
     return out.length > 0 ? out : undefined;
   }
@@ -236,58 +239,24 @@ export function resolveContext(
   return undefined;
 }
 
-function publicValue(
+/** Nothing unresolved anywhere inside `value`. Each shared object is visited
+ *  once: a local read twice is one object, and walking it as a tree doubles the
+ *  work with every level. Past the nesting cap the answer is no, which only
+ *  means no hover. */
+const MAX_KNOWN_DEPTH = 64;
+function isFullyKnown(
   value: Value,
-  isCancelled?: () => boolean,
-): ContextInstance['eachValue'] | undefined {
-  if (isCancelled?.()) return undefined;
-  if (value === undefined) return undefined;
-  if (value instanceof NonString) {
-    if (value.text === 'null') return null;
-    if (/^-?\d+(?:\.\d+)?$/.test(value.text)) return Number(value.text);
-    if (value.text === 'true' || value.text === 'false') return value.text === 'true';
-    return value.text;
-  }
-  if (typeof value === 'string') return value;
-  if (value instanceof SetValue) {
-    const values = value.values.map((item) => publicValue(item, isCancelled));
-    return values.some((v) => v === undefined) ? undefined : (values as string[]);
-  }
-  if (Array.isArray(value)) {
-    const values = value.map((item) => publicValue(item, isCancelled));
-    return values.some((v) => v === undefined) ? undefined : (values as string[]);
-  }
-
-  const out: Record<string, unknown> = {};
-  for (const [key, item] of value) {
-    const converted = publicValue(item, isCancelled);
-    if (converted === undefined) return undefined;
-    out[key] = converted;
-  }
-  return out;
-}
-
-function internalValue(
-  value: Exclude<ContextInstance['eachValue'], undefined>,
-  isCancelled?: () => boolean,
-): Value {
-  if (isCancelled?.()) return undefined;
-  if (value === null) return new NonString('null');
-  if (typeof value === 'string') return value;
-  if (Array.isArray(value)) {
-    return value.map((v) =>
-      internalValue(v as Exclude<ContextInstance['eachValue'], undefined>, isCancelled),
-    );
-  }
-  if (typeof value === 'number' || typeof value === 'boolean') return new NonString(String(value));
-  const out: ObjValue = new Map();
-  for (const [key, item] of Object.entries(value)) {
-    out.set(
-      key,
-      internalValue(item as Exclude<ContextInstance['eachValue'], undefined>, isCancelled),
-    );
-  }
-  return out;
+  cancelled?: () => boolean,
+  seen: Set<object> = new Set(),
+  depth = 0,
+): boolean {
+  if (cancelled?.() || depth > MAX_KNOWN_DEPTH || value === undefined) return false;
+  if (typeof value === 'string' || value instanceof NonString) return true;
+  if (seen.has(value)) return true;
+  seen.add(value);
+  const children =
+    value instanceof SetValue ? value.values : Array.isArray(value) ? value : [...value.values()];
+  return children.every((child) => isFullyKnown(child, cancelled, seen, depth + 1));
 }
 
 /** Separate from strings because rendering loses the type: 8080 and "8080"
@@ -799,8 +768,10 @@ function evalNode(node: Node, scope: EvalScope, depth: number, struct = 0): Valu
       case 'object': {
         const out: ObjValue = new Map();
         for (const elem of named(node)) {
-          if (scope.contextDiscovery && out.size >= MAX_CONTEXT_INSTANCES) return undefined;
           if (elem.type !== 'object_elem') continue;
+          // checked per entry, not per node: the closing brace is a named child too,
+          // and counting it rejected a map of exactly MAX_CONTEXT_INSTANCES entries
+          if (scope.contextDiscovery && out.size >= MAX_CONTEXT_INSTANCES) return undefined;
           const [key, value] = named(elem).filter((c) => c.type === 'expression');
           if (!key || !value) continue;
           // a bare key is literal: { env = 1 } has key "env" even if var.env exists
@@ -855,13 +826,16 @@ function resolveRefValue(parts: string[], scope: EvalScope, depth: number): Valu
     if (scope.context?.eachValue === undefined) return undefined;
     // `each.value.size` is the usual spelling: the attribute walk is the same
     // one `var.x.y` gets, over the instance's own value
-    return walkPath(internalValue(scope.context.eachValue, scope.isCancelled), parts.slice(2));
+    return walkPath(scope.context.eachValue, parts.slice(2));
   }
   if (head === 'path' && (name === 'module' || name === 'root' || name === 'cwd')) {
     if (parts.length !== 2) return undefined;
     const root = rootDirOf(scope);
     if (name === 'cwd') {
-      if (scope.cwd !== undefined) return scope.cwd;
+      // a configured run directory belongs to the configured root: for a module
+      // another root owns it says nothing, and the assumption below applies
+      if (scope.cwd !== undefined && (scope.rootDir === undefined || root === scope.rootDir))
+        return scope.cwd;
       // The run directory is in no file: `cd infra && terraform plan` and
       // `terraform -chdir=infra plan` from the repo root differ, and path.cwd is
       // the original directory, before -chdir. The usual workflow is the first,
@@ -922,20 +896,25 @@ function resolveRefValue(parts: string[], scope: EvalScope, depth: number): Valu
 }
 
 /** The root module this module is reached from, or nothing when that is not a
- *  single directory. An explicit `rootDir` (the setting) wins. Otherwise the
- *  root is found the way `resolveVar` already finds it — a directory no
- *  `module` block calls is a root, which is also what makes its variables come
- *  from tfvars — by climbing the callers, honouring the call site the hover is
- *  pinned to. Reached from two roots, `path.module` differs between them, so
- *  nothing is claimed; a loop of modules that only call each other has no root. */
+ *  single directory. The root is found the way `resolveVar` already finds it — a
+ *  directory no `module` block calls is a root, which is also what makes its
+ *  variables come from tfvars — by climbing the callers, honouring the call site
+ *  the hover is pinned to. An explicit `rootDir` (the setting) is a root the
+ *  climb stops at, and settles it for every module under it. It cannot speak for
+ *  a module another root owns, so there the root found from the files stands.
+ *  Reached from two roots, `path.module` differs between them, so nothing is
+ *  claimed; a loop of modules that only call each other has no root. */
 function rootDirOf(scope: EvalScope): string | undefined {
-  if (scope.rootDir !== undefined) return scope.rootDir;
   const roots = new Set<string>();
   const seen = new Set<string>();
   const climb = (dir: string): boolean => {
     if (seen.has(dir)) return true; // a loop contributes no root of its own
     if (seen.size >= MAX_REF_HOPS) return false;
     seen.add(dir);
+    if (dir === scope.rootDir) {
+      roots.add(dir);
+      return true;
+    }
     const pinned = scope.pinnedSites?.get(dir);
     const sites = pinned ? [pinned] : scope.index.externalCallSitesOf(dir);
     if (sites.length === 0) {
@@ -944,7 +923,9 @@ function rootDirOf(scope: EvalScope): string | undefined {
     }
     return sites.every((site) => climb(site.callerDir));
   };
-  return climb(scope.moduleDir) && roots.size === 1 ? [...roots][0] : undefined;
+  if (!climb(scope.moduleDir)) return undefined;
+  if (scope.rootDir !== undefined && roots.has(scope.rootDir)) return scope.rootDir;
+  return roots.size === 1 ? [...roots][0] : undefined;
 }
 
 /** Module name + shortest path suffix that disambiguates sites — basenames
@@ -1142,17 +1123,19 @@ export function listShape(text: string, scope: EvalScope): ListShape {
     (scoped.state?.spends ?? 0) > 0 || scoped.state?.gaveUp === true
       ? { kind: 'unknown', overBudget: true }
       : { kind: 'unknown' };
-  if (value instanceof SetValue) {
-    if (!value.values.every((v): v is string => typeof v === 'string')) {
-      return { kind: 'nonStrings' };
-    }
-    return { kind: 'strings', values: value.values };
-  }
-  if (!Array.isArray(value)) return unknown;
+  // a set is read exactly as the list it was made from
+  const items = value instanceof SetValue ? value.values : Array.isArray(value) ? value : undefined;
+  if (!items) return unknown;
   // an unresolved element says nothing; a resolved non-string says everything
   // — numbers count too, for_each rejects those
-  if (value.some((v) => Array.isArray(v) || isObject(v) || v instanceof NonString)) {
+  if (
+    items.some(
+      (v) => Array.isArray(v) || isObject(v) || v instanceof SetValue || v instanceof NonString,
+    )
+  ) {
     return { kind: 'nonStrings' };
   }
-  return value.every((v) => typeof v === 'string') ? { kind: 'strings', values: value } : unknown;
+  return items.every((v): v is string => typeof v === 'string')
+    ? { kind: 'strings', values: items }
+    : unknown;
 }

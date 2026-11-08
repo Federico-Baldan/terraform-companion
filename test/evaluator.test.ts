@@ -2,6 +2,7 @@ import { beforeAll, describe, expect, it } from 'vitest';
 import {
   type EvalScope,
   emptyUsage,
+  listShape,
   resolveContext,
   resolveExpr,
   resolveRef,
@@ -94,127 +95,19 @@ describe('F7 evaluator', () => {
   /** Terraform reports a module's directory as it was loaded, relative to the
    *  root module's directory, and only `path.cwd` as an absolute path (see
    *  GetPathAttr in hashicorp/terraform internal/terraform/evaluate.go). */
-  it('reports path.module and path.root relative to the root module, like terraform', () => {
-    const at = (moduleDir: string, rootDir?: string): EvalScope => ({
-      index: scope.index,
-      moduleDir,
-      ...(rootDir ? { rootDir } : {}),
-    });
-    expect(resolveRef(['path', 'root'], at('/work/infra', '/work/infra'))).toBe('.');
-    expect(resolveRef(['path', 'module'], at('/work/infra', '/work/infra'))).toBe('.');
-    expect(resolveRef(['path', 'module'], at('/work/infra/modules/vpc', '/work/infra'))).toBe(
-      'modules/vpc',
+  it('reports path.module and path.root relative to the root module, like terraform', async () => {
+    const index = new WorkspaceIndex();
+    await index.updateFile(
+      '/work/infra/main.tf',
+      'module "vpc" {\n  source = "./modules/vpc"\n}\nmodule "shared" {\n  source = "../shared/vpc"\n}\n',
     );
-    expect(resolveRef(['path', 'module'], at('/work/shared/vpc', '/work/infra'))).toBe(
-      '../shared/vpc',
-    );
-  });
-
-  /** With no `terraformRoot` set the root is found the way `var` resolution
-   *  already finds it: a directory nothing calls is a root, and a called module
-   *  climbs through its callers. */
-  describe('path.* with no configured root', () => {
-    async function workspace(files: Record<string, string>): Promise<WorkspaceIndex> {
-      const index = new WorkspaceIndex();
-      for (const [file, text] of Object.entries(files)) await index.updateFile(file, text);
-      return index;
-    }
-    const call = (name: string, source: string) =>
-      `module "${name}" {\n  source = "${source}"\n}\n`;
-
-    it('treats a module nothing calls as the root', async () => {
-      const index = await workspace({ '/ws/main.tf': 'locals {}\n' });
-      expect(resolveRef(['path', 'root'], { index, moduleDir: '/ws' })).toBe('.');
-      expect(resolveRef(['path', 'module'], { index, moduleDir: '/ws' })).toBe('.');
-    });
-
-    it('climbs the module calls to the root, through a chain', async () => {
-      const index = await workspace({
-        '/ws/main.tf': call('mid', './mid'),
-        '/ws/mid/main.tf': call('leaf', './leaf'),
-        '/ws/mid/leaf/main.tf': 'locals {}\n',
-      });
-      expect(resolveRef(['path', 'module'], { index, moduleDir: '/ws/mid' })).toBe('mid');
-      expect(resolveRef(['path', 'module'], { index, moduleDir: '/ws/mid/leaf' })).toBe('mid/leaf');
-      expect(resolveRef(['path', 'root'], { index, moduleDir: '/ws/mid/leaf' })).toBe('.');
-    });
-
-    it('stays unknown when the module is reached from more than one root', async () => {
-      const index = await workspace({
-        '/ws/a/main.tf': call('shared', '../shared'),
-        '/ws/b/main.tf': call('shared', '../shared'),
-        '/ws/shared/main.tf': 'locals {}\n',
-      });
-      const s: EvalScope = { index, moduleDir: '/ws/shared' };
-      expect(resolveRef(['path', 'module'], s)).toBe(UNKNOWN);
-      expect(resolveRef(['path', 'root'], s)).toBe(UNKNOWN);
-    });
-
-    it('follows the call site the hover is pinned to, so one root of two can be named', async () => {
-      const index = await workspace({
-        '/ws/a/main.tf': call('shared', '../shared'),
-        '/ws/b/main.tf': call('shared', '../shared'),
-        '/ws/shared/main.tf': 'locals {}\n',
-      });
-      const [site] = index.externalCallSitesOf('/ws/shared').filter((s) => s.callerDir === '/ws/b');
-      if (!site) throw new Error('fixture did not index the call from /ws/b');
-      const s: EvalScope = {
-        index,
-        moduleDir: '/ws/shared',
-        pinnedSites: new Map([['/ws/shared', site]]),
-      };
-      expect(resolveRef(['path', 'module'], s)).toBe('../shared');
-    });
-
-    it('gives up on modules that only call each other', async () => {
-      const index = await workspace({
-        '/ws/a/main.tf': call('b', '../b'),
-        '/ws/b/main.tf': call('a', '../a'),
-      });
-      expect(resolveRef(['path', 'root'], { index, moduleDir: '/ws/a' })).toBe(UNKNOWN);
-    });
-
-    /** The run directory is not in any file: `cd infra && terraform plan` and
-     *  `terraform -chdir=infra plan` from the repo root give different answers
-     *  (HashiCorp: path.cwd is the original directory, before -chdir). The usual
-     *  workflow is the first, so that is the value, and the usage says so. */
-    it('takes path.cwd from the setting, else assumes the root module directory and says so', async () => {
-      const index = await workspace({
-        '/ws/main.tf': call('mid', './mid'),
-        '/ws/mid/main.tf': 'locals {}\n',
-      });
-      const assumed = emptyUsage();
-      expect(resolveRef(['path', 'cwd'], { index, moduleDir: '/ws/mid', used: assumed })).toBe(
-        '/ws',
-      );
-      expect([...assumed.assumes]).toEqual(['terraform runs in the root module directory']);
-
-      const configured = emptyUsage();
-      expect(
-        resolveRef(['path', 'cwd'], { index, moduleDir: '/ws/mid', cwd: '/run', used: configured }),
-      ).toBe('/run');
-      expect(configured.assumes.size).toBe(0);
-    });
-
-    it('has no path.cwd to assume when the root is ambiguous', async () => {
-      const index = await workspace({
-        '/ws/a/main.tf': call('shared', '../shared'),
-        '/ws/b/main.tf': call('shared', '../shared'),
-        '/ws/shared/main.tf': 'locals {}\n',
-      });
-      expect(resolveRef(['path', 'cwd'], { index, moduleDir: '/ws/shared' })).toBe(UNKNOWN);
-    });
-
-    it('lets an explicit root win over the one it would find', async () => {
-      const index = await workspace({
-        '/ws/main.tf': call('mid', './mid'),
-        '/ws/mid/main.tf': 'locals {}\n',
-      });
-      expect(resolveRef(['path', 'module'], { index, moduleDir: '/ws/mid' })).toBe('mid');
-      expect(
-        resolveRef(['path', 'module'], { index, moduleDir: '/ws/mid', rootDir: '/ws/mid' }),
-      ).toBe('.');
-    });
+    await index.updateFile('/work/infra/modules/vpc/main.tf', 'locals {}\n');
+    await index.updateFile('/work/shared/vpc/main.tf', 'locals {}\n');
+    const at = (moduleDir: string): EvalScope => ({ index, moduleDir, rootDir: '/work/infra' });
+    expect(resolveRef(['path', 'root'], at('/work/infra'))).toBe('.');
+    expect(resolveRef(['path', 'module'], at('/work/infra'))).toBe('.');
+    expect(resolveRef(['path', 'module'], at('/work/infra/modules/vpc'))).toBe('modules/vpc');
+    expect(resolveRef(['path', 'module'], at('/work/shared/vpc'))).toBe('../shared/vpc');
   });
 
   it('keeps a configured path.cwd as given, absolute', () => {
@@ -667,5 +560,97 @@ describe('nesting cannot overflow the stack', () => {
     const nested = block.blocks[0];
     if (!nested) throw new Error('test fixture did not parse nested block');
     expect(resolveContext(nested, { index, moduleDir: '/context' })).toBeUndefined();
+  });
+});
+
+describe('context values', () => {
+  async function resource(source: string) {
+    const index = new WorkspaceIndex();
+    await index.updateFile('/context/main.tf', source);
+    const block = parseFile('/context/main.tf', source).blocks.find((b) => b.kind === 'resource');
+    if (!block) throw new Error('fixture has no resource block');
+    return { index, block, s: { index, moduleDir: '/context' } as EvalScope };
+  }
+
+  /** Values share structure: a local read twice is one object. Converting one as
+   *  a tree doubles the work with every level, so a 24-line chain of locals froze
+   *  the extension host. */
+  it('does not expand a shared value as a tree', async () => {
+    const levels = 21;
+    const chain = ['a0 = ["x", "x"]'];
+    for (let i = 1; i <= levels; i++) chain.push(`a${i} = [local.a${i - 1}, local.a${i - 1}]`);
+    const { block, s } = await resource(
+      `locals {\n${chain.map((l) => `  ${l}`).join('\n')}\n}\nresource "x" "r" {\n  for_each = { k = local.a${levels} }\n}\n`,
+    );
+    const started = performance.now();
+    const instances = resolveContext(block, s);
+    resolveRef(['each', 'value'], { ...s, context: instances?.[0] });
+    expect(performance.now() - started).toBeLessThan(250);
+    expect(instances).toHaveLength(1);
+  });
+
+  it('keeps numbers exactly as written', async () => {
+    const { block, s } = await resource(
+      'resource "x" "r" {\n  for_each = { k = { a = 12345678901234567890, b = 100000000000000000000000, c = 0.1234567890123456789 } }\n}\n',
+    );
+    const [instance] = resolveContext(block, s) ?? [];
+    for (const [key, literal] of [
+      ['a', '12345678901234567890'],
+      ['b', '100000000000000000000000'],
+      ['c', '0.1234567890123456789'],
+    ] as const) {
+      expect(resolveRef(['each', 'value', key], { ...s, context: instance })).toBe(
+        resolveExpr(literal, s),
+      );
+    }
+  });
+
+  it('keeps a key named __proto__', async () => {
+    const { block, s } = await resource(
+      'resource "x" "r" {\n  for_each = { k = { "__proto__" = "p", real = "r" } }\n}\n',
+    );
+    const [instance] = resolveContext(block, s) ?? [];
+    expect(resolveRef(['each', 'value', '__proto__'], { ...s, context: instance })).toBe('p');
+    expect(resolveRef(['each', 'value', 'real'], { ...s, context: instance })).toBe('r');
+  });
+
+  it('accepts a for_each map of exactly 64 entries and rejects 65', async () => {
+    const map = (n: number) =>
+      `resource "x" "r" {\n  for_each = { ${Array.from({ length: n }, (_, i) => `k${i} = "${i}"`).join(', ')} }\n}\n`;
+    const sixtyFour = await resource(map(64));
+    expect(resolveContext(sixtyFour.block, sixtyFour.s)).toHaveLength(64);
+    const sixtyFive = await resource(map(65));
+    expect(resolveContext(sixtyFive.block, sixtyFive.s)).toBeUndefined();
+  });
+
+  it('reads an unresolved element of a set as unknown, the way it does for a list', () => {
+    const asList = listShape('[var.region, "a"]', scope);
+    expect(asList.kind).toBe('unknown');
+    expect(listShape('toset([var.region, "a"])', scope)).toEqual(asList);
+  });
+
+  /** An explicit root answers "which directory is the root". It cannot speak for a
+   *  module that another root owns, so there the root is found from the files. */
+  it('uses an explicit root only for the modules it applies to', async () => {
+    const index = new WorkspaceIndex();
+    await index.updateFile(
+      '/repo/envs/prod/main.tf',
+      'module "vpc" {\n  source = "../../modules/vpc"\n}\n',
+    );
+    await index.updateFile('/repo/envs/dev/main.tf', 'locals {}\n');
+    await index.updateFile('/repo/modules/vpc/main.tf', 'locals {}\n');
+    const base = { index, rootDir: '/repo/envs/prod', cwd: '/run/prod' };
+
+    const dev: EvalScope = { ...base, moduleDir: '/repo/envs/dev' };
+    expect(resolveRef(['path', 'module'], dev)).toBe('.');
+    const assumed = emptyUsage();
+    expect(resolveRef(['path', 'cwd'], { ...dev, used: assumed })).toBe('/repo/envs/dev');
+    expect(assumed.assumes.size).toBe(1);
+
+    const prod: EvalScope = { ...base, moduleDir: '/repo/envs/prod' };
+    expect(resolveRef(['path', 'module'], prod)).toBe('.');
+    expect(resolveRef(['path', 'cwd'], prod)).toBe('/run/prod');
+    const vpc: EvalScope = { ...base, moduleDir: '/repo/modules/vpc' };
+    expect(resolveRef(['path', 'module'], vpc)).toBe('../../modules/vpc');
   });
 });

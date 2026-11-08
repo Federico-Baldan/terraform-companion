@@ -131,8 +131,8 @@ All keys are under `tfCompanion.`
 | `versionLens.enabled` | `true` | |
 | `versionLens.cacheTtlHours` | `6` | floored at 5 minutes |
 | `resolvedHover.enabled` | `true` | |
-| `terraformRoot` | unset | root module directory, for `path.root` and `path.module` in the hover; by default the module nothing calls |
-| `terraformCwd` | unset | directory Terraform runs from, for `path.cwd` in the hover; by default the root module directory |
+| `terraformRoot` | unset | absolute path of the root module, for `path.root` and `path.module` in the hover; by default the module nothing calls |
+| `terraformCwd` | unset | absolute path Terraform runs from, for `path.cwd` in the hover; by default the root module directory |
 | `countForEach.enabled` | `true` | |
 | `dependsOn.enabled` | `true` | |
 | `unusedLocals.enabled` | `true` | |

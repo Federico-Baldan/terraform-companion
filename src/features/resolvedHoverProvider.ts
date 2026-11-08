@@ -1,7 +1,7 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { basename, dirname } from 'node:path';
 import * as vscode from 'vscode';
-import { featureEnabled } from '../config';
+import { featureEnabled, terraformCwd, terraformRoot } from '../config';
 import type { TfvarsValue } from '../core/evaluator';
 import type { ParsedFile } from '../core/model';
 import { parseFile } from '../core/parser';
@@ -448,12 +448,8 @@ export function registerResolvedHover(
         if (token.isCancellationRequested) return undefined;
         const file = parseCached(document, path);
         if (!file || token.isCancellationRequested) return undefined;
-        const configuredRoot = vscode.workspace
-          .getConfiguration('tfCompanion')
-          .get<string>('terraformRoot');
-        const configuredCwd = vscode.workspace
-          .getConfiguration('tfCompanion')
-          .get<string>('terraformCwd');
+        const configuredRoot = terraformRoot();
+        const configuredCwd = terraformCwd();
         const body = computeHover(
           file,
           { row: position.line, column: position.character },
@@ -461,10 +457,9 @@ export function registerResolvedHover(
             index,
             tfvarsOf: (dir) => active.valuesFor(dir),
             copyCommand: COPY_VALUE_COMMAND,
-            // A workspace folder is the only root information VS Code
-            // authoritatively supplies. Terraform's invocation directory is
-            // not the extension host cwd; expose it only when explicitly
-            // configured by the user.
+            // Both are optional overrides: without them the root is found from the
+            // module calls, and the run directory is assumed to be the root. They
+            // are used only when absolute (see config.ts).
             rootDir: configuredRoot ? normalizePath(configuredRoot) : undefined,
             cwd: configuredCwd ? normalizePath(configuredCwd) : undefined,
             isCancelled: () => token.isCancellationRequested,

@@ -283,6 +283,19 @@ export interface HoverContext {
   isCancelled?: () => boolean;
 }
 
+/** A `for` expression binds its own iterator names, so inside one `each` or
+ *  `count` is not the block's. Matched on the text of the attribute under the
+ *  cursor, which is conservative: it also silences a reference outside the `for`
+ *  in the same attribute, and the cost of that is a missing hover, not a wrong
+ *  one. */
+function rebindsInFor(block: import('../core/model').TfBlock, pos: Pos, name: string): boolean {
+  const attr = block.attrs.find((a) => spanContainsExclusiveEnd(a.valueSpan, pos));
+  if (!attr) return false;
+  return new RegExp(`\\bfor\\s+(?:${name}\\s*,|(?:[\\w-]+\\s*,\\s*)?${name}\\s+in\\b)`).test(
+    attr.valueText,
+  );
+}
+
 function enclosingBlock(file: ParsedFile, pos: Pos): import('../core/model').TfBlock | undefined {
   let best: import('../core/model').TfBlock | undefined;
   const visit = (blocks: import('../core/model').TfBlock[]): void => {
@@ -351,14 +364,24 @@ export function computeHover(file: ParsedFile, pos: Pos, ctx: HoverContext): str
     used,
   };
   if (ctx.isCancelled?.()) return undefined;
-  const contextTarget = target[0] === 'count' || target[0] === 'each';
+  const kind = target[0];
+  const contextTarget = kind === 'count' || kind === 'each';
   const block = enclosingBlock(file, pos);
+  if (contextTarget && block && rebindsInFor(block, pos, kind)) return undefined;
+  // discovering the instances reads `count` or `for_each` through the same
+  // evaluator; its provenance is that expression's, not the value hovered, so it
+  // is kept in a usage of its own
   const instances =
     contextTarget && block && !file.hasError
-      ? resolveContext(block, scope, { isCancelled: ctx.isCancelled })
+      ? resolveContext(block, { ...scope, used: emptyUsage() }, { isCancelled: ctx.isCancelled })
       : undefined;
   if (ctx.isCancelled?.()) return undefined;
   if (contextTarget && (!instances || instances.length === 0)) return undefined;
+  // `count.index` in a for_each block, or `each.key` in a count block, has no
+  // instance to read: a column of ⟨unknown⟩ says nothing
+  const needed = kind === 'count' ? 'countIndex' : 'eachKey';
+  if (contextTarget && instances?.some((instance) => instance[needed] === undefined))
+    return undefined;
   if (instances && instances.length > 1) {
     for (const instance of instances) {
       if (ctx.isCancelled?.()) return undefined;
@@ -376,6 +399,7 @@ export function computeHover(file: ParsedFile, pos: Pos, ctx: HoverContext): str
       shape: 'unknown',
       used,
       copyCommand: ctx.copyCommand,
+      rows: 'instance',
       ...(ctx.isCancelled ? { isCancelled: ctx.isCancelled } : {}),
     });
   }
@@ -442,6 +466,9 @@ export interface HoverParts {
   copyCommand: string;
   /** instances past MAX_CONFLICT_SITES that were never resolved */
   conflictsOmitted?: number;
+  /** What the rows of `used.conflicts` are: the instances of one module called
+   *  from several places (the default), or the instances of one block. */
+  rows?: 'module' | 'instance';
   isCancelled?: () => boolean;
 }
 
@@ -459,6 +486,7 @@ export function hoverMarkdown({
   tfvarsNames,
   copyCommand,
   conflictsOmitted = 0,
+  rows: rowsKind = 'module',
   isCancelled,
 }: HoverParts): string | undefined {
   // a block label is whatever the parser accepted between the quotes, and this
@@ -524,7 +552,7 @@ export function hoverMarkdown({
     const more = dropped > 0 ? `\n- …and ${dropped} more instance${dropped === 1 ? '' : 's'}` : '';
     return isCancelled?.()
       ? undefined
-      : `**${name}** differs per module instance:\n\n${rows.join('\n')}${more}`;
+      : `**${name}** ${rowsKind === 'instance' ? 'per instance' : 'differs per module instance'}:\n\n${rows.join('\n')}${more}`;
   }
 
   const origins: string[] = [];
@@ -605,7 +633,10 @@ function escapeMd(v: string, isCancelled?: () => boolean): string | undefined {
   let out = '';
   for (const char of v) {
     if (isCancelled?.()) return undefined;
-    out += /[\\`[\]<>*_~]/.test(char) ? `\\${char}` : char;
+    // a line break would end the list row it is in, and a key chosen by the file
+    // being hovered could write the next line of the markdown itself
+    if (char === '\n' || char === '\r') out += ' ';
+    else out += /[\\`[\]<>*_~]/.test(char) ? `\\${char}` : char;
   }
   return out;
 }
