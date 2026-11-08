@@ -1334,10 +1334,10 @@ export function listShape(text: string, scope: EvalScope): ListShape {
   // `gaveUp` covers the give-ups that must not disturb the memo (depth, and the
   // string/format size caps); `spends` covers the rest. Either one means this
   // list was never measured, which is the answer a destructive rewrite needs.
-  const unknown: ListShape =
-    (scoped.state?.spends ?? 0) > 0 || scoped.state?.gaveUp === true
-      ? { kind: 'unknown', overBudget: true }
-      : { kind: 'unknown' };
+  const unmeasured = (scoped.state?.spends ?? 0) > 0 || scoped.state?.gaveUp === true;
+  const unknown: ListShape = unmeasured
+    ? { kind: 'unknown', overBudget: true }
+    : { kind: 'unknown' };
   // a set is read exactly as the list it was made from
   const items = value instanceof SetValue ? value.values : Array.isArray(value) ? value : undefined;
   if (!items) return unknown;
@@ -1350,7 +1350,10 @@ export function listShape(text: string, scope: EvalScope): ListShape {
   ) {
     return { kind: 'nonStrings' };
   }
-  return items.every((v): v is string => typeof v === 'string')
-    ? { kind: 'strings', values: items }
-    : unknown;
+  if (!items.every((v): v is string => typeof v === 'string')) return unknown;
+  // A reference a budget gave up on reads as the text ⟨unknown⟩ inside an
+  // interpolation, so `["${local.hot}", "x"]` is two strings that look different
+  // when `hot` is really "x". Strings are only certified when nothing gave up on
+  // the way: the duplicate check below the caller is only as good as the values.
+  return unmeasured ? unknown : { kind: 'strings', values: items };
 }

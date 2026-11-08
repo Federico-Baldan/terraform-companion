@@ -531,6 +531,39 @@ describe('a reference that ran out of budget is evaluated once', () => {
     expect(listShape(`local.d${levels}`, at)).not.toMatchObject({ kind: 'strings' });
   });
 
+  /** A reference a budget gave up on reads as the text ⟨unknown⟩ when it sits in an
+   *  interpolation, so `["${local.hot}", "x"]` is two strings — and two strings
+   *  that look different, when `hot` is really "x". The list was never measured,
+   *  which the count -> for_each check must read as "cannot certify": toset()
+   *  would collapse the real duplicates while count built them all. */
+  it('does not certify a list that holds an element the hop limit gave up on', async () => {
+    const index = new WorkspaceIndex();
+    const lines = ['locals {', '  c0 = "x"'];
+    for (let i = 1; i <= 260; i++) lines.push(`  c${i} = local.c${i - 1}`);
+    lines.push('  hot = local.c260', '  names = ["${local.hot}", "x"]', '}', '');
+    await index.updateFile('/certify/hops.tf', lines.join('\n'));
+    expect(listShape('local.names', { index, moduleDir: '/certify' })).toEqual({
+      kind: 'unknown',
+      overBudget: true,
+    });
+  });
+
+  /** The same through the cap on reference evaluations: the elements past it are
+   *  given up on, and a list of strings that looks unique is not one. */
+  it('does not certify a list that holds an element the evaluation cap gave up on', async () => {
+    const index = new WorkspaceIndex();
+    const count = 20_100;
+    const lines = ['locals {'];
+    for (let i = 0; i < count; i++) lines.push(`  v${i} = "x${i}"`);
+    const elements = Array.from({ length: count }, (_, i) => `"\${local.v${i}}"`);
+    lines.push(`  names = [${elements.join(', ')}]`, '}', '');
+    await index.updateFile('/certify/cap.tf', lines.join('\n'));
+    expect(listShape('local.names', { index, moduleDir: '/certify' })).toEqual({
+      kind: 'unknown',
+      overBudget: true,
+    });
+  });
+
   /** The number it may start is a ceiling on pathological work, not a limit anyone
    *  meets: with the memo, a resolve evaluates each distinct reference once, and
    *  this reads five thousand of them. */
