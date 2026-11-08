@@ -122,7 +122,7 @@ The cleaner also covers Terraform's shared plugin cache (`plugin_cache_dir` or `
 
 It offers provider versions installed over `staleDays` days ago that no `.terraform.lock.hcl` in the workspace names. Terraform never touches a cache entry after installing it, so the date is when it was installed, not when it was last used, and another project may still use the provider. If you delete one that is in use, that project needs `terraform init` again.
 
-A project in the workspace keeps its providers even without a lock file. The lock files are read again right before anything is deleted. The cache is left alone when no folder is open, when a lock file could not be read, or when `plugin_cache_dir` points at a local provider mirror such as `~/.terraform.d/plugins`.
+A project in the workspace keeps its providers even without a lock file. The lock files are read again right before anything is deleted. The cache is left alone when no folder is open, when a lock file could not be read, or when `plugin_cache_dir` points at a local provider mirror, such as `~/.terraform.d/plugins` or a `filesystem_mirror` path in your CLI config. A relative `filesystem_mirror` path also leaves it alone, because it cannot be compared.
 
 ## Offline
 

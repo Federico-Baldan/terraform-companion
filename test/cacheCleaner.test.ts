@@ -561,6 +561,18 @@ provider "registry.terraform.io/hashicorp/random" {
         expect(await configuredProviderCache()).toBe(join(root, 'from-b'));
       });
 
+      it('refuses a cache that a mirror in another config file names', async () => {
+        const dir = home();
+        const shared = join(root, 'shared');
+        mkdirSync(shared, { recursive: true });
+        writeFileSync(join(dir, '.terraformrc'), `plugin_cache_dir = "${shared}"\n`);
+        writeFileSync(
+          join(dir, '.terraform.d', 'mirror.tfrc'),
+          `provider_installation {\n  filesystem_mirror {\n    path = "${shared}"\n  }\n}\n`,
+        );
+        expect(await configuredProviderCache()).toBeUndefined();
+      });
+
       it('skips the directory when an override env var is set', async () => {
         const dir = home();
         writeFileSync(
@@ -609,6 +621,127 @@ provider "registry.terraform.io/hashicorp/random" {
       process.env.TF_PLUGIN_CACHE_DIR = join(root, 'share', 'terraform', 'plugins');
       expect(await configuredProviderCache((m) => logged.push(m))).toBeUndefined();
       expect(logged.join('\n')).toContain('mirror');
+    });
+
+    /** HashiCorp: "The plugin cache directory must not also be one of the
+     *  configured or implied filesystem mirror directories". A mirror holds
+     *  providers placed by hand, in the layout of a cache, and the path is not
+     *  expanded or checked by Terraform: it is taken as written. */
+    describe('a configured filesystem mirror', () => {
+      const withMirror = (dir: string) =>
+        `provider_installation {\n  filesystem_mirror {\n    path = "${dir}"\n  }\n  direct {}\n}\n`;
+      const cache = () => {
+        const dir = join(root, 'shared');
+        mkdirSync(dir, { recursive: true });
+        return dir;
+      };
+      const refused = async (): Promise<string[]> => {
+        const logged: string[] = [];
+        expect(await configuredProviderCache((m) => logged.push(m))).toBeUndefined();
+        return logged;
+      };
+
+      it('is refused as the cache, whichever way the cache was configured', async () => {
+        const dir = cache();
+        cliConfig(withMirror(dir));
+        process.env.TF_PLUGIN_CACHE_DIR = dir;
+        expect((await refused()).join('\n')).toContain('filesystem_mirror');
+
+        delete process.env.TF_PLUGIN_CACHE_DIR;
+        cliConfig(`plugin_cache_dir = "${dir}"\n${withMirror(dir)}`);
+        await refused();
+      });
+
+      it('is recognised through a trailing slash and through a symlink', async () => {
+        const dir = cache();
+        const link = join(root, 'link-to-shared');
+        symlinkSync(dir, link);
+        process.env.TF_PLUGIN_CACHE_DIR = link;
+        cliConfig(withMirror(`${dir}/`));
+        await refused();
+      });
+
+      it('is recognised written on one line, with a quoted key, or in JSON', async () => {
+        const dir = cache();
+        process.env.TF_PLUGIN_CACHE_DIR = dir;
+        cliConfig(`provider_installation { filesystem_mirror { path = "${dir}" } }\n`);
+        await refused();
+        cliConfig(
+          `"provider_installation" {\n  "filesystem_mirror" {\n    "path" = "${dir}"\n  }\n}\n`,
+        );
+        await refused();
+
+        const json = join(root, 'terraform.rc.json');
+        writeFileSync(
+          json,
+          JSON.stringify({ provider_installation: { filesystem_mirror: { path: dir } } }),
+        );
+        process.env.TF_CLI_CONFIG_FILE = json;
+        await refused();
+        writeFileSync(
+          json,
+          JSON.stringify({
+            provider_installation: [{ filesystem_mirror: [{ path: '/elsewhere' }, { path: dir }] }],
+          }),
+        );
+        await refused();
+      });
+
+      it('is refused when any of several mirrors is the cache', async () => {
+        const dir = cache();
+        process.env.TF_PLUGIN_CACHE_DIR = dir;
+        cliConfig(
+          `provider_installation {\n  filesystem_mirror {\n    path = "/elsewhere"\n  }\n  filesystem_mirror {\n    path = "${dir}"\n  }\n}\n`,
+        );
+        await refused();
+      });
+
+      it('does not matter when the mirror is somewhere else', async () => {
+        const dir = cache();
+        process.env.TF_PLUGIN_CACHE_DIR = dir;
+        cliConfig(withMirror(join(root, 'another-mirror')));
+        expect(await configuredProviderCache()).toBe(dir);
+      });
+
+      it('is not read from a comment, or from a block that is not a mirror', async () => {
+        const dir = cache();
+        process.env.TF_PLUGIN_CACHE_DIR = dir;
+        cliConfig(
+          `# filesystem_mirror { path = "${dir}" }\n/* provider_installation {\n  filesystem_mirror {\n    path = "${dir}"\n  }\n} */\nprovider_installation {\n  direct {\n    path = "${dir}"\n  }\n}\n`,
+        );
+        expect(await configuredProviderCache()).toBe(dir);
+        // only provider_installation declares a mirror
+        cliConfig(
+          `unrelated {\n  filesystem_mirror {\n    path = "${dir}"\n  }\n}\nfilesystem_mirror {\n  path = "${dir}"\n}\n`,
+        );
+        expect(await configuredProviderCache()).toBe(dir);
+      });
+
+      /** Terraform takes a relative path against its own working directory, which
+       *  the extension cannot know, so it could be the cache. Any doubt leaves the
+       *  cache alone. */
+      it('leaves the cache alone when a mirror path is relative, and says why', async () => {
+        const dir = cache();
+        process.env.TF_PLUGIN_CACHE_DIR = dir;
+        cliConfig(withMirror('providers'));
+        expect((await refused()).join('\n')).toContain('relative');
+      });
+
+      it('does not expand variables in the path, as Terraform does not', async () => {
+        const dir = cache();
+        process.env.TF_PLUGIN_CACHE_DIR = dir;
+        process.env.TFC_TEST_MIRROR = dir;
+        cliConfig(withMirror('$TFC_TEST_MIRROR'));
+        // `$TFC_TEST_MIRROR` is a relative path to Terraform, hence the doubt
+        expect((await refused()).join('\n')).toContain('relative');
+        delete process.env.TFC_TEST_MIRROR;
+      });
+    });
+
+    it('reads a quoted key, which HCL allows', async () => {
+      const dir = join(root, 'quoted');
+      cliConfig(`"plugin_cache_dir" = "${dir}"\n`);
+      expect(await configuredProviderCache()).toBe(dir);
     });
 
     it('is undefined when nothing configures a cache', async () => {

@@ -1,7 +1,7 @@
 import type { Dirent } from 'node:fs';
 import { lstat, readdir, readFile, realpath, rm, stat } from 'node:fs/promises';
 import { homedir, platform } from 'node:os';
-import { basename, isAbsolute, join, relative, sep } from 'node:path';
+import { basename, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import * as semver from 'semver';
 
 // The shared provider cache below is deliberately modelled on what Terraform
@@ -27,10 +27,11 @@ export interface ProviderCacheEntry {
 }
 
 const LOCK_PROVIDER = /^\s*provider\s+"([^"]+)"\s*\{/gm;
-/** `plugin_cache_dir = "..."` at the start of a line. The scan below decides
- *  where a line may start; this only reads the assignment. Sticky, so it matches
+/** `key = "value"`, the key bare or quoted as HCL allows. Sticky, so it matches
  *  at exactly the position it is given. */
-const PLUGIN_CACHE_ASSIGNMENT = /plugin_cache_dir[ \t]*=[ \t]*"([^"\r\n]+)"/y;
+const STRING_ASSIGNMENT = /"?([A-Za-z_][\w-]*)"?[ \t]*=[ \t]*"([^"\r\n]*)"/y;
+/** `name {` or `name "label" {`: the start of a block. */
+const BLOCK_OPEN = /"?([A-Za-z_][\w-]*)"?(?:[ \t]+"[^"\r\n]*")*[ \t]*\{/y;
 
 /** Provider sources named by lock files. A lock file identifies a provider
  * source, not a single version, so protecting the whole source is the only
@@ -43,20 +44,30 @@ export function providerSourcesFromLockFile(contents: string): Set<string> {
   );
 }
 
-/** The top-level `plugin_cache_dir` of a Terraform CLI config. Terraform parses
- *  that file as HCL, where the setting only means something outside any block and
- *  a comment — `#`, `//` and `/* *​/` — says nothing. A pattern on the raw text
- *  could not tell `provider_installation { plugin_cache_dir = ... }` or a
- *  commented-out line from the real thing, so the text is walked instead:
- *  comments and strings are skipped, braces counted, and an assignment is read
- *  only where a line starts at depth zero. */
-export function pluginCacheDirOf(text: string): string | undefined {
-  let depth = 0;
-  let lineStart = true;
+interface StringAssignment {
+  /** the names of the blocks it sits in, outermost first */
+  blocks: readonly string[];
+  key: string;
+  value: string;
+}
+
+/** Every `key = "string"` of a Terraform CLI config, with the blocks around it.
+ *  Terraform parses that file as HCL, where an assignment only means something
+ *  in the block it is in, and a comment (`#`, `//`, `/* *​/`) says nothing. A
+ *  pattern on the raw text could not tell `provider_installation {
+ *  plugin_cache_dir = ... }` or a commented-out line from the real thing, so the
+ *  text is walked instead: comments and strings are skipped, blocks are named as
+ *  they open and close, and an assignment is read only where a statement starts,
+ *  which is a new line or the `{` of a block (`filesystem_mirror { path = "/x" }`
+ *  is one line). */
+function stringAssignmentsOf(text: string): StringAssignment[] {
+  const found: StringAssignment[] = [];
+  const blocks: string[] = [];
+  let statementStart = true;
   for (let i = 0; i < text.length; ) {
     const c = text.charAt(i);
     if (c === '\n') {
-      lineStart = true;
+      statementStart = true;
       i++;
     } else if (c === ' ' || c === '\t' || c === '\r') {
       i++;
@@ -67,25 +78,54 @@ export function pluginCacheDirOf(text: string): string | undefined {
       const end = text.indexOf('*/', i + 2);
       i = end < 0 ? text.length : end + 2;
     } else {
-      if (depth === 0 && lineStart) {
-        PLUGIN_CACHE_ASSIGNMENT.lastIndex = i;
-        const match = PLUGIN_CACHE_ASSIGNMENT.exec(text);
-        if (match?.[1]) return match[1];
+      if (statementStart) {
+        BLOCK_OPEN.lastIndex = i;
+        const open = BLOCK_OPEN.exec(text);
+        if (open?.[1]) {
+          blocks.push(open[1]);
+          i = BLOCK_OPEN.lastIndex;
+          continue;
+        }
+        STRING_ASSIGNMENT.lastIndex = i;
+        const assignment = STRING_ASSIGNMENT.exec(text);
+        if (assignment?.[1] !== undefined && assignment[2] !== undefined)
+          found.push({ blocks: [...blocks], key: assignment[1], value: assignment[2] });
       }
-      lineStart = false;
+      statementStart = c === '{';
       if (c === '"') {
         i++;
         while (i < text.length && text.charAt(i) !== '"' && text.charAt(i) !== '\n')
           i += text.charAt(i) === '\\' ? 2 : 1;
         i++;
       } else {
-        if (c === '{') depth++;
-        else if (c === '}') depth = Math.max(0, depth - 1);
+        if (c === '{') blocks.push('');
+        else if (c === '}') blocks.pop();
         i++;
       }
     }
   }
-  return undefined;
+  return found;
+}
+
+/** The top-level `plugin_cache_dir` of a Terraform CLI config. */
+export function pluginCacheDirOf(text: string): string | undefined {
+  return stringAssignmentsOf(text).find(
+    (a) => a.blocks.length === 0 && a.key === 'plugin_cache_dir' && a.value !== '',
+  )?.value;
+}
+
+/** The `path` of every `filesystem_mirror` block of a Terraform CLI config. */
+export function filesystemMirrorPathsOf(text: string): string[] {
+  return stringAssignmentsOf(text)
+    .filter(
+      (a) =>
+        a.key === 'path' &&
+        a.blocks.length === 2 &&
+        a.blocks[0] === 'provider_installation' &&
+        a.blocks[1] === 'filesystem_mirror' &&
+        a.value !== '',
+    )
+    .map((a) => a.value);
 }
 
 /** Whether `path` is absolute on `os`. On Windows a rooted path with no drive,
@@ -138,6 +178,60 @@ async function cliConfigFiles(): Promise<string[]> {
   ];
 }
 
+/** The `path` of every `filesystem_mirror` of a `*.tfrc.json` CLI config. HCL's
+ *  JSON syntax lets a block be an object or an array of them, at both levels. */
+function filesystemMirrorPathsOfJson(text: string): string[] {
+  const objects = (value: unknown): Record<string, unknown>[] =>
+    (Array.isArray(value) ? value : [value]).filter(
+      (item): item is Record<string, unknown> => typeof item === 'object' && item !== null,
+    );
+  const paths: string[] = [];
+  const root = objects(JSON.parse(text) as unknown);
+  for (const config of root)
+    for (const installation of objects(config.provider_installation))
+      for (const mirror of objects(installation.filesystem_mirror))
+        if (typeof mirror.path === 'string' && mirror.path !== '') paths.push(mirror.path);
+  return paths;
+}
+
+/** Every `filesystem_mirror` path of every CLI config file, not only the one that
+ *  names the cache: Terraform appends the `provider_installation` blocks of all of
+ *  them, and the cache may come from `TF_PLUGIN_CACHE_DIR`. Taken as written,
+ *  since Terraform neither expands nor checks it. */
+async function filesystemMirrorPaths(): Promise<string[]> {
+  const paths: string[] = [];
+  for (const candidate of await cliConfigFiles()) {
+    try {
+      const text = await readFile(candidate, 'utf8');
+      paths.push(
+        ...(candidate.endsWith('.json')
+          ? filesystemMirrorPathsOfJson(text)
+          : filesystemMirrorPathsOf(text)),
+      );
+    } catch {
+      // An absent or unparseable CLI config is normal; Terraform itself would
+      // refuse the second, and neither can name a mirror.
+    }
+  }
+  return paths;
+}
+
+/** Whether two paths are one directory: through links, trailing separators and,
+ *  where the file system ignores case, case. A path that does not exist is
+ *  compared as written. */
+async function sameDirectory(a: string, b: string): Promise<boolean> {
+  const canonical = async (path: string): Promise<string> => {
+    let real = resolve(path);
+    try {
+      real = await realpath(path);
+    } catch {
+      // not there: the written path is all there is to compare
+    }
+    return platform() === 'win32' ? real.toLowerCase() : real;
+  };
+  return (await canonical(a)) === (await canonical(b));
+}
+
 /** The `plugin_cache_dir` of a `*.tfrc.json` CLI config, which Terraform reads
  *  as JSON. */
 function pluginCacheDirOfJson(text: string): string | undefined {
@@ -172,6 +266,23 @@ export async function configuredProviderCache(
     if (LOCAL_MIRROR_DIR.test(dir) || LOCAL_MIRROR_DIR.test(real)) {
       log?.(`cacheCleaner: shared plugin cache ${dir} ignored, it is a local provider mirror`);
       return undefined;
+    }
+    // a mirror declared in the CLI config: Terraform says the cache must not be one
+    for (const mirror of await filesystemMirrorPaths()) {
+      if (!isAbsoluteFsPath(mirror)) {
+        // Terraform resolves it against its own working directory, which could
+        // make it this very directory, and nothing here can tell
+        log?.(
+          `cacheCleaner: shared plugin cache ${dir} ignored, filesystem_mirror path ${mirror} is relative so it cannot be told apart from the cache`,
+        );
+        return undefined;
+      }
+      if (await sameDirectory(dir, mirror)) {
+        log?.(
+          `cacheCleaner: shared plugin cache ${dir} ignored, the CLI config names it as a filesystem_mirror, which holds providers placed by hand`,
+        );
+        return undefined;
+      }
     }
     return dir;
   };
