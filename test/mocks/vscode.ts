@@ -1,4 +1,4 @@
-/** Minimal stand-in for the `vscode` module, aliased in by vitest.config.ts.
+/** Minimal stand-in for the `vscode` module, aliased in by vitest.config.mts.
  *
  *  The extension host is not available under vitest, so anything importing
  *  `vscode` was untestable — which left the cache cleaner's prompt, the one

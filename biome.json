@@ -6,7 +6,7 @@
     "useIgnoreFile": true
   },
   "files": {
-    "includes": ["src/**", "test/**", "esbuild.mjs", "vitest.config.ts"]
+    "includes": ["src/**", "test/**", "esbuild.mjs", "vitest.config.mts"]
   },
   "formatter": {
     "enabled": true,

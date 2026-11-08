@@ -21,7 +21,7 @@ assets/demos/**
 .terraform/**
 .terraform.lock.hcl
 esbuild.mjs
-vitest.config.ts
+vitest.config.mts
 tsconfig.json
 biome.json
 renovate.json
