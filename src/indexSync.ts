@@ -1,9 +1,16 @@
 import * as vscode from 'vscode';
 import { TrackedDirs } from './core/trackedDirs';
-import { normalizePath, type WorkspaceIndex } from './core/workspaceIndex';
+import { normalizePath, READ_CONCURRENCY, type WorkspaceIndex } from './core/workspaceIndex';
 import { isExcludedTfPath, isTfPath, TF_EXCLUDE, TF_GLOB } from './vscodeUtils';
 
 const DEBOUNCE_MS = 500;
+/** How long one disk read may go unanswered before it is given up on and its slot
+ *  freed. Reads are bounded (see `acquireRead`), so one that never returns — a
+ *  dead mount, a file system provider that lost its connection — would otherwise
+ *  hold its slot for good, and 24 of them would stop the index following the disk
+ *  until a reload. Far past any read that is going to answer; one that does
+ *  answer later is ignored, and the file is picked up by its next event. */
+const READ_TIMEOUT_MS = 30_000;
 /** How long a burst of index changes is allowed to gather before consumers are
  *  told. Short enough to stay invisible next to DEBOUNCE_MS, long enough that a
  *  git checkout's per-file watcher events land in one batch. */
@@ -43,6 +50,28 @@ export function registerIndexSync(
     return next;
   };
   const tokenOf = (path: string): number | undefined => epoch.get(normalizePath(path));
+  /** Disk reads in flight, and the events waiting for one of the slots.
+   *
+   *  A `git checkout` or `terraform fmt -recursive` reports one event per file, and
+   *  each started its own read on arrival, so a burst of 5000 files was 5000 round
+   *  trips to the main thread at once, on a channel every other extension shares.
+   *  The limit is the one the initial scan reads at, for the same reason. A slot
+   *  passes straight to the next waiter on release, so `reading` never dips and a
+   *  burst keeps every slot busy until it drains. */
+  let reading = 0;
+  const waiting: (() => void)[] = [];
+  const acquireRead = (): Promise<void> => {
+    if (reading < READ_CONCURRENCY) {
+      reading++;
+      return Promise.resolve();
+    }
+    return new Promise((resolve) => waiting.push(resolve));
+  };
+  const releaseRead = (): void => {
+    const next = waiting.shift();
+    if (next) next();
+    else reading--;
+  };
   const clearTimerFor = (path: string): void => {
     const key = normalizePath(path);
     const pending = timers.get(key);
@@ -139,19 +168,53 @@ export function registerIndexSync(
    *  `ignoreDirtyOf` is the document being disposed on a close: it can still be
    *  listed in `textDocuments`, and letting its own dirty state veto the read is
    *  exactly backwards — its text is the text being discarded. */
+  const readFile = (uri: vscode.Uri): Promise<Uint8Array> =>
+    new Promise((resolve, reject) => {
+      let read: Thenable<Uint8Array>;
+      try {
+        read = vscode.workspace.fs.readFile(uri);
+      } catch (e) {
+        reject(e);
+        return;
+      }
+      const timer = setTimeout(
+        () => reject(new Error(`no answer after ${READ_TIMEOUT_MS / 1000}s`)),
+        READ_TIMEOUT_MS,
+      );
+      read.then(
+        (bytes) => {
+          clearTimeout(timer);
+          resolve(bytes);
+        },
+        (e) => {
+          clearTimeout(timer);
+          reject(e);
+        },
+      );
+    });
+  const hasDirtyBuffer = (uri: vscode.Uri, ignoreDirtyOf?: vscode.TextDocument): boolean =>
+    vscode.workspace.textDocuments.some(
+      (d) => d !== ignoreDirtyOf && d.isDirty && d.uri.fsPath === uri.fsPath,
+    );
   const refreshFromDisk = async (uri: vscode.Uri, ignoreDirtyOf?: vscode.TextDocument) => {
     if (disposed || isExcludedTfPath(uri.fsPath)) return;
-    if (
-      vscode.workspace.textDocuments.some(
-        (d) => d !== ignoreDirtyOf && d.isDirty && d.uri.fsPath === uri.fsPath,
-      )
-    ) {
-      return;
-    }
+    if (hasDirtyBuffer(uri, ignoreDirtyOf)) return;
     tracked.add(uri.fsPath);
     const token = supersede(uri.fsPath);
+    await acquireRead();
     try {
-      const text = new TextDecoder().decode(await vscode.workspace.fs.readFile(uri));
+      // Replaced while it waited for a slot: a later event for this path, a
+      // delete or a buffer edit owns it now, and whatever was read here would be
+      // dropped by the check below. Events for one path come in twos and threes
+      // (an editor's temp file and rename, a formatter touching a file twice), so
+      // this is most of what a burst would otherwise read for nothing.
+      //
+      // The dirty check is made again for the same reason: it was true to the
+      // moment of the event, and the wait can be seconds long. An edit only takes
+      // the path over once its debounce fires, so a buffer opened and typed into
+      // meanwhile would have the disk's text written over what the index follows.
+      if (disposed || tokenOf(uri.fsPath) !== token || hasDirtyBuffer(uri, ignoreDirtyOf)) return;
+      const text = new TextDecoder().decode(await readFile(uri));
       // A delete can land mid-read: the bytes still arrive, and writing them
       // would put the file back into the index after removeFile took it out.
       if (disposed || tokenOf(uri.fsPath) !== token) return;
@@ -159,9 +222,14 @@ export function registerIndexSync(
       // parsed, so without the guard every save costs two full refresh rounds
       if (await index.updateFile(uri.fsPath, text)) announce([uri.fsPath]);
     } catch (e) {
+      // After the teardown the output channel is gone, and writing to it throws
+      // from a promise nothing awaits. A read given up on late lands here too.
+      if (disposed) return;
       // unreadable or deleted right after the event — but a parse failure lands
       // here too, and reading that as a missing file hid it completely
       log?.(`Not indexed (unreadable, deleted, or parse failed): ${uri.fsPath}: ${e}`);
+    } finally {
+      releaseRead();
     }
   };
 
@@ -260,6 +328,9 @@ export function registerIndexSync(
     {
       dispose: () => {
         disposed = true;
+        // events still waiting for a read slot: each would only wake to find the
+        // flag above and leave, and until then keeps its uri alive
+        waiting.length = 0;
         for (const t of timers.values()) clearTimeout(t);
         timers.clear();
         // a flush after deactivation would touch a disposed diagnostic

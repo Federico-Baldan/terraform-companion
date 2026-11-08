@@ -173,6 +173,12 @@ function declarationsOf(f: ParsedFile): {
   return { variables, locals, calls };
 }
 
+/** Files read at once by anything that reads many of them — the initial scan and
+ *  the watcher's burst handling alike. Bounded so a huge workspace does not open
+ *  a file descriptor per file, or send thousands of requests across the ext-host
+ *  RPC boundary at the same moment. */
+export const READ_CONCURRENCY = 24;
+
 export class WorkspaceIndex {
   private parsed = new Map<string, ParsedFile>();
   /** Indexed .tf paths grouped by directory, each list in `parsed` order.
@@ -204,9 +210,8 @@ export class WorkspaceIndex {
     // byte for byte what the serial version produced: `files()` order feeds
     // diagnostic and candidate ordering. The bound also keeps a huge workspace
     // from opening a file descriptor per file.
-    const CONCURRENCY = 24;
-    for (let start = 0; start < files.length; start += CONCURRENCY) {
-      const batch = files.slice(start, start + CONCURRENCY);
+    for (let start = 0; start < files.length; start += READ_CONCURRENCY) {
+      const batch = files.slice(start, start + READ_CONCURRENCY);
       const read = await Promise.all(
         batch.map(async (path): Promise<{ path: string; text?: string; error?: unknown }> => {
           try {
