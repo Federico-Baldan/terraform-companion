@@ -131,6 +131,8 @@ Setting: `tfCompanion.countForEach.enabled`. It hides the refactor too.
 
 Settings are under `tfCompanion.`.
 
+Files over 1 MiB (1,048,576 characters) are not parsed, and nothing in one is analysed. While one is in the workspace, the count → for_each refactor is withheld wherever the list depends on a variable, the unused-local lint stays quiet for that module, and the hover on a variable says it assumes no unread file sets it. The Terraform Companion output channel names the file.
+
 ## Cache cleanup
 
 Shortly after startup, the extension looks for `.terraform` folders with no activity for 30 days (`cacheCleaner.staleDays`) and asks before deleting. Activity means a recent change to `.terraform` or its top-level entries, or to the `.tf`, `.tfvars`, `.hcl`, lock or state files beside it.
