@@ -8,7 +8,9 @@
   "timezone": "Europe/Rome",
   "labels": ["dependencies"],
   "rangeStrategy": "bump",
-  "dependencyDashboard": true,
+  "dependencyDashboard": {
+    "enabled": true
+  },
   "rebaseWhen": "conflicted",
   "postUpdateOptions": ["npmDedupe"],
   "platformAutomerge": true,
