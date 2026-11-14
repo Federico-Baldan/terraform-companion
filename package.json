@@ -131,7 +131,7 @@
   "dependencies": {
     "@tree-sitter-grammars/tree-sitter-hcl": "1.2.0",
     "semver": "^7.8.6",
-    "web-tree-sitter": "0.27.1"
+    "web-tree-sitter": "0.27.2"
   },
   "devDependencies": {
     "@biomejs/biome": "2.6.6",
