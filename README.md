@@ -214,6 +214,8 @@ npm run package    # .vsix
 
 [MIT](LICENSE). Bugs and feature requests go in [Issues](https://github.com/Federico-Baldan/terraform-companion/issues).
 
+Questions, ideas or just a hello are welcome on [LinkedIn](https://www.linkedin.com/in/federico-baldan/).
+
 <p align="center">
   <a href="https://federico.baldan.dev">
     <picture>
