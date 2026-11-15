@@ -259,19 +259,23 @@ export function registerIndexSync(
    *  indexed files. Shared by the folder-delete watcher and workspace-folder
    *  removal, which differ only in how they learn the directory is gone — the
    *  sweeps themselves have to be identical, since either one leaving a timer
-   *  armed puts a file straight back into the index after it was retracted. */
-  const dropUnder = (dirPath: string): void => {
+   *  armed puts a file straight back into the index after it was retracted.
+   *
+   *  `keep` exempts paths that are under the directory and still not gone: see
+   *  the workspace-folder handler, the one caller with any. */
+  const dropUnder = (dirPath: string, keep?: (path: string) => boolean): void => {
     const prefix = `${normalizePath(dirPath)}/`;
+    const goes = (key: string): boolean => key.startsWith(prefix) && !keep?.(key);
     for (const [key, timer] of timers) {
-      if (key.startsWith(prefix)) {
+      if (goes(key)) {
         clearTimeout(timer);
         timers.delete(key);
       }
     }
     for (const key of [...epoch.keys()]) {
-      if (key.startsWith(prefix)) supersede(key);
+      if (goes(key)) supersede(key);
     }
-    const gone = index.pathsUnder(dirPath);
+    const gone = index.pathsUnder(dirPath).filter((p) => !keep?.(p));
     if (gone.length === 0) return;
     for (const p of gone) index.removeFile(p);
     // routed through the same announce as every other retraction, so the lint
@@ -405,8 +409,17 @@ export function registerIndexSync(
     // Only the multi-root case needs handling: per the API docs this event does
     // not fire when the *first* folder is added or removed, because the
     // extension host is restarted instead.
+    //
+    // Folders may nest — `/repo` and `/repo/infra` can both be open — so a file
+    // under the removed folder can still belong to one that stays. Sweeping it
+    // too left it unindexed for the rest of the session: it is still on disk, so
+    // no event ever brings it back. By the time this fires the folder list is
+    // the new one, which makes `getWorkspaceFolder` the test for "still here",
+    // the same one `scheduleRefresh` admits a file by.
     vscode.workspace.onDidChangeWorkspaceFolders((e) => {
-      for (const folder of e.removed) dropUnder(folder.uri.fsPath);
+      const stillInWorkspace = (path: string): boolean =>
+        vscode.workspace.getWorkspaceFolder(vscode.Uri.file(path)) !== undefined;
+      for (const folder of e.removed) dropUnder(folder.uri.fsPath, stillInWorkspace);
       for (const folder of e.added) void indexFolder(folder);
     }),
     watcher,
