@@ -539,11 +539,22 @@ const ACTIVITY_SOURCE = /\.(tf|tfvars)(\.json)?$|\.hcl$/;
  *  files inside get stat'd. */
 const WORKSPACE_STATE_DIR = 'terraform.tfstate.d';
 
+/** `.<state file>.lock.info`: what Terraform writes beside a local state when an
+ *  operation takes its lock, and removes when the operation ends
+ *  (internal/states/statemgr, `lockInfoPath`). Its mtime is when the run began,
+ *  so one left behind by a crash ages like everything else. */
+function isStateLock(name: string): boolean {
+  return name.startsWith('.') && name.endsWith('.lock.info');
+}
+
 function isActivityFile(name: string): boolean {
   return (
     ACTIVITY_SOURCE.test(name) ||
     name === '.terraform.lock.hcl' ||
-    name.startsWith('terraform.tfstate')
+    name.startsWith('terraform.tfstate') ||
+    // a plan writes no state, and an apply writes none until its first resource
+    // is done: the lock is the only sign that Terraform is running right now
+    isStateLock(name)
   );
 }
 
