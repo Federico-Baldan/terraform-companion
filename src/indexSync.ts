@@ -16,11 +16,41 @@ const READ_TIMEOUT_MS = 30_000;
  *  told. Short enough to stay invisible next to DEBOUNCE_MS, long enough that a
  *  git checkout's per-file watcher events land in one batch. */
 const COALESCE_MS = 50;
+/** How long after the last path appeared before the directories among them are
+ *  listed (see `scanAppeared`). A checkout or a copy is still writing into a
+ *  directory when the watcher reports it, and what it writes below a directory
+ *  the watcher has not caught up with is never reported at all, so the listing
+ *  has to come after the burst rather than at its first event. */
+const APPEARED_QUIET_MS = 1_000;
+/** The longest a path that appeared waits for that pause: a build that creates
+ *  a file every half second for minutes must not hold back the directory a
+ *  checkout added in the meantime. */
+const APPEARED_MAX_WAIT_MS = 10_000;
+/** Paths one burst may ask about one by one. Each is a round trip to learn
+ *  whether it is a directory, and a build or a checkout between distant
+ *  branches creates tens of thousands; past this the burst is answered by one
+ *  listing of the workspace instead, which costs the same whatever its size. */
+const MAX_APPEARED = 64;
+/** The least time between two listings of the whole workspace. One costs what
+ *  the listing at activation does, and it grows with the workspace, not with
+ *  what appeared: measured with ripgrep, which is what answers it, 0.6 s of CPU
+ *  for 300,000 files. A build that creates paths for minutes overflows
+ *  MAX_APPEARED again and again, and without this it was listed every
+ *  APPEARED_MAX_WAIT_MS for as long as the build ran. The first listing is not
+ *  held back, so a checkout is indexed as soon as before; a second one right
+ *  behind it waits, and what it would have found is found a minute later. */
+const LIST_ALL_GAP_MS = 60_000;
 
 /** What the output channel says about a file past the parse limit: the one place
  *  that can say why a module's lints went quiet. */
 export function tooLargeNotice(path: string): string {
   return `Skipped (larger than ${MAX_PARSE_CHARS / 1_048_576} MiB, so it is not parsed): ${path}. Nothing in it is analysed, and lints that need the whole module stay quiet while it is there.`;
+}
+
+/** Inside a repository's `.git` directory, where every git command creates lock
+ *  files and refs and no Terraform file is ever indexed. */
+function isGitInternalPath(path: string): boolean {
+  return normalizePath(path).includes('/.git/');
 }
 
 /**
@@ -341,14 +371,136 @@ export function registerIndexSync(
     if (added.length > 0) announce(added);
   };
 
+  /** Paths that appeared and may be directories, by normalized path. */
+  const appeared = new Map<string, vscode.Uri>();
+  /** More appeared than `appeared` holds; see MAX_APPEARED. */
+  let appearedOverflow = false;
+  let appearedTimer: ReturnType<typeof setTimeout> | undefined;
+  /** When the oldest path still waiting appeared, and when the newest did. */
+  let appearedSince = 0;
+  let appearedLast = 0;
+  /** When the whole workspace was last listed; see LIST_ALL_GAP_MS. */
+  let listedAllAt = Number.NEGATIVE_INFINITY;
+
+  /** Index the Terraform files of the directories that appeared.
+   *
+   *  A directory that is renamed, moved into the workspace or restored from the
+   *  trash arrives as ONE create event, for the directory: nothing is reported
+   *  for the files in it. A tree that is written quickly, as `git checkout` and
+   *  `git pull` write one, is not reported in full either: on Linux the watcher
+   *  only starts watching a new directory once it has seen it appear, and what
+   *  was created inside before that is lost (measured with the watcher VS Code
+   *  ships: over ten checkouts of a branch adding four directories, 74 of 130
+   *  new `.tf` files were never reported). Those files stayed out of the index
+   *  until each was opened: a local used only from one of them was reported as
+   *  unused, a variable declared in one resolved to nothing, and a reference
+   *  from one did not hold back the count -> for_each rewrite.
+   *
+   *  So a directory that appears is listed, and each Terraform file in it that
+   *  the index does not hold yet is read exactly as if its create event had
+   *  arrived. The listing is the one the initial scan and a new workspace
+   *  folder use, with the same exclusions, so it can only add what a reload of
+   *  the window would. */
+  const scanAppeared = async (): Promise<void> => {
+    const batch = [...appeared];
+    const everything = appearedOverflow;
+    appeared.clear();
+    appearedOverflow = false;
+    /** what to list: directories, or `undefined` for the whole workspace */
+    const bases: (vscode.Uri | undefined)[] = [];
+    if (everything) {
+      bases.push(undefined);
+      listedAllAt = Date.now();
+    } else {
+      for (const [path, uri] of batch) {
+        // a tree that appeared in one go is one listing, from its top
+        if (batch.some(([other]) => path.startsWith(`${other}/`))) continue;
+        try {
+          const { type } = await vscode.workspace.fs.stat(uri);
+          if ((type & vscode.FileType.Directory) !== 0) bases.push(uri);
+        } catch {
+          // gone again already: a temporary file, a lock
+        }
+      }
+    }
+    for (const base of bases) {
+      // Nothing awaits this function: it runs off a timer, so a rejection would
+      // land on the extension host as an unhandled one. Caught per directory,
+      // so one that is gone again does not cost the others their listing.
+      try {
+        const uris = await vscode.workspace.findFiles(
+          base ? new vscode.RelativePattern(base, TF_GLOB) : TF_GLOB,
+          TF_EXCLUDE,
+        );
+        if (disposed) return;
+        for (const uri of uris) {
+          // already held: reported by its own event, or there all along
+          if (isExcludedTfPath(uri.fsPath) || index.file(uri.fsPath)) continue;
+          void refreshFromDisk(uri);
+        }
+      } catch (e) {
+        // after the teardown the output channel is gone, and writing to it throws
+        if (disposed) return;
+        log?.(`Not indexed (scan failed): ${base?.fsPath ?? 'the workspace'}: ${e}`);
+      }
+    }
+    // counted from its end as well: one that took long is not followed at once
+    if (everything) listedAllAt = Date.now();
+  };
+
+  /** The timer of `noteAppeared`: lists once the burst has paused, or has gone
+   *  on for long enough, and otherwise waits out what is left of the pause. */
+  const appearedDue = (): void => {
+    appearedTimer = undefined;
+    if (disposed) return;
+    const now = Date.now();
+    const quietFor = now - appearedLast;
+    if (quietFor < APPEARED_QUIET_MS && now - appearedSince < APPEARED_MAX_WAIT_MS) {
+      appearedTimer = setTimeout(appearedDue, APPEARED_QUIET_MS - quietFor);
+      return;
+    }
+    // Too many to ask about, so the workspace is what gets listed, and it was
+    // listed a moment ago: wait out the rest of the gap. The timer stays armed,
+    // so what appears meanwhile is only noted, and that listing covers it all.
+    const held = appearedOverflow ? listedAllAt + LIST_ALL_GAP_MS - now : 0;
+    if (held > 0) {
+      appearedTimer = setTimeout(appearedDue, held);
+      return;
+    }
+    void scanAppeared();
+  };
+
+  /** A few assignments per event, because it runs for every path created
+   *  anywhere in the workspace and a build writes tens of thousands: the timer
+   *  is armed once per burst rather than moved by every event, and the
+   *  questions that cost something are asked once, in `scanAppeared`. */
+  const noteAppeared = (uri: vscode.Uri): void => {
+    if (disposed) return;
+    if (appeared.size < MAX_APPEARED) appeared.set(normalizePath(uri.fsPath), uri);
+    else appearedOverflow = true;
+    appearedLast = Date.now();
+    if (appearedTimer) return;
+    appearedSince = appearedLast;
+    appearedTimer = setTimeout(appearedDue, APPEARED_QUIET_MS);
+  };
+
   const watcher = vscode.workspace.createFileSystemWatcher(TF_GLOB);
   // Deleting a folder arrives as ONE event for the folder path — an Explorer
   // delete is a move to trash, so the per-file deletes TF_GLOB waits for never
   // fire. The folder path matches no file glob, so seeing it needs a second
-  // watcher on everything, deletes only.
-  const folderWatcher = vscode.workspace.createFileSystemWatcher('**', true, true, false);
+  // watcher on everything. A folder that appears is the same in reverse (see
+  // `scanAppeared`), so it listens for creates too; changes it has no use for.
+  const folderWatcher = vscode.workspace.createFileSystemWatcher('**', false, true, false);
   context.subscriptions.push(
     folderWatcher,
+    folderWatcher.onDidCreate((uri) => {
+      // a matching file: the TF_GLOB create handler below owns that case
+      if (isTfPath(uri.fsPath)) return;
+      // nothing under these is ever indexed, and `npm install`, `terraform init`
+      // and every git command create paths there
+      if (isExcludedTfPath(`${uri.fsPath}/`) || isGitInternalPath(`${uri.fsPath}/`)) return;
+      noteAppeared(uri);
+    }),
     folderWatcher.onDidDelete((uri) => {
       // a matching file: the TF_GLOB delete handler below owns that case
       if (isTfPath(uri.fsPath)) return;
@@ -379,6 +531,9 @@ export function registerIndexSync(
         if (flushTimer) clearTimeout(flushTimer);
         flushTimer = undefined;
         pendingChanged.clear();
+        if (appearedTimer) clearTimeout(appearedTimer);
+        appearedTimer = undefined;
+        appeared.clear();
       },
     },
     // VS Code fires this with an empty change list for metadata-only events —
