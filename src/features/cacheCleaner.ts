@@ -1026,6 +1026,12 @@ async function reclaimablePluginEntries(pluginsDir: string): Promise<string[]> {
   }
   const out: string[] = [];
   for (const de of entries) {
+    // Same rule as for the subdirectories themselves: a link is unlinked, not
+    // emptied, so it reclaims nothing. Here it is also dangerous, because the
+    // delete removes the path a victim resolves to: a link leading back into
+    // the cache had its target deleted in its place — `..` took the whole
+    // `.terraform`, metadata included.
+    if (de.isSymbolicLink()) continue;
     if (de.isDirectory() && LEGACY_PLATFORM_DIR.test(de.name)) {
       try {
         await lstat(join(pluginsDir, de.name, 'lock.json'));
