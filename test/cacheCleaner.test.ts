@@ -1166,6 +1166,62 @@ provider "registry.terraform.io/hashicorp/random" {
     expect(existsSync(join(cache, 'providers'))).toBe(false);
   });
 
+  /** The delete hands `rm` the path a victim *resolves* to, and the entries of
+   *  `plugins` were taken as they came, links included. A link there that led
+   *  back into the cache had its target removed in its place: one to `..` took
+   *  the whole `.terraform` with it, `environment` and `terraform.tfstate`
+   *  included — the metadata this delete exists to leave standing. */
+  describe('a symbolic link directly under plugins', () => {
+    function cacheWithLink(name: string, target: string): string {
+      const cache = join(root, name, '.terraform');
+      mkdirSync(join(cache, 'plugins'), { recursive: true });
+      mkdirSync(join(cache, 'providers'));
+      writeFileSync(join(cache, 'providers', 'bin'), 'refetchable');
+      writeFileSync(join(cache, 'environment'), 'prod');
+      writeFileSync(join(cache, 'terraform.tfstate'), '{"backend":{}}');
+      symlinkSync(target, join(cache, 'plugins', 'link'));
+      return cache;
+    }
+
+    it('is left alone when it leads to the cache directory itself', async () => {
+      const cache = cacheWithLink('loop', '..');
+
+      expect(await deleteCachePayload(cache, root)).toEqual({ ok: true, removed: ['providers'] });
+      expect(readFileSync(join(cache, 'environment'), 'utf8')).toBe('prod');
+      expect(existsSync(join(cache, 'terraform.tfstate'))).toBe(true);
+    });
+
+    it('is left alone when it leads to the metadata beside it', async () => {
+      const cache = cacheWithLink('meta', join('..', 'terraform.tfstate'));
+
+      expect(await deleteCachePayload(cache, root)).toEqual({ ok: true, removed: ['providers'] });
+      expect(readFileSync(join(cache, 'terraform.tfstate'), 'utf8')).toBe('{"backend":{}}');
+    });
+
+    it('is not offered for deletion, wherever it leads', async () => {
+      const cache = cacheWithLink('shared', outside);
+      writeFileSync(join(outside, 'terraform-provider-inhouse'), 'ELF');
+      const old = new Date(NOW - 90 * DAY);
+      lutimesSync(join(cache, 'plugins', 'link'), old, old);
+      for (const p of [
+        join(cache, 'plugins'),
+        join(cache, 'providers', 'bin'),
+        join(cache, 'providers'),
+        join(cache, 'environment'),
+        join(cache, 'terraform.tfstate'),
+        cache,
+      ]) {
+        touch(p, 90);
+      }
+
+      const [found] = await findStaleTerraformDirs(root, 30, NOW);
+      expect(found?.entries).toEqual(['providers']);
+      // and a clean is a clean: a link it refused used to fail the whole cache
+      expect(await deleteCachePayload(cache, root)).toEqual({ ok: true, removed: ['providers'] });
+      expect(existsSync(join(outside, 'terraform-provider-inhouse'))).toBe(true);
+    });
+  });
+
   /** The 0.13 nested layout is unambiguously registry-managed. */
   it('reclaims the nested registry plugins layout without a lock.json', async () => {
     const cache = join(root, 'nested', '.terraform');
