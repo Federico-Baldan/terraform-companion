@@ -417,6 +417,17 @@ export function registerIndexSync(
     watcher.onDidDelete((uri) => handleDelete(uri)),
   );
 
+  // The index was built from disk, and no open event fires for a document that
+  // was open before the listeners above existed: one restored with unsaved
+  // changes by hot exit, or typed into while the initial scan was still
+  // running. Its buffer is what the editor shows and what a disk event defers
+  // to (`hasDirtyBuffer`), so without this the index — and the diagnostics
+  // drawn on that buffer — stayed on the saved text until the next keystroke.
+  // Only dirty ones: a clean buffer is the disk's text, which the scan read.
+  for (const doc of vscode.workspace.textDocuments) {
+    if (doc.isDirty) scheduleRefresh(doc);
+  }
+
   for (const e of initialEvents) {
     if (e.deleted) handleDelete(e.uri);
     else void refreshFromDisk(e.uri);
