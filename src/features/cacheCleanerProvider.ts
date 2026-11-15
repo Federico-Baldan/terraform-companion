@@ -283,7 +283,10 @@ export async function scan(
   // recording that as a quiet period would hide what it never reached
   if (cancelled()) return;
   if (unique.length === 0 && staleProviders.length === 0) {
-    await snooze(QUIET_SCAN_MS);
+    // Only a walk can find nothing. With no folder open none ran, and the
+    // snooze is shared by every window: a lone .tf opened without a folder
+    // used to switch the cleaner off in every real workspace for a day.
+    if (folders.length > 0) await snooze(QUIET_SCAN_MS);
     return;
   }
 

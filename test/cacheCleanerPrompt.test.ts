@@ -631,4 +631,22 @@ describe('cache cleaner prompt', () => {
     expect(mock.warnings).toEqual([]);
     expect(existsSync(join(root, 'infra/prod/.terraform/providers'))).toBe(true);
   });
+
+  /** The quiet period is kept in the extension's global state, which every
+   *  window shares. A window with no folder — a lone .tf file opened from the
+   *  command line — walks nothing, and recording that as "nothing stale" kept
+   *  the cleaner from looking in any real workspace for the next 24 hours. */
+  it('records no quiet period when there is no workspace folder to walk', async () => {
+    module_('infra/prod', 90);
+    const state = memento();
+    mock.folders = [];
+    await scan(silent, () => false, state);
+    expect((state as unknown as { keys(): string[] }).keys()).toEqual([]);
+
+    // the next window to open, on a folder that does hold a stale cache
+    mock.folders = [{ uri: { fsPath: root } }];
+    mock.warningAnswers = ['Ignore'];
+    await scan(silent, () => false, state);
+    expect(prompt()).toContain('infra/prod');
+  });
 });
