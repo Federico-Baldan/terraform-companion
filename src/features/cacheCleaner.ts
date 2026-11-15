@@ -444,13 +444,31 @@ async function dirSize(
 async function cacheSize(tfDir: string, cancelled?: () => boolean): Promise<number> {
   let total = 0;
   const budget = { left: MAX_SIZE_ENTRIES };
-  for (const sub of CACHE_SUBDIRS) {
-    const p = join(tfDir, sub);
+  const sizeOf = async (p: string): Promise<void> => {
     try {
       const st = await lstat(p);
       total += st.isDirectory() ? await dirSize(p, 0, cancelled, budget) : st.size;
     } catch {
       // absent or unreadable — nothing to count
+    }
+  };
+  for (const sub of CACHE_SUBDIRS) {
+    const p = join(tfDir, sub);
+    // `plugins` is removed entry by entry, and a hand-placed platform directory
+    // is kept (see `reclaimablePluginEntries`): sized whole, its bytes were
+    // promised in the prompt and reported as freed while they stayed on disk
+    let isPluginsDir = false;
+    if (sub === 'plugins') {
+      try {
+        isPluginsDir = (await lstat(p)).isDirectory();
+      } catch {
+        // absent or unreadable — nothing to count
+      }
+    }
+    if (isPluginsDir) {
+      for (const name of await reclaimablePluginEntries(p)) await sizeOf(join(p, name));
+    } else {
+      await sizeOf(p);
     }
   }
   return total;
