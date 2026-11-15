@@ -154,8 +154,23 @@ export function detectRedundantDependsOn(file: ParsedFile): LintFinding[] {
     // block references, excluding the depends_on tuple itself. Narrowed to the
     // body first, not filtered from every reference in the file per block: that
     // made the rule quadratic in file size (131ms at 8000 lines).
+    //
+    // A module block's arguments are its input variables, and a reference in
+    // one makes only what reads that variable inside the module wait, while
+    // depends_on on the block holds back everything in it — the same reason a
+    // `module.x` entry is never redundant, seen from the other side. Only
+    // `count` and `for_each` belong to the call itself: Terraform's node for a
+    // module call refers to those and to depends_on, nothing else
+    // (nodeExpandModule.References), and every resource in the module hangs
+    // off that node.
+    const own =
+      block.kind === 'module'
+        ? [attrOf(block, 'count'), attrOf(block, 'for_each')].flatMap((a) => (a ? [a.span] : []))
+        : undefined;
     const bodyRefs = refsStartingIn(file.refs, block.bodySpan).filter(
-      (r) => !spanContains(attr.span, r.span.start),
+      (r) =>
+        !spanContains(attr.span, r.span.start) &&
+        (own === undefined || own.some((span) => spanContains(span, r.span.start))),
     );
     // module addresses are never redundant — [module.x] waits for everything
     // in it, while module.x.output waits only for what that output needs

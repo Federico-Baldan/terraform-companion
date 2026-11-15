@@ -315,3 +315,48 @@ describe('a comment does not hide the index behind it', () => {
     expect(detectRedundantDependsOn(parseFile('a.tf', src))).toHaveLength(1);
   });
 });
+
+/** The mirror image of "never module addresses" above. An argument of a module
+ *  block is an input variable: only what reads that variable inside the module
+ *  waits for what the argument references. `depends_on` on the block makes
+ *  everything in the module wait. Terraform's graph says so directly: the
+ *  node that expands a module call refers to its `depends_on`, `count` and
+ *  `for_each` and to nothing else (nodeExpandModule.References), and every
+ *  resource of the module hangs off that node. Calling the entry redundant
+ *  offered a quick fix that let the rest of the module run ahead of it. */
+describe('depends_on in a module block', () => {
+  it('is not made redundant by an input that references the same resource', () => {
+    const src = `module "app" {
+  source     = "./app"
+  role_arn   = aws_iam_role.app.arn
+  depends_on = [aws_iam_role.app, aws_iam_role_policy.app]
+}
+`;
+    expect(detectRedundantDependsOn(parseFile('a.tf', src))).toEqual([]);
+  });
+
+  it('is made redundant by a reference in for_each, which belongs to the call itself', () => {
+    const src = `module "app" {
+  source     = "./app"
+  for_each   = aws_subnet.private
+  role_arn   = aws_iam_role.app.arn
+  depends_on = [aws_subnet.private, aws_iam_role.app]
+}
+`;
+    const findings = detectRedundantDependsOn(parseFile('a.tf', src));
+    expect(findings).toHaveLength(1);
+    expect(findings[0]!.message).toContain('aws_subnet.private');
+    expect(findings[0]!.message).not.toContain('aws_iam_role.app');
+    expect(findings[0]!.fix?.newText).toBe('[aws_iam_role.app]');
+  });
+
+  it('is made redundant by a reference in count', () => {
+    const src = `module "app" {
+  source     = "./app"
+  count      = aws_instance.gate.cpu_core_count
+  depends_on = [aws_instance.gate]
+}
+`;
+    expect(detectRedundantDependsOn(parseFile('a.tf', src))).toHaveLength(1);
+  });
+});
