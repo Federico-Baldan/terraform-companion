@@ -47,15 +47,30 @@ export interface MockWatcher {
 
 export const watchers: MockWatcher[] = [];
 
-/** What `workspace.fs.readFile` answers; a test replaces it to count or delay reads. */
+/** What `workspace.fs.readFile` answers; a test replaces it to count or delay reads.
+ *  `stat` and `findFiles` are the same for `workspace.fs.stat` and
+ *  `workspace.findFiles`: nothing on disk until a test says otherwise. */
 export const fsMock = {
   readFile: (_fsPath: string): Promise<Uint8Array> => Promise.reject(new Error('no file')),
+  stat: (_fsPath: string): Promise<{ type: number }> => Promise.reject(new Error('no file')),
+  findFiles: (_include: unknown): Promise<{ fsPath: string }[]> => Promise.resolve([]),
 };
+
+export const FileType = { Unknown: 0, File: 1, Directory: 2, SymbolicLink: 64 };
+
+export class RelativePattern {
+  constructor(
+    readonly base: { fsPath: string },
+    readonly pattern: string,
+  ) {}
+}
 
 export function resetVscodeMock(): void {
   watchers.length = 0;
   workspace.textDocuments.length = 0;
   fsMock.readFile = () => Promise.reject(new Error('no file'));
+  fsMock.stat = () => Promise.reject(new Error('no file'));
+  fsMock.findFiles = () => Promise.resolve([]);
   mock.settings = new Map();
   mock.folders = [];
   mock.warnings = [];
@@ -127,7 +142,9 @@ export const workspace = {
   },
   fs: {
     readFile: (uri: { fsPath: string }): Promise<Uint8Array> => fsMock.readFile(uri.fsPath),
+    stat: (uri: { fsPath: string }): Promise<{ type: number }> => fsMock.stat(uri.fsPath),
   },
+  findFiles: (include: unknown): Promise<{ fsPath: string }[]> => fsMock.findFiles(include),
   getConfiguration(_section: string) {
     return {
       get<T>(key: string, fallback: T): T {
