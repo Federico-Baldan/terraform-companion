@@ -868,3 +868,74 @@ describe('a call site that cannot be measured', () => {
     expect(pattern?.safeToRefactor).toBe(false);
   });
 });
+
+/** Each module on the way to the root that is called with differing values
+ *  multiplies the questions the safety check asks: it pins one call site and
+ *  resolves again, once per site, at every such level. Three levels of 20 call
+ *  sites was 8000 full resolves and 1.7s of blocked extension host, three of 40
+ *  was 12s, and the code-action provider asks again on every cursor move over the
+ *  `count` line. Past a fixed number of resolves the list counts as not measured,
+ *  which withholds the rewrite like every other budget does. */
+describe('a module instantiated along many diverging paths', () => {
+  /** `levels` module directories above the counted block, each calling the one
+   *  below from `sites` module blocks that all pass a different list. */
+  async function nested(levels: number, sites: number): Promise<WorkspaceIndex> {
+    const index = new WorkspaceIndex();
+    await index.updateFile(
+      '/fan/m0/main.tf',
+      [
+        'variable "l" {}',
+        'resource "null_resource" "r" {',
+        '  count = length(var.l)',
+        '  name  = var.l[count.index]',
+        '}',
+        '',
+      ].join('\n'),
+    );
+    for (let level = 1; level <= levels; level++) {
+      const top = level === levels;
+      const lines = [top ? 'locals {\n  l = ["root"]\n}' : 'variable "l" {}'];
+      for (let site = 0; site < sites; site++) {
+        lines.push(
+          `module "c${site}" {`,
+          `  source = "../m${level - 1}"`,
+          `  l      = concat(${top ? 'local.l' : 'var.l'}, ["k${level}s${site}"])`,
+          '}',
+        );
+      }
+      await index.updateFile(`/fan/m${level}/main.tf`, `${lines.join('\n')}\n`);
+    }
+    return index;
+  }
+
+  const patternIn = (index: WorkspaceIndex) => {
+    const file = index.file('/fan/m0/main.tf');
+    if (!file) throw new Error('fixture not indexed');
+    return detectCountLength(file, index)[0];
+  };
+
+  it('still offers the fix when every path can be checked', async () => {
+    // 20 sites, then 20 above each: 400 paths, every one a clean list of strings
+    expect(patternIn(await nested(2, 20))?.safeToRefactor).toBe(true);
+  });
+
+  it('still offers the fix for one module called from very many places', async () => {
+    // wide rather than deep: one resolve per call site, which is cheap
+    expect(patternIn(await nested(1, 1500))?.safeToRefactor).toBe(true);
+  });
+
+  it('withholds the fix instead of resolving every one of thousands of paths', async () => {
+    const index = await nested(3, 20);
+    // every resolve ends at the one local the top module passes down, and lists
+    // that module's locals once to find it: one call per resolve
+    let resolves = 0;
+    const localsOf = index.localsOf.bind(index);
+    index.localsOf = (dir) => {
+      if (dir === '/fan/m3') resolves++;
+      return localsOf(dir);
+    };
+    expect(patternIn(index)?.safeToRefactor).toBe(false);
+    // all 8000 paths, and the 421 pins above them, were resolved before
+    expect(resolves).toBeLessThan(2_500);
+  });
+});

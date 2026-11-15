@@ -204,21 +204,40 @@ function shapeUnusable(shape: ListShape): boolean {
   return new Set(shape.values).size !== shape.values.length;
 }
 
+/** Resolves one safety check may run, across every call site it pins.
+ *
+ *  Each module on the way to the root that is called with differing values is
+ *  pinned one site at a time, and every pin is a full resolve of its own, so the
+ *  count is the *product* of the site counts along the way: three such levels of
+ *  20 sites measured 8421 resolves and 1.7s of blocked extension host, three of
+ *  40 took 12s — synchronously, in a code-action provider VS Code asks again on
+ *  every cursor move over the `count` line. Sized by the time it allows, about
+ *  half a second at worst, and a module called from 1500 places with different
+ *  lists (1501 resolves, ~150ms) stays inside it; past it the paths left
+ *  unchecked are what cannot be certified, and the fix is withheld like it is
+ *  for every other value nobody measured. */
+const MAX_PINNED_RESOLVES = 2000;
+
 /** A list the evaluator can't reach concludes nothing here — the declared-type
  *  and usage checks cover that case.
  *
  *  A multi-instantiated module has no single list, so each instance is checked
  *  separately and any one unusable withholds the fix. Recursion matters: the
  *  evaluator only reports the first divergence it meets, so a value forwarded
- *  through two of them needs a second pinned pass to reach. */
+ *  through two of them needs a second pinned pass to reach.
+ *
+ *  `budget` is shared by the whole recursion, see MAX_PINNED_RESOLVES. */
 function resolvedListUnusable(
   refText: string,
   file: ParsedFile,
   index: WorkspaceIndex | undefined,
   tfvars: TfvarsContext | undefined,
   pinnedSites: Map<string, ModuleCallSite> = new Map(),
+  budget: { left: number } = { left: MAX_PINNED_RESOLVES },
 ): boolean {
   if (!index) return false;
+  // out of resolves with paths still unchecked: never measured, so not certified
+  if (budget.left-- <= 0) return true;
   const base: EvalScope = {
     index,
     moduleDir: index.moduleDirOf(file.path),
@@ -250,6 +269,7 @@ function resolvedListUnusable(
       index,
       tfvars,
       new Map([...pinnedSites, [diverged.moduleDir, site]]),
+      budget,
     ),
   );
 }
