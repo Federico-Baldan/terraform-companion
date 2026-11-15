@@ -2,11 +2,19 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vite
 import { WorkspaceIndex } from '../src/core/workspaceIndex';
 import { registerIndexSync } from '../src/indexSync';
 import { initTestParser } from './helpers';
-import { FileType, fsMock, RelativePattern, resetVscodeMock, watchers } from './mocks/vscode';
+import {
+  FileType,
+  fsMock,
+  RelativePattern,
+  resetVscodeMock,
+  watchers,
+  workspace,
+} from './mocks/vscode';
 
 beforeAll(initTestParser);
 beforeEach(resetVscodeMock);
 afterEach(() => {
+  vi.restoreAllMocks();
   vi.useRealTimers();
 });
 
@@ -54,7 +62,15 @@ function start(index = new WorkspaceIndex()) {
   const tf = watchers.find((w) => w.pattern === '**/*.{tf,tfvars}');
   if (!all || !tf) throw new Error('index sync registered no watcher');
   const settle = () => vi.advanceTimersByTimeAsync(15_000);
-  return { index, announced, context, appear: (p: string) => all.fire('create', p), tf, settle };
+  return {
+    index,
+    announced,
+    context,
+    appear: (p: string) => all.fire('create', p),
+    vanish: (p: string) => all.fire('delete', p),
+    tf,
+    settle,
+  };
 }
 
 describe('a directory that appears with Terraform files already in it', () => {
@@ -294,5 +310,81 @@ describe('a listing that fails', () => {
     expect(calls.list).toEqual(['/ws/b']);
     expect(index.file('/ws/b/main.tf')).toBeDefined();
     expect(messages).toEqual(['Not indexed (scan failed): /ws/a: Error: gone']);
+  });
+});
+
+/** Workspace folders as VS Code reports them. */
+function openFolders(folders: string[]): void {
+  vi.spyOn(workspace, 'getWorkspaceFolder').mockImplementation(((uri: { fsPath: string }) =>
+    folders.some((f) => uri.fsPath === f || uri.fsPath.startsWith(`${f}/`))
+      ? {}
+      : undefined) as never);
+}
+
+/** git removes a directory its checkout emptied and makes it again for what the
+ *  other branch holds there. The watcher was following the directory that went,
+ *  so nothing written into the new one is reported: `git checkout` of a branch
+ *  that renamed `modules/vpc` to `modules/network`, the only module, reports
+ *  `delete modules/vpc` and `change modules`, and nothing else (measured with
+ *  the watcher VS Code ships, on Linux). The one thing the events do say is
+ *  where something indexed went from. */
+describe('a directory whose indexed content was replaced', () => {
+  it('lists the directory an indexed directory went from', async () => {
+    openFolders(['/ws']);
+    const { calls } = disk(['/ws/modules/network/main.tf']);
+    const index = new WorkspaceIndex();
+    await index.updateFile('/ws/modules/vpc/main.tf', TEXT('/ws/modules/vpc/main.tf'));
+    const { vanish, settle } = start(index);
+
+    vanish('/ws/modules/vpc');
+    await settle();
+
+    expect(index.files().map((f) => f.path)).toEqual(['/ws/modules/network/main.tf']);
+    expect(calls.list).toEqual(['/ws/modules']);
+  });
+
+  it('lists the directory an indexed file went from', async () => {
+    openFolders(['/ws']);
+    const { calls } = disk(['/ws/modules/network/main.tf']);
+    const index = new WorkspaceIndex();
+    await index.updateFile('/ws/modules/all.tf', TEXT('/ws/modules/all.tf'));
+    const { tf, settle } = start(index);
+
+    tf.fire('delete', '/ws/modules/all.tf');
+    await settle();
+
+    expect(index.files().map((f) => f.path)).toEqual(['/ws/modules/network/main.tf']);
+    expect(calls.list).toEqual(['/ws/modules']);
+  });
+
+  it('asks nothing when what went held nothing indexed', async () => {
+    openFolders(['/ws']);
+    const { calls } = disk(['/ws/main.tf']);
+    const index = new WorkspaceIndex();
+    await index.updateFile('/ws/main.tf', TEXT('/ws/main.tf'));
+    const { vanish, tf, settle } = start(index);
+
+    vanish('/ws/dist');
+    vanish('/ws/target/debug');
+    tf.fire('delete', '/ws/never-indexed.tf');
+    await settle();
+
+    expect(calls.stat).toEqual([]);
+    expect(calls.list).toEqual([]);
+  });
+
+  it('does not look outside the workspace when a workspace folder itself is deleted', async () => {
+    openFolders(['/home/me/ws']);
+    const { calls } = disk(['/home/me/other/main.tf']);
+    const index = new WorkspaceIndex();
+    await index.updateFile('/home/me/ws/main.tf', TEXT('/home/me/ws/main.tf'));
+    const { vanish, settle } = start(index);
+
+    vanish('/home/me/ws');
+    await settle();
+
+    expect(calls.stat).toEqual([]);
+    expect(calls.list).toEqual([]);
+    expect(index.files()).toEqual([]);
   });
 });

@@ -1,3 +1,4 @@
+import { dirname } from 'node:path';
 import * as vscode from 'vscode';
 import { MAX_PARSE_CHARS } from './core/parser';
 import { TrackedDirs } from './core/trackedDirs';
@@ -484,6 +485,23 @@ export function registerIndexSync(
     appearedTimer = setTimeout(appearedDue, APPEARED_QUIET_MS);
   };
 
+  /** Something indexed went from the directory it was in, which is then listed
+   *  like one that appeared.
+   *
+   *  git removes a directory its checkout emptied and makes it again for what
+   *  the other branch holds there, and the watcher was following the one that
+   *  went: nothing written into the new one is reported. A checkout that renames
+   *  the only module from `modules/vpc` to `modules/network` reports `delete
+   *  modules/vpc` and nothing for `modules/network` or the file in it (measured
+   *  with the watcher VS Code ships, on Linux). What the events do say is where
+   *  something indexed went from, and what replaced it is beside it. */
+  const noteGone = (uri: vscode.Uri): void => {
+    const parent = vscode.Uri.file(dirname(uri.fsPath));
+    // a workspace folder itself went: what is beside it is not in the workspace
+    if (!vscode.workspace.getWorkspaceFolder(parent)) return;
+    noteAppeared(parent);
+  };
+
   const watcher = vscode.workspace.createFileSystemWatcher(TF_GLOB);
   // Deleting a folder arrives as ONE event for the folder path — an Explorer
   // delete is a move to trash, so the per-file deletes TF_GLOB waits for never
@@ -515,6 +533,7 @@ export function registerIndexSync(
       // The sweeps must run even when nothing under the folder is indexed yet:
       // an armed timer or an in-flight read would put a file back after removal.
       dropUnder(uri.fsPath);
+      noteGone(uri);
     }),
   );
   context.subscriptions.push(
@@ -637,6 +656,8 @@ export function registerIndexSync(
       // gets swept. Deleting a folder of 1000 .tf files used to be 1000 full
       // passes over the index.
       const nested = tracked.mayContain(uri.fsPath) ? index.pathsUnder(uri.fsPath) : [];
+      // asked before it is removed below: only something indexed is worth a look
+      if (index.file(uri.fsPath) || nested.length > 0) noteGone(uri);
       for (const p of nested) {
         clearTimerFor(p);
         supersede(p);
