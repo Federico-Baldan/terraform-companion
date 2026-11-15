@@ -1342,6 +1342,35 @@ provider "registry.terraform.io/hashicorp/random" {
     expect(found!.sizeBytes).toBe(2048);
   });
 
+  /** A hand-placed `plugins/<os>_<arch>` with no lock.json is kept by the delete
+   *  and left out of `entries`, so its bytes are not reclaimed either. Counting
+   *  them told the user, in the prompt and again in the "freed" message, that a
+   *  binary the clean deliberately left in place had been removed. */
+  it('does not size a hand-placed plugin directory the delete leaves in place', async () => {
+    const cache = makeModule(root, 'handplaced', 60, 60);
+    const platform = join(cache, 'plugins', 'linux_amd64');
+    mkdirSync(platform, { recursive: true });
+    writeFileSync(join(platform, 'terraform-provider-acme_v0.4.2'), 'x'.repeat(8192));
+    // terraform installed this one itself, so it is reclaimed and counted
+    const managed = join(cache, 'plugins', 'registry.terraform.io');
+    mkdirSync(managed, { recursive: true });
+    writeFileSync(join(managed, 'bin'), 'x'.repeat(1024));
+    for (const p of [
+      join(platform, 'terraform-provider-acme_v0.4.2'),
+      platform,
+      join(managed, 'bin'),
+      managed,
+      join(cache, 'plugins'),
+      cache,
+    ]) {
+      touch(p, 60);
+    }
+
+    const [found] = await findStaleTerraformDirs(root, 30, NOW);
+    expect(found?.entries).toEqual(['providers', 'plugins/registry.terraform.io']);
+    expect(found?.sizeBytes).toBe(2048 + 1024);
+  });
+
   it('only ever treats dirs literally named .terraform as cache', () => {
     expect(isTerraformCacheDir('/x/y/.terraform')).toBe(true);
     expect(isTerraformCacheDir('/x/y/.terraform-backup')).toBe(false);
