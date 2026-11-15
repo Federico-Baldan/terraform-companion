@@ -1155,6 +1155,14 @@ export async function deleteCachePayload(
     // still under a .terraform, and still under the one we vetted: a swap that
     // keeps the path inside the workspace is still not ours to delete
     if (!isInside(realDir, real)) return 'escaped';
+    // And still itself. `victim` is built on the resolved cache directory and
+    // was a real directory a moment ago, so it resolves to itself or a link has
+    // taken its place since. Being inside the cache is not enough: a link back
+    // into it (`providers` -> `.`) resolves to the cache directory, and what is
+    // removed is where the victim resolves — `environment` and the backend
+    // configuration with it. The provider-cache delete holds itself to the same
+    // rule (`deleteProviderCacheEntry`).
+    if (real !== victim) return 'escaped';
     return { real };
   };
 
