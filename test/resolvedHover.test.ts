@@ -69,6 +69,17 @@ describe('F7 hover sulla definizione', () => {
     expect(definitionAt(file, { row: 0, column: 24 })).toBeUndefined();
   });
 
+  it('ends a variable definition at its closing quote, not one column past it', () => {
+    const file = parseFile('/mod/variables.tf', VARIABLES);
+    // `variable "project_name"` is columns 0-22: the closing quote still hits
+    expect(definitionAt(file, { row: 0, column: 22 })).toEqual({
+      kind: 'var',
+      name: 'project_name',
+    });
+    // column 23 is the blank before the brace, which belongs to no name
+    expect(definitionAt(file, { row: 0, column: 23 })).toBeUndefined();
+  });
+
   it('resolves the full value of the definition through the var chain', () => {
     const scope: EvalScope = { index, moduleDir: '/mod' };
     expect(resolveRef(['local', 'name_prefix'], scope)).toBe('satispay-dev');
