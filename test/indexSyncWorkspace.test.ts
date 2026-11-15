@@ -73,3 +73,67 @@ describe('a document that is already open when the sync starts', () => {
     expect(announced).toEqual([]);
   });
 });
+
+/** VS Code allows workspace folders to nest: `/repo` and `/repo/infra` can both
+ *  be open. Removing one of them fires no file event, so its files are swept
+ *  out of the index — but the files the other folder still contains were swept
+ *  with them, and nothing ever indexed them again: no diagnostics and no hover
+ *  for files that are still in the workspace, for the rest of the session. */
+describe('removing a workspace folder that overlaps another', () => {
+  type FoldersChanged = (e: {
+    added: { uri: { fsPath: string } }[];
+    removed: { uri: { fsPath: string } }[];
+  }) => void;
+
+  async function setup(): Promise<{
+    index: WorkspaceIndex;
+    announced: string[][];
+    remove: (folder: string, remaining: string[]) => Promise<void>;
+  }> {
+    vi.useFakeTimers();
+    let fire: FoldersChanged | undefined;
+    vi.spyOn(workspace, 'onDidChangeWorkspaceFolders').mockImplementation(((
+      handler: FoldersChanged,
+    ) => {
+      fire = handler;
+      return { dispose() {} };
+    }) as never);
+    const index = new WorkspaceIndex();
+    await index.updateFile('/repo/main.tf', DISK);
+    await index.updateFile('/repo/infra/vpc.tf', DISK);
+    const { announced } = start(index);
+    const remove = async (folder: string, remaining: string[]): Promise<void> => {
+      openFolders(remaining);
+      if (!fire) throw new Error('index sync does not listen for workspace folder changes');
+      fire({ added: [], removed: [{ uri: { fsPath: folder } }] });
+      await vi.advanceTimersByTimeAsync(1_000);
+    };
+    return { index, announced, remove };
+  }
+
+  it('keeps the files of an inner folder that the outer one still contains', async () => {
+    const { index, announced, remove } = await setup();
+    await remove('/repo/infra', ['/repo']);
+
+    expect(index.file('/repo/infra/vpc.tf')?.source).toBe(DISK);
+    expect(index.file('/repo/main.tf')?.source).toBe(DISK);
+    expect(announced).toEqual([]);
+  });
+
+  it('keeps the files of an inner folder when the outer one is removed', async () => {
+    const { index, announced, remove } = await setup();
+    await remove('/repo', ['/repo/infra']);
+
+    expect(index.file('/repo/infra/vpc.tf')?.source).toBe(DISK);
+    expect(index.file('/repo/main.tf')).toBeUndefined();
+    expect(announced).toEqual([['/repo/main.tf']]);
+  });
+
+  it('still drops everything under a folder no other folder contains', async () => {
+    const { index, announced, remove } = await setup();
+    await remove('/repo', []);
+
+    expect(index.files()).toEqual([]);
+    expect(announced).toEqual([['/repo/infra/vpc.tf', '/repo/main.tf']]);
+  });
+});
