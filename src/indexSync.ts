@@ -247,6 +247,21 @@ export function registerIndexSync(
       // After the teardown the output channel is gone, and writing to it throws
       // from a promise nothing awaits. A read given up on late lands here too.
       if (disposed) return;
+      // Nothing on disk, and this read is still the last word on the path: what
+      // the index holds for it can then only be a buffer that has been closed
+      // (typed into after its file was deleted, or never saved at all), and no
+      // event is left to retract it. Only for a file that is not there: one
+      // that could not be read keeps what the index had, as before.
+      if (
+        (e as { code?: unknown } | undefined)?.code === 'FileNotFound' &&
+        tokenOf(uri.fsPath) === token &&
+        !hasDirtyBuffer(uri, ignoreDirtyOf) &&
+        index.file(uri.fsPath)
+      ) {
+        index.removeFile(uri.fsPath);
+        announce([uri.fsPath]);
+        return;
+      }
       // unreadable or deleted right after the event — but a parse failure lands
       // here too, and reading that as a missing file hid it completely
       log?.(`Not indexed (unreadable, deleted, or parse failed): ${uri.fsPath}: ${e}`);

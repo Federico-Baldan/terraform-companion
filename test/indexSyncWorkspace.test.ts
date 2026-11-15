@@ -2,7 +2,7 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vite
 import { WorkspaceIndex } from '../src/core/workspaceIndex';
 import { registerIndexSync } from '../src/indexSync';
 import { initTestParser } from './helpers';
-import { resetVscodeMock, workspace } from './mocks/vscode';
+import { fsMock, resetVscodeMock, workspace } from './mocks/vscode';
 
 beforeAll(initTestParser);
 beforeEach(resetVscodeMock);
@@ -135,5 +135,73 @@ describe('removing a workspace folder that overlaps another', () => {
 
     expect(index.files()).toEqual([]);
     expect(announced).toEqual([['/repo/infra/vpc.tf', '/repo/main.tf']]);
+  });
+});
+
+/** A buffer can outlive its file, or never have had one: the file is deleted
+ *  under an open editor (a branch switch) and typed into afterwards, or a path
+ *  is opened that does not exist yet and closed without saving. The debounce
+ *  indexes the buffer either way. Closing it re-reads the disk, the read finds
+ *  nothing, and the buffer's text stayed indexed with nothing left to correct
+ *  it: diagnostics for a file that does not exist, and its declarations and
+ *  references counted in its module, until the window reloaded. */
+describe('closing a buffer whose file is not on disk', () => {
+  type DocHandler = (arg: never) => void;
+
+  function listen(): { change: (doc: unknown) => void; close: (doc: unknown) => void } {
+    let onChange: DocHandler | undefined;
+    let onClose: DocHandler | undefined;
+    vi.spyOn(workspace, 'onDidChangeTextDocument').mockImplementation(((handler: DocHandler) => {
+      onChange = handler;
+      return { dispose() {} };
+    }) as never);
+    vi.spyOn(workspace, 'onDidCloseTextDocument').mockImplementation(((handler: DocHandler) => {
+      onClose = handler;
+      return { dispose() {} };
+    }) as never);
+    return {
+      change: (document) => onChange?.({ document, contentChanges: [{}] } as never),
+      close: (document) => onClose?.(document as never),
+    };
+  }
+
+  const PATH = '/ws/m/scratch.tf';
+  const notFound = (): Error => Object.assign(new Error('not found'), { code: 'FileNotFound' });
+
+  it('forgets the buffer when the read finds no file', async () => {
+    vi.useFakeTimers();
+    openFolders(['/ws']);
+    const events = listen();
+    const index = new WorkspaceIndex();
+    const { announced } = start(index);
+    const doc = { uri: { fsPath: PATH, scheme: 'file' }, isDirty: true, getText: () => BUFFER };
+
+    events.change(doc);
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(index.file(PATH)?.source).toBe(BUFFER);
+
+    fsMock.readFile = () => Promise.reject(notFound());
+    events.close(doc);
+    await vi.advanceTimersByTimeAsync(1_000);
+
+    expect(index.file(PATH)).toBeUndefined();
+    // announced again, so the lint pipeline drops the diagnostics it published
+    expect(announced).toEqual([[PATH], [PATH]]);
+  });
+
+  it('keeps what it holds when the file could not be read for another reason', async () => {
+    vi.useFakeTimers();
+    openFolders(['/ws']);
+    const events = listen();
+    const index = new WorkspaceIndex();
+    await index.updateFile(PATH, DISK);
+    const { announced } = start(index);
+
+    fsMock.readFile = () => Promise.reject(new Error('EBUSY'));
+    events.close({ uri: { fsPath: PATH, scheme: 'file' }, isDirty: false, getText: () => DISK });
+    await vi.advanceTimersByTimeAsync(1_000);
+
+    expect(index.file(PATH)?.source).toBe(DISK);
+    expect(announced).toEqual([]);
   });
 });
