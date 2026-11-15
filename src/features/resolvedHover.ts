@@ -39,7 +39,8 @@ export function definitionAt(file: ParsedFile, pos: Pos): DefinitionHit | undefi
         const line = file.lines[row] ?? '';
         const q = line.indexOf(`"${name}"`);
         const end = q === -1 ? line.length : q + name.length + 2;
-        if (pos.column >= block.span.start.column && pos.column <= end) {
+        // `<`, as for a local above: `end` is the column just past the closing quote
+        if (pos.column >= block.span.start.column && pos.column < end) {
           return { kind: 'var', name };
         }
       }
