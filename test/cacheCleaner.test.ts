@@ -988,6 +988,41 @@ provider "registry.terraform.io/hashicorp/random" {
     expect((await findStaleTerraformDirs(root, 30, NOW)).map((s) => s.dir)).toEqual([cache]);
   });
 
+  /** A plan, an apply or a destroy on a local state holds
+   *  `.terraform.tfstate.lock.info` beside it for as long as it runs. Nothing
+   *  else moves until the state is written, which an apply does as it goes and a
+   *  plan never does, so a project picked up again after a month and being
+   *  planned right now read as abandoned: its providers were offered for
+   *  deletion, or with autoDelete removed, under the Terraform that was using
+   *  them. A workspace other than the default already had this, since every
+   *  file under terraform.tfstate.d/<name> counts. */
+  describe('the lock a running Terraform holds on a local state', () => {
+    function lockedModule(name: string, lockName: string, lockAgeDays: number): string {
+      const cache = makeModule(root, name, 60, 60);
+      const lock = join(cache, '..', lockName);
+      writeFileSync(lock, '{"Operation":"OperationTypePlan"}');
+      touch(lock, lockAgeDays);
+      return cache;
+    }
+
+    it('counts as activity', async () => {
+      const cache = lockedModule('planning', '.terraform.tfstate.lock.info', 0.001);
+      expect(await findStaleTerraformDirs(root, 30, NOW)).toEqual([]);
+      // and for a run started while the prompt was open
+      expect(await isStillStale(cache, 30, NOW)).toBe(false);
+    });
+
+    it('counts for a state file under another name', async () => {
+      lockedModule('named', '.prod.tfstate.lock.info', 0.001);
+      expect(await findStaleTerraformDirs(root, 30, NOW)).toEqual([]);
+    });
+
+    it('does not keep a cache for ever when a crashed run left it behind', async () => {
+      const cache = lockedModule('crashed', '.terraform.tfstate.lock.info', 60);
+      expect((await findStaleTerraformDirs(root, 30, NOW)).map((s) => s.dir)).toEqual([cache]);
+    });
+  });
+
   it('respects the staleDays threshold', async () => {
     makeModule(root, 'old', 20, 20);
     expect(await findStaleTerraformDirs(root, 30, NOW)).toEqual([]);
