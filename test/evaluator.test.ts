@@ -529,7 +529,9 @@ describe('a reference that ran out of budget is evaluated once', () => {
     }
     // spent is not the same as absent: nothing certifies a rewrite on it
     expect(listShape(`local.d${levels}`, at)).not.toMatchObject({ kind: 'strings' });
-  });
+    // three seconds of CPU on its own, and past vitest's default five when the
+    // files run side by side on a busy machine: the same for the three below
+  }, 120_000);
 
   /** A reference a budget gave up on reads as the text ⟨unknown⟩ when it sits in an
    *  interpolation, so `["${local.hot}", "x"]` is two strings — and two strings
@@ -562,7 +564,7 @@ describe('a reference that ran out of budget is evaluated once', () => {
       kind: 'unknown',
       overBudget: true,
     });
-  });
+  }, 120_000);
 
   /** The number it may start is a ceiling on pathological work, not a limit anyone
    *  meets: with the memo, a resolve evaluates each distinct reference once, and
@@ -600,7 +602,7 @@ describe('a reference that ran out of budget is evaluated once', () => {
       expect(shape.values).toHaveLength(count);
       expect(shape.values).not.toContain(UNKNOWN);
     }
-  });
+  }, 120_000);
 
   /** The text budget is a spend like the others: a list whose later elements the
    *  budget refused is not one that was measured, however unique it looks. */
@@ -618,7 +620,7 @@ describe('a reference that ran out of budget is evaluated once', () => {
       kind: 'unknown',
       overBudget: true,
     });
-  });
+  }, 120_000);
 
   /** A count of evaluations says nothing about what each one costs: a read parses
    *  the whole text of the local it reads. Under a chain past the hop limit, with
