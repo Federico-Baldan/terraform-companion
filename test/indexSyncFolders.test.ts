@@ -5,6 +5,7 @@ import { initTestParser } from './helpers';
 import {
   FileType,
   fsMock,
+  mock,
   RelativePattern,
   resetVscodeMock,
   watchers,
@@ -386,5 +387,54 @@ describe('a directory whose indexed content was replaced', () => {
     expect(calls.stat).toEqual([]);
     expect(calls.list).toEqual([]);
     expect(index.files()).toEqual([]);
+  });
+
+  /** The directory something went from can be the top of a workspace folder,
+   *  and listing below that is listing the workspace: the one listing a minute
+   *  is meant to space out. Asked about as a directory it went around that, so
+   *  a generator that rewrites a file at the top by removing it first had the
+   *  whole workspace listed on every run. */
+  describe('at the top of a workspace folder', () => {
+    function workspaceAt(folder: string): void {
+      openFolders([folder]);
+      mock.folders = [{ uri: { fsPath: folder } }];
+    }
+
+    it('still finds what replaced an indexed directory', async () => {
+      workspaceAt('/ws');
+      const { calls } = disk(['/ws/network/main.tf']);
+      const index = new WorkspaceIndex();
+      await index.updateFile('/ws/vpc/main.tf', TEXT('/ws/vpc/main.tf'));
+      const { vanish, settle } = start(index);
+
+      vanish('/ws/vpc');
+      await settle();
+
+      expect(index.files().map((f) => f.path)).toEqual(['/ws/network/main.tf']);
+      expect(calls.list).toEqual(['**/*.{tf,tfvars}']);
+    });
+
+    it('lists the workspace once a minute at most while a file there keeps being replaced', async () => {
+      workspaceAt('/ws');
+      const { files, calls } = disk(['/ws/main.tf', '/ws/modules/a/main.tf']);
+      const index = new WorkspaceIndex();
+      await index.updateFile('/ws/main.tf', TEXT('/ws/main.tf'));
+      await index.updateFile('/ws/modules/a/main.tf', TEXT('/ws/modules/a/main.tf'));
+      const { tf } = start(index);
+
+      for (let run = 0; run < 5; run++) {
+        tf.fire('delete', '/ws/main.tf');
+        await vi.advanceTimersByTimeAsync(200);
+        tf.fire('create', '/ws/main.tf');
+        await vi.advanceTimersByTimeAsync(2_800);
+      }
+      expect(calls.list).toEqual(['**/*.{tf,tfvars}']);
+
+      // and what a checkout wrote meanwhile is found once the minute is over
+      files.add('/ws/network/main.tf');
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(calls.list).toHaveLength(2);
+      expect(index.file('/ws/network/main.tf')).toBeDefined();
+    });
   });
 });

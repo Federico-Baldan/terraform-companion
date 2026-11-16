@@ -486,9 +486,10 @@ export function registerIndexSync(
    *  anywhere in the workspace and a build writes tens of thousands: the timer
    *  is armed once per burst rather than moved by every event, and the
    *  questions that cost something are asked once, in `scanAppeared`. */
-  const noteAppeared = (uri: vscode.Uri): void => {
+  const noteAppeared = (uri: vscode.Uri | undefined): void => {
     if (disposed) return;
-    if (appeared.size < MAX_APPEARED) appeared.set(normalizePath(uri.fsPath), uri);
+    // no path to ask about: the workspace is what there is to list
+    if (uri && appeared.size < MAX_APPEARED) appeared.set(normalizePath(uri.fsPath), uri);
     else appearedOverflow = true;
     appearedLast = Date.now();
     if (appearedTimer) return;
@@ -505,12 +506,22 @@ export function registerIndexSync(
    *  the only module from `modules/vpc` to `modules/network` reports `delete
    *  modules/vpc` and nothing for `modules/network` or the file in it (measured
    *  with the watcher VS Code ships, on Linux). What the events do say is where
-   *  something indexed went from, and what replaced it is beside it. */
+   *  something indexed went from, and what replaced it is beside it.
+   *
+   *  When that directory is the top of a workspace folder, listing it is
+   *  listing the workspace, so it is asked for as that and LIST_ALL_GAP_MS
+   *  applies: as a directory it was listed again on every delete there, five
+   *  times in fifteen seconds for a generator that rewrites a file at the top
+   *  by removing it first. */
   const noteGone = (uri: vscode.Uri): void => {
     const parent = vscode.Uri.file(dirname(uri.fsPath));
     // a workspace folder itself went: what is beside it is not in the workspace
     if (!vscode.workspace.getWorkspaceFolder(parent)) return;
-    noteAppeared(parent);
+    const top = normalizePath(parent.fsPath);
+    const isFolderTop = (vscode.workspace.workspaceFolders ?? []).some(
+      (folder) => normalizePath(folder.uri.fsPath) === top,
+    );
+    noteAppeared(isFolderTop ? undefined : parent);
   };
 
   const watcher = vscode.workspace.createFileSystemWatcher(TF_GLOB);
