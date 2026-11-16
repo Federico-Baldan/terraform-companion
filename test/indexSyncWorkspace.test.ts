@@ -205,3 +205,59 @@ describe('closing a buffer whose file is not on disk', () => {
     expect(announced).toEqual([]);
   });
 });
+
+/** Adding a folder lists what it already holds and reads each file from disk,
+ *  and no open event fires for a document that was open before: the same gap as
+ *  at activation, on the other way into the index. A file with unsaved changes
+ *  had the disk's text written over what the index follows, so the diagnostics
+ *  drawn on its buffer were computed from the saved file until the next
+ *  keystroke. Folders may nest, so the file may have been indexed all along. */
+describe('adding a workspace folder that holds a file with unsaved changes', () => {
+  type FoldersChanged = (e: {
+    added: { uri: { fsPath: string } }[];
+    removed: { uri: { fsPath: string } }[];
+  }) => void;
+
+  const dirty = (fsPath: string) =>
+    ({ uri: { fsPath, scheme: 'file' }, isDirty: true, getText: () => BUFFER }) as never;
+
+  async function add(index: WorkspaceIndex, folder: string, folders: string[], files: string[]) {
+    vi.useFakeTimers();
+    let fire: FoldersChanged | undefined;
+    vi.spyOn(workspace, 'onDidChangeWorkspaceFolders').mockImplementation(((
+      handler: FoldersChanged,
+    ) => {
+      fire = handler;
+      return { dispose() {} };
+    }) as never);
+    fsMock.findFiles = async () => files.map((fsPath) => ({ fsPath, scheme: 'file' }));
+    fsMock.readFile = async () => new TextEncoder().encode(DISK);
+    start(index);
+    openFolders(folders);
+    if (!fire) throw new Error('index sync does not listen for workspace folder changes');
+    fire({ added: [{ uri: { fsPath: folder } }], removed: [] });
+    await vi.advanceTimersByTimeAsync(5_000);
+  }
+
+  it('keeps the buffer of a file an outer folder had indexed already', async () => {
+    const index = new WorkspaceIndex();
+    // as the edit debounce left it
+    await index.updateFile('/repo/infra/vpc.tf', BUFFER);
+    workspace.textDocuments.push(dirty('/repo/infra/vpc.tf'));
+
+    await add(index, '/repo/infra', ['/repo', '/repo/infra'], ['/repo/infra/vpc.tf']);
+
+    expect(index.file('/repo/infra/vpc.tf')?.source).toBe(BUFFER);
+  });
+
+  it('indexes the buffer, not the disk, of a file that was open from outside the workspace', async () => {
+    const index = new WorkspaceIndex();
+    workspace.textDocuments.push(dirty('/other/main.tf'));
+
+    await add(index, '/other', ['/ws', '/other'], ['/other/main.tf', '/other/saved.tf']);
+
+    expect(index.file('/other/main.tf')?.source).toBe(BUFFER);
+    // one without unsaved changes is the disk's, as before
+    expect(index.file('/other/saved.tf')?.source).toBe(DISK);
+  });
+});

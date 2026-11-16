@@ -343,6 +343,16 @@ export function registerIndexSync(
       return;
     }
     if (disposed) return;
+    // No open event fires for a document that was open before the folder was
+    // added, the same as at activation (see the end of `registerIndexSync`):
+    // one with unsaved changes is the editor path's, so it is handed to it here
+    // and left out of the reads below, which would write the disk's text over
+    // the buffer the diagnostics are drawn on. A file from outside the
+    // workspace joins the index this way, and with folders nesting it may have
+    // been indexed, from its buffer, all along.
+    for (const doc of vscode.workspace.textDocuments) {
+      if (doc.isDirty) scheduleRefresh(doc);
+    }
     // Every token is taken up front, before the first await — not one per
     // iteration inside it. `dropUnder` can only supersede a path that already
     // has an `epoch` entry, so taking them lazily left every file the loop had
@@ -352,7 +362,7 @@ export function registerIndexSync(
     // with diagnostics, for a folder no longer in the workspace.
     const tokens = new Map<string, number>();
     for (const uri of uris) {
-      if (isExcludedTfPath(uri.fsPath)) continue;
+      if (isExcludedTfPath(uri.fsPath) || hasDirtyBuffer(uri)) continue;
       tracked.add(uri.fsPath);
       tokens.set(uri.fsPath, supersede(uri.fsPath));
     }
@@ -362,8 +372,9 @@ export function registerIndexSync(
       if (token === undefined) continue;
       try {
         const text = new TextDecoder().decode(await vscode.workspace.fs.readFile(uri));
-        // the folder can be removed again while this scan is still running
-        if (disposed || tokenOf(uri.fsPath) !== token) continue;
+        // the folder can be removed again while this scan is still running, and
+        // a buffer typed into meanwhile owns its path once it is dirty
+        if (disposed || tokenOf(uri.fsPath) !== token || hasDirtyBuffer(uri)) continue;
         if (await updateIndex(uri.fsPath, text)) added.push(uri.fsPath);
       } catch (e) {
         log?.(`Not indexed (unreadable or parse failed): ${uri.fsPath}: ${e}`);
