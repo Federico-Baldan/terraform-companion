@@ -2,6 +2,27 @@
 
 Notable changes to Terraform Companion. Versions follow semver; dates are ISO (YYYY-MM-DD).
 
+## [1.3.2](https://github.com/Federico-Baldan/terraform-companion/compare/v1.3.1...v1.3.2) (2026-11-22)
+
+
+### Bug Fixes
+
+* bound the resolves the count -&gt; for_each safety check may run ([f0dfeed](https://github.com/Federico-Baldan/terraform-companion/commit/f0dfeed9e0b0248ed26a65df9d469f48c6a5ca2d))
+* count the lock a running Terraform holds on a local state as cache activity ([e1047fe](https://github.com/Federico-Baldan/terraform-companion/commit/e1047fee807392272e8012d4883b80e9386a092a))
+* do not call depends_on in a module block redundant because an input references the resource ([9ed8bda](https://github.com/Federico-Baldan/terraform-companion/commit/9ed8bdae4cb28ead75af740fcde2d8c38a1c3896))
+* do not count a hand-placed plugin directory in the size a clean reports ([ad2d9e2](https://github.com/Federico-Baldan/terraform-companion/commit/ad2d9e2165f2b0f7a3494b4ba30d7c85653f8fda))
+* end the hover range of a variable definition at its closing quote ([672db3e](https://github.com/Federico-Baldan/terraform-companion/commit/672db3ea4156e3ae238786e679b4756df3cf23a9))
+* forget a closed buffer whose file is not on disk ([8fbfe8f](https://github.com/Federico-Baldan/terraform-companion/commit/8fbfe8f5c8a9d8933e53ae6d2e9920185449ea97))
+* index the Terraform files of a directory that appears with them inside ([e2142e2](https://github.com/Federico-Baldan/terraform-companion/commit/e2142e20d2e6a048367c46422fbf96e06068ee20))
+* index the unsaved buffer of a document already open when the sync starts ([0fcf73d](https://github.com/Federico-Baldan/terraform-companion/commit/0fcf73d44914ff044cc6226c03479dfadb14c1e3))
+* keep files another workspace folder still contains when a nested folder is removed ([4ee70a2](https://github.com/Federico-Baldan/terraform-companion/commit/4ee70a2cd21d5578172f8b4fcf11a4dbdfb11ef5))
+* keep the unsaved buffer of a file whose workspace folder is added ([e992ec5](https://github.com/Federico-Baldan/terraform-companion/commit/e992ec52bd8a2a7472bc51573171519ed5905081))
+* leave a symbolic link directly under .terraform/plugins alone when cleaning ([29eee60](https://github.com/Federico-Baldan/terraform-companion/commit/29eee60b1029987306f49edb9eb7802d41084f5d))
+* list the directory an indexed file or directory was deleted from ([6c2a710](https://github.com/Federico-Baldan/terraform-companion/commit/6c2a7106400fa7c3bc6d3b4013290b6fc54025a4))
+* record no cache cleaner quiet period when no workspace folder was walked ([4aff244](https://github.com/Federico-Baldan/terraform-companion/commit/4aff2446158826b286df7ee11cd83023974988c4))
+* refuse to clean a cache subdirectory that was swapped for a link into the cache ([31f86d8](https://github.com/Federico-Baldan/terraform-companion/commit/31f86d81c09774b9d8e554085caecf84bb5c22fa))
+* space out the workspace listing when what was deleted sat at the top of a workspace folder ([fe86df0](https://github.com/Federico-Baldan/terraform-companion/commit/fe86df0eb9d2fda2257ae3c6e8f04077eb94a54b))
+
 ## [1.3.1](https://github.com/Federico-Baldan/terraform-companion/compare/v1.3.0...v1.3.1) (2026-11-14)
 
 
